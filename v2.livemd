@@ -1,0 +1,956 @@
+<!-- livebook:{"autosave_interval_s":60,"persist_outputs":true} -->
+
+# me_think_v2
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9"},
+  {:exla, "~> 0.9"}
+  # Notice we don't even need Bumblebee for this test!
+])
+
+# Lock it to your CPU for fast, local testing
+Nx.global_default_backend({EXLA.Backend, client: :host})
+```
+
+## Section
+
+```elixir
+:erlang.system_info(:process_limit)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+2097152
+```
+
+```elixir
+defmodule DLM.ThoughtBlock do
+  import Nx.Defn
+
+  @doc """
+  The Self-Attention Mechanism with Causal Masking.
+  """
+  defn self_attention(x, wq, wk, wv) do
+    # FIX 1: Prefixed 'batch' with an underscore
+    {_batch, seq_len, embed_dim} = Nx.shape(x)
+    
+    q = Nx.dot(x, [2], [], wq, [0], [])
+    k = Nx.dot(x, [2], [], wk, [0], [])
+    v = Nx.dot(x, [2], [], wv, [0], [])
+    
+    k_t = Nx.transpose(k, axes: [0, 2, 1])
+    scores = Nx.dot(q, [2], [0], k_t, [1], [0])
+    
+    # FIX 2: Let Nx auto-cast the embed_dim scalar instead of using Nx.tensor()
+    scaled_scores = Nx.divide(scores, Nx.sqrt(embed_dim))
+    
+    mask = Nx.broadcast(1, {seq_len, seq_len}) |> Nx.tri(k: 0)
+    
+    # FIX 3: Use a literal float for negative infinity to keep the JIT compiler happy
+    neg_inf = -1.0e9
+    masked_scores = Nx.select(mask, scaled_scores, neg_inf)
+    
+    attn_weights = Nx.exp(masked_scores) |> Nx.divide(Nx.sum(Nx.exp(masked_scores), axes: [-1], keep_axes: true))
+    Nx.dot(attn_weights, [2], [0], v, [1], [0])
+  end
+
+  @doc """
+  The Feed-Forward Network to process the attention context.
+  """
+  defn feed_forward(x, w1, w2) do
+    x
+    |> Nx.dot([2], [], w1, [0], [])
+    |> Nx.max(0.0) # FIX 4: Used max(0.0) as the universal ReLU
+    |> Nx.dot([2], [], w2, [0], [])
+  end
+  
+  @doc """
+  The Full Forward Pass connecting Attention and Feed-Forward with Residuals.
+  """
+  defn process(x, attn_weights, ff_weights) do
+    {wq, wk, wv} = attn_weights
+    {w1, w2} = ff_weights
+
+    context = self_attention(x, wq, wk, wv)
+    x_residual = Nx.add(x, context) 
+    
+    ff_out = feed_forward(x_residual, w1, w2)
+    Nx.add(x_residual, ff_out)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.ThoughtBlock, <<70, 79, 82, 49, 0, 0, 22, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Positional do
+  # Changed 'defn' to 'def' so seq_len and embed_dim stay as standard integers
+  def build(seq_len, embed_dim) do
+    half_dim = div(embed_dim, 2)
+    positions = Nx.iota({seq_len, 1})
+    
+    # Calculate the frequency wavelengths
+    div_term = Nx.exp(Nx.multiply(Nx.iota({half_dim}), -(:math.log(10000.0) / half_dim)))
+    args = Nx.multiply(positions, div_term)
+    
+    # Generate the waves and stick them together
+    pe = Nx.concatenate([Nx.sin(args), Nx.cos(args)], axis: 1)
+    
+    # Scale to 0.1 so it acts as a subtle watermark!
+    Nx.multiply(Nx.reshape(pe, {1, seq_len, embed_dim}), 0.1)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 9, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.Mask do
+  import Nx.Defn
+
+  # Build the mathematical blindfold
+  defn causal(seq_len) do
+    # Create row and column coordinates
+    row_idx = Nx.iota({seq_len, 1})
+    col_idx = Nx.iota({1, seq_len})
+    
+    # Identify the "future" (upper triangle of the matrix)
+    future_mask = Nx.greater(col_idx, row_idx)
+    
+    # FIX: Removed Nx.tensor() wrappers to keep the JIT compiler happy
+    Nx.select(future_mask, -1.0e9, 0.0)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Mask, <<70, 79, 82, 49, 0, 0, 10, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Training do
+  import Nx.Defn
+
+  defn softmax(logits) do
+    exps = Nx.exp(Nx.subtract(logits, Nx.reduce_max(logits, axes: [-1], keep_axes: true)))
+    Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
+  end
+
+  defn layer_norm(x) do
+    mean = Nx.mean(x, axes: [-1], keep_axes: true)
+    variance = Nx.variance(x, axes: [-1], keep_axes: true)
+    Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(variance, 1.0e-5)))
+  end
+
+  # THE FIX: We now pass in the raw IDs and the emb_w matrix
+  defn loss_fn(input_ids, target_ids, emb_w, aw, fw, pos_emb) do
+    # 1. EMBEDDING LOOKUP (Now tracked by the gradient!)
+    nx = Nx.take(emb_w, input_ids) |> Nx.add(pos_emb)
+    targets = Nx.take(emb_w, target_ids)
+    
+    {_batch, seq_len, dim} = Nx.shape(nx)
+    
+    # 2. SELF-ATTENTION
+    transposed = Nx.transpose(nx, axes: [0, 2, 1])
+    scores = Nx.dot(nx, [2], [0], transposed, [1], [0])
+    
+    scaled_scores = Nx.divide(scores, Nx.sqrt(dim))
+    mask = DLM.Mask.causal(seq_len)
+    masked_scores = Nx.add(scaled_scores, mask)
+    
+    attn_weights = softmax(masked_scores)
+    attended_nx = Nx.dot(attn_weights, [2], [0], nx, [1], [0])
+    
+    # 3. FEED FORWARD
+    x = Nx.dot(attended_nx, aw) |> layer_norm()
+    ff = Nx.dot(x, fw)
+    ff = Nx.select(Nx.greater(ff, 0), ff, Nx.multiply(ff, 0.01))
+    final_x = Nx.add(x, ff) |> layer_norm()
+    
+    # 4. MSE
+    diff = Nx.subtract(final_x, targets)
+    Nx.mean(Nx.pow(diff, 2))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Training, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Optimizer do
+  import Nx.Defn
+
+  # THE FIX: emb_w is now in the tracking tuple!
+  defn update_step(input_ids, target_ids, emb_w, aw, fw, pos_emb, lr) do
+    {loss, {grad_emb, grad_aw, grad_fw}} = value_and_grad(
+      {emb_w, aw, fw}, 
+      fn {e, a, f} -> DLM.Training.loss_fn(input_ids, target_ids, e, a, f, pos_emb) end
+    )
+    
+    # Update the vocabulary!
+    new_emb = Nx.subtract(emb_w, Nx.multiply(grad_emb, lr))
+    new_aw = Nx.subtract(aw, Nx.multiply(grad_aw, lr))
+    new_fw = Nx.subtract(fw, Nx.multiply(grad_fw, lr))
+    
+    {new_emb, new_aw, new_fw, loss}
+  end
+
+  defn run_chunk(input_ids, target_ids, emb_w, aw, fw, pos_emb, lr, opts \\ []) do
+    opts = keyword!(opts, [:iterations])
+    iterations = opts[:iterations]
+
+    {final_emb, final_aw, final_fw, final_loss, _ids, _targs, _pos, _lr} = 
+      while {emb_acc = emb_w, aw_acc = aw, fw_acc = fw, _loss = 0.0, 
+             ids_acc = input_ids, targs_acc = target_ids, pos_acc = pos_emb, lr_acc = lr}, 
+            _i <- 1..iterations do
+        
+        {new_emb, new_aw, new_fw, step_loss} = 
+          update_step(ids_acc, targs_acc, emb_acc, aw_acc, fw_acc, pos_acc, lr_acc)
+        
+        {new_emb, new_aw, new_fw, step_loss, ids_acc, targs_acc, pos_acc, lr_acc}
+      end
+      
+    {final_emb, final_aw, final_fw, final_loss}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Optimizer, <<70, 79, 82, 49, 0, 0, 27, ...>>, true}
+```
+
+```elixir
+# --- V5 DATA GENERATOR & BURN HUB ---
+
+# ==========================================
+# 1. DATA GENERATION (The Hard Stop Corpus)
+# ==========================================
+subjects = ["fox", "cat", "dog", "owl", "bee"]
+adjectives = ["quick", "slow", "fast", "tiny", "lazy"]
+colors = ["brown", "black", "white", "green", "grey"]
+actions = ["jumps", "flies", "leaps", "runs", "walks"]
+
+v4_raw = for s <- subjects, adj <- adjectives, c <- colors do
+  sent = "the #{adj} #{c} #{s} #{Enum.random(actions)}."
+  String.pad_trailing(sent, 32, "#")
+end
+
+# THE FIX: Let the model see all 625 combinations!
+v4_sentences = Enum.shuffle(v4_raw) 
+
+byte_lists = Enum.map(v4_sentences, &to_charlist/1)
+v4_corpus_tensor = Nx.tensor(byte_lists) 
+
+IO.puts("V4 Corpus Ready with Hard-Stop Tokens (#)")
+IO.puts("Example: '#{List.first(v4_sentences)}'\n")
+
+seq_len = 31
+v4_inputs_ids = Nx.slice_along_axis(v4_corpus_tensor, 0, seq_len, axis: 1)
+v4_targets_ids = Nx.slice_along_axis(v4_corpus_tensor, 1, seq_len, axis: 1)
+
+
+# ==========================================
+# 2. ARCHITECTURE INITIALIZATION (256-D)
+# ==========================================
+embed_dim = 256
+vocab_size = 256
+key = Nx.Random.key(42)
+
+# Vocabulary Embeddings
+{emb_w, key} = Nx.Random.uniform(key, -1.0, 0.02, shape: {vocab_size, embed_dim})
+
+# Positional Embeddings
+pos_emb = DLM.Positional.build(seq_len, embed_dim)
+
+# The "Brain" Weights (He Initialization for stability)
+he_stddev = :math.sqrt(2 / embed_dim)
+{aw_init, key} = Nx.Random.normal(key, 0.0, he_stddev, shape: {embed_dim, embed_dim})
+{fw_init, _key} = Nx.Random.normal(key, 0.0, he_stddev, shape: {embed_dim, embed_dim})
+
+IO.puts("✅ V5 Weights and Embeddings successfully generated in RAM.\n")
+
+
+# --- V7 THE GENERALIZATION BURN ---
+max_lr = 0.5 
+min_lr = 0.05
+chunks = 20 # Bumped to 20 for the larger dataset
+epochs_per_chunk = 400
+batch_size = 16 # Bumping to 16 so it sees more of the universe at once
+
+IO.puts("--- Starting True V7 Generalization Burn ---")
+
+{final_v7_emb, final_v7_attn, final_v7_ff, _} = 
+  Enum.reduce(1..chunks, {emb_w, aw_init, fw_init, 0.0}, fn c, {emb, aw, fw, _} ->
+    current_lr = max_lr - ((max_lr - min_lr) * (c / chunks))
+    
+    indices = Enum.take_random(0..(length(v4_sentences) - 1), batch_size) |> Nx.tensor()
+    
+    batch_inputs_ids = Nx.take(v4_inputs_ids, indices) 
+    batch_targets_ids = Nx.take(v4_targets_ids, indices) 
+
+    {next_emb, next_aw, next_fw, loss} = 
+       DLM.Optimizer.run_chunk(batch_inputs_ids, batch_targets_ids, emb, aw, fw, pos_emb, current_lr, iterations: epochs_per_chunk)
+    
+    l_val = Nx.to_number(loss)
+    emb_safe = Nx.backend_copy(next_emb, Nx.BinaryBackend)
+    aw_safe = Nx.backend_copy(next_aw, Nx.BinaryBackend)
+    fw_safe = Nx.backend_copy(next_fw, Nx.BinaryBackend)
+    
+    Nx.backend_deallocate(next_emb); Nx.backend_deallocate(next_aw); Nx.backend_deallocate(next_fw); Nx.backend_deallocate(loss)
+    :erlang.garbage_collect()
+    
+    IO.puts("Chunk #{c} | LR: #{Float.round(current_lr, 4)} | MSE: #{Float.round(l_val, 8)} | RAM: #{round(:erlang.memory(:total) / 1_000_000)}MB")
+    {emb_safe, aw_safe, fw_safe, l_val}
+  end)
+
+IO.puts("\n✅ V7 Generalization Burn Complete!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+V4 Corpus Ready with Hard-Stop Tokens (#)
+Example: 'the tiny black cat jumps.#######'
+
+✅ V5 Weights and Embeddings successfully generated in RAM.
+
+--- Starting True V7 Generalization Burn ---
+```
+
+```elixir
+defmodule DLM.Inference do
+  import Nx.Defn
+
+  # Use the same Softmax as training
+  defn softmax(logits) do
+    exps = Nx.exp(Nx.subtract(logits, Nx.reduce_max(logits, axes: [-1], keep_axes: true)))
+    Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
+  end
+
+  defn predict_next(input_emb, aw, fw) do
+    # Dynamically extract the 256 dimension!
+    {_batch, seq_len, dim} = Nx.shape(input_emb)
+    
+    # 1. Self-Attention (Mirroring Training Logic)
+    transposed = Nx.transpose(input_emb, axes: [0, 2, 1])
+    scores = Nx.dot(input_emb, [2], [0], transposed, [1], [0])
+    
+    # Scale and Mask
+    # FIX 1: Dynamic scaling for 256-D
+    scaled_scores = Nx.divide(scores, Nx.sqrt(dim))
+    mask = DLM.Mask.causal(seq_len)
+    masked_scores = Nx.add(scaled_scores, mask)
+    
+    # Probabilities & Mixing
+    attn_weights = softmax(masked_scores)
+    attended = Nx.dot(attn_weights, [2], [0], input_emb, [1], [0])
+    
+    # 2. Weights & Feed Forward
+    # FIX 2: Route through the new layer_norm function
+    x = Nx.dot(attended, aw) |> DLM.Training.layer_norm()
+    ff = Nx.dot(x, fw)
+    ff = Nx.select(Nx.greater(ff, 0), ff, Nx.multiply(ff, 0.01))
+    
+    # Return the final state of ONLY the last character in the sequence
+    # Shape: {batch, 1, dim}
+    Nx.add(x, ff) 
+    |> DLM.Training.layer_norm()
+    |> Nx.slice_along_axis(seq_len - 1, 1, axis: 1)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Inference, <<70, 79, 82, 49, 0, 0, 18, ...>>, true}
+```
+
+```elixir
+# --- V6 MULTIVERSE GENERATOR (TRUE MSE INVERSE) ---
+seeds = [
+  "the fast green ",
+  "the slow white ",
+  "the tiny black ",
+  "the lazy brown ",
+  "the quick grey "
+]
+
+temp = 1.0  # Back to a natural 1.0 because the math is perfectly scaled!
+top_p = 0.9
+
+IO.puts("--- Generating the V6 Multiverse ---\n")
+
+Enum.each(seeds, fn seed_text ->
+  seed_ids = seed_text |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+  
+  IO.write("#{seed_text}")
+  
+  Enum.reduce_while(1..30, seed_ids, fn _i, acc_ids ->
+    {_, current_len} = Nx.shape(acc_ids)
+    
+    current_emb = Nx.take(final_v7_emb, acc_ids)
+    {_, _, dim} = Nx.shape(current_emb)
+    
+    p_emb = DLM.Positional.build(current_len, dim)
+    input_with_pos = Nx.add(current_emb, p_emb)
+    
+    # Forward Pass
+    prediction_vec = DLM.Inference.predict_next(input_with_pos, final_v7_attn, final_v7_ff)
+    
+    # ----------------------------------------------------
+    # THE TRUE MSE INVERSE DECODER
+    # ----------------------------------------------------
+    emb_broadcast = Nx.reshape(final_v7_emb, {1, 256, 256})
+    diff = Nx.subtract(prediction_vec, emb_broadcast)
+    
+    # 1. Calculate raw squared distances (Exactly what the loss function minimized)
+    raw_distances = Nx.sum(Nx.pow(diff, 2), axes: [-1]) |> Nx.reshape({256})
+    
+    # 2. Scale by -16.0 to convert to natural logits
+    # (Negative because closer distance = higher probability)
+    logits = Nx.divide(raw_distances, -16.0)
+    # ----------------------------------------------------
+
+    probs = DLM.Inference.softmax(Nx.divide(logits, temp))
+    sorted_indices = Nx.argsort(probs, direction: :desc)
+    sorted_probs = Nx.take(probs, sorted_indices)
+    mask = Nx.less_equal(Nx.cumulative_sum(sorted_probs), top_p)
+    mask = Nx.put_slice(mask, [0], Nx.tensor([1], type: :u8)) 
+    
+    filtered_probs = Nx.multiply(sorted_probs, mask) |> then(&Nx.divide(&1, Nx.sum(&1)))
+    
+    {sample_idx, _} = Nx.Random.choice(Nx.Random.key(System.unique_integer([:positive])), Nx.iota({256}), filtered_probs)
+    next_id_val = Nx.take(sorted_indices, sample_idx) |> Nx.squeeze() |> Nx.to_number()
+    next_id = Nx.reshape(Nx.tensor([next_id_val]), {1, 1})
+
+    if next_id_val == 35 do # The '#' Stop Token
+      {:halt, acc_ids}
+    else
+      if next_id_val > 31 and next_id_val < 127, do: IO.write(<<next_id_val>>)
+      {:cont, Nx.concatenate([acc_ids, next_id], axis: 1)}
+    end
+  end)
+  
+  IO.puts("") 
+end)
+
+IO.puts("\nMultiverse Generation Complete.")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+--- Generating the V6 Multiverse ---
+
+the fast green l l l l s.
+the slow white  l l le l le s.
+the tiny black l le le l le w le l le f s.
+the lazy brown l l w le s.
+the quick grey e l l le s.
+
+Multiverse Generation Complete.
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# --- V7.1 THE HIGH-RESOLUTION CARVER ---
+# We start with a "kick" (0.6) to move the vectors out of the 'l' centroid
+max_lr = 0.6 
+min_lr = 0.01
+chunks = 30 # A longer bake to handle the 625-sentence complexity
+epochs_per_chunk = 500 # More iterations per chunk
+batch_size = 24 # Increased batch size to give the model a clearer view of the whole universe
+
+IO.puts("--- Starting V7.1 High-Resolution Carver ---")
+
+{final_v7_1_emb, final_v7_1_attn, final_v7_1_ff, _} = 
+  Enum.reduce(1..chunks, {final_v7_emb, final_v7_attn, final_v7_ff, 0.0}, fn c, {emb, aw, fw, _} ->
+    current_lr = max_lr - ((max_lr - min_lr) * (c / chunks))
+    
+    indices = Enum.take_random(0..(length(v4_sentences) - 1), batch_size) |> Nx.tensor()
+    
+    batch_inputs_ids = Nx.take(v4_inputs_ids, indices) 
+    batch_targets_ids = Nx.take(v4_targets_ids, indices) 
+
+    {next_emb, next_aw, next_fw, loss} = 
+       DLM.Optimizer.run_chunk(batch_inputs_ids, batch_targets_ids, emb, aw, fw, pos_emb, current_lr, iterations: epochs_per_chunk)
+    
+    l_val = Nx.to_number(loss)
+    emb_safe = Nx.backend_copy(next_emb, Nx.BinaryBackend)
+    aw_safe = Nx.backend_copy(next_aw, Nx.BinaryBackend)
+    fw_safe = Nx.backend_copy(next_fw, Nx.BinaryBackend)
+    
+    Nx.backend_deallocate(next_emb); Nx.backend_deallocate(next_aw); Nx.backend_deallocate(next_fw); Nx.backend_deallocate(loss)
+    :erlang.garbage_collect()
+    
+    IO.puts("Carve Chunk #{c} | LR: #{Float.round(current_lr, 4)} | MSE: #{Float.round(l_val, 8)} | RAM: #{round(:erlang.memory(:total) / 1_000_000)}MB")
+    {emb_safe, aw_safe, fw_safe, l_val}
+  end)
+
+IO.puts("\n✅ V7.1 Carving Complete!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+--- Starting V7.1 High-Resolution Carver ---
+Carve Chunk 1 | LR: 0.5803 | MSE: 0.30080819 | RAM: 4528MB
+Carve Chunk 2 | LR: 0.5607 | MSE: 0.27584079 | RAM: 4759MB
+Carve Chunk 3 | LR: 0.541 | MSE: 0.24882288 | RAM: 4990MB
+Carve Chunk 4 | LR: 0.5213 | MSE: 0.2340418 | RAM: 5220MB
+Carve Chunk 5 | LR: 0.5017 | MSE: 0.22802927 | RAM: 5450MB
+Carve Chunk 6 | LR: 0.482 | MSE: 0.21783653 | RAM: 5701MB
+```
+
+```elixir
+final_v7_1_emb
+```
+
+```elixir
+# --- V7 GREEDY DIAGNOSTIC (TOP-K = 1) ---
+seeds = [
+  "the fast green ",
+  "the slow white ",
+  "the tiny black ",
+  "the lazy brown ",
+  "the quick grey "
+]
+
+IO.puts("--- Running V7 Greedy Diagnostic ---\n")
+
+Enum.each(seeds, fn seed_text ->
+  seed_ids = seed_text |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+  
+  IO.write("#{seed_text}")
+  
+  Enum.reduce_while(1..30, seed_ids, fn _i, acc_ids ->
+    {_, current_len} = Nx.shape(acc_ids)
+    
+    current_emb = Nx.take(final_v7_emb, acc_ids)
+    {_, _, dim} = Nx.shape(current_emb)
+    
+    p_emb = DLM.Positional.build(current_len, dim)
+    input_with_pos = Nx.add(current_emb, p_emb)
+    
+    # Forward Pass
+    prediction_vec = DLM.Inference.predict_next(input_with_pos, final_v7_attn, final_v7_ff)
+    
+    # Euclidean Distance
+    emb_broadcast = Nx.reshape(final_v7_emb, {1, 256, 256})
+    diff = Nx.subtract(prediction_vec, emb_broadcast)
+    distances = Nx.sum(Nx.pow(diff, 2), axes: [-1]) |> Nx.reshape({256})
+
+    # GREEDY PICK: Choose the absolute closest character (smallest distance)
+    next_id_val = Nx.argmin(distances) |> Nx.to_number()
+    next_id = Nx.reshape(Nx.tensor([next_id_val]), {1, 1})
+
+    if next_id_val == 35 do # '#'
+      {:halt, acc_ids}
+    else
+      if next_id_val > 31 and next_id_val < 127, do: IO.write(<<next_id_val>>)
+      {:cont, Nx.concatenate([acc_ids, next_id], axis: 1)}
+    end
+  end)
+  
+  IO.puts("") 
+end)
+
+IO.puts("\nDiagnostic Complete.")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+--- Running V7 Greedy Diagnostic ---
+
+the fast green l l l l le le le l le le le le
+the slow white l l le l le le le le le le le 
+the tiny black l le le l le le le le le le le
+the lazy brown l l le le le le l le le le le 
+the quick grey l le le l le le le le le le le
+
+Diagnostic Complete.
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# --- V7 EXPORT SCRIPT: ARCHIVING THE GENERALIZED BRAIN ---
+
+IO.puts("Preparing to immortalize the V7 Tensors...")
+
+# 1. Define the Save Location
+# This creates a 'v7_brain' folder in your current working directory
+save_dir = Path.join(File.cwd!(), "v7_brain")
+File.mkdir_p!(save_dir)
+
+# 2. Package the Weights
+# We use :erlang.term_to_binary because it preserves the Nx metadata 
+# and the nested tuple structures (like {wq, wk, wv}) perfectly.
+weights_map = %{
+  embeddings: final_v7_emb,
+  attention: final_v7_attn,
+  feedforward: final_v7_ff,
+  positional: pos_emb,
+  timestamp: DateTime.utc_now() |> DateTime.to_string()
+}
+
+# 3. Serialize and Write
+binary_data = :erlang.term_to_binary(weights_map)
+file_path = Path.join(save_dir, "v7_weights_complete.bin")
+
+case File.write(file_path, binary_data) do
+  :ok ->
+    IO.puts("\n✅ SUCCESS: The V7 Brain has been saved to disk.")
+    IO.puts("Location: #{file_path}")
+    IO.puts("Size: #{Float.round(byte_size(binary_data) / 1_000_000, 2)} MB")
+    
+  {:error, reason} ->
+    IO.puts("\n❌ EXPORT FAILED: #{inspect(reason)}")
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Preparing to immortalize the V7 Tensors...
+
+✅ SUCCESS: The V7 Brain has been saved to disk.
+Location: /home/jbc50/v7_brain/v7_weights_complete.bin
+Size: 0.79 MB
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# --- V7 IMPORT SCRIPT: RECORECTING THE BRAIN ---
+
+IO.puts("Searching for V7 Brain on disk...")
+save_path = Path.join(File.cwd!(), "v7_brain/v7_weights_complete.bin")
+
+if File.exists?(save_path) do
+  # 1. Read the binary
+  binary_data = File.read!(save_path)
+  
+  # 2. Reconstitute the Map
+  brain_map = :erlang.binary_to_term(binary_data)
+  
+  # 3. Assign to variables
+  # We use the BinaryBackend to ensure they are ready for Nx
+  final_v7_emb  = brain_map.embeddings
+  final_v7_attn = brain_map.attention
+  final_v7_ff   = brain_map.feedforward
+  pos_emb       = brain_map.positional
+  
+  IO.puts("✅ V7 Brain Loaded Successfully!")
+  IO.puts("Model Timestamp: #{brain_map.timestamp}")
+else
+  IO.puts("❌ ERROR: No save file found at #{save_path}")
+end
+```
+
+```elixir
+# --- V5 FINAL REVEAL (NUCLEUS + REP PENALTY) ---
+seed_text = "the tiny black "
+max_generate = 30
+temp = 0.7
+top_p = 0.9
+rep_penalty = 5.0 # The Stutter Crusher
+
+seed_ids = seed_text |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+generated_ids = seed_ids
+
+IO.write("Generating: #{seed_text}")
+
+Enum.reduce_while(1..max_generate, generated_ids, fn _i, acc_ids ->
+  {_, current_len} = Nx.shape(acc_ids)
+  
+  # 1. Forward Pass (Dynamic Dimension Extraction)
+  current_emb = Nx.take(emb_w, acc_ids)
+  {_, _, dim} = Nx.shape(current_emb)
+  
+  p_emb = DLM.Positional.build(current_len, dim)
+  input_with_pos = Nx.add(current_emb, p_emb)
+  
+  # Pass to our clean Inference module
+  prediction_vec = DLM.Inference.predict_next(input_with_pos, final_v5_attn, final_v5_ff)
+  
+  # 2. Get Logits
+  logits = Nx.dot(prediction_vec, Nx.transpose(emb_w)) |> Nx.reshape({256})
+  
+  # 3. Apply Repetition Penalty to recent history
+  # Look at the last 4 characters to strongly discourage stutter loops
+  history_len = min(current_len, 4)
+  recent_history = acc_ids |> Nx.slice_along_axis(current_len - history_len, history_len, axis: 1) |> Nx.to_flat_list()
+  
+  biased_logits = Enum.reduce(recent_history, logits, fn char_id, acc_logits ->
+    mask = Nx.indexed_put(Nx.broadcast(0.0, {256}), Nx.tensor([[char_id]]), Nx.tensor([rep_penalty]))
+    Nx.subtract(acc_logits, mask)
+  end)
+
+  # 4. Nucleus Sampling (Top-P)
+  probs = DLM.Inference.softmax(Nx.divide(biased_logits, temp))
+  sorted_indices = Nx.argsort(probs, direction: :desc)
+  sorted_probs = Nx.take(probs, sorted_indices)
+  mask = Nx.less_equal(Nx.cumulative_sum(sorted_probs), top_p)
+  mask = Nx.put_slice(mask, [0], Nx.tensor([1], type: :u8)) 
+  
+  filtered_probs = Nx.multiply(sorted_probs, mask) |> then(&Nx.divide(&1, Nx.sum(&1)))
+  
+  # 5. Sample and Decode
+  {sample_idx, _} = Nx.Random.choice(Nx.Random.key(System.unique_integer([:positive])), Nx.iota({256}), filtered_probs)
+  next_id_val = Nx.take(sorted_indices, sample_idx) |> Nx.squeeze() |> Nx.to_number()
+  next_id = Nx.reshape(Nx.tensor([next_id_val]), {1, 1})
+
+  # 6. The Hard Stop Kill Switch
+  if next_id_val == 35 do # ASCII for '#'
+    {:halt, acc_ids}
+  else
+    if next_id_val > 31 and next_id_val < 127 do
+      IO.write(<<next_id_val>>)
+    end
+    {:cont, Nx.concatenate([acc_ids, next_id], axis: 1)}
+  end
+end)
+
+IO.puts("\n\nGeneration Complete.")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+error: undefined variable "final_v5_attn"
+└─ me_mind/v2.livemd#cell:iwoc73utdl5jddsm:24
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+** (CompileError) cannot compile cell (errors have been logged)
+```
+
+```elixir
+# --- THE V3 "BRAIN SCANNER" (TOP-K INSPECTION) ---
+seed_text = "the fast green "
+max_generate = 10
+temp = 0.5
+
+seed_ids = seed_text |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+generated_ids = seed_ids
+
+IO.puts("Inception Scan for: '#{seed_text}'\n")
+
+Enum.reduce(1..max_generate, generated_ids, fn _i, acc_ids ->
+  {_, current_len} = Nx.shape(acc_ids)
+  
+  # Forward Pass
+  current_emb = Nx.take(emb_w, acc_ids)
+  p_emb = DLM.Positional.build(current_len, 128)
+  input_with_pos = Nx.add(current_emb, p_emb)
+  prediction_vec = DLM.Inference.predict_next(input_with_pos, final_v3_attn, final_v3_ff)
+  
+  # Get Probabilities
+  logits = Nx.dot(prediction_vec, Nx.transpose(emb_w)) |> Nx.reshape({256})
+  probs = DLM.Inference.softmax(Nx.divide(logits, temp))
+  
+  # --- THE SCANNER ---
+  # Find the Top 5 most likely byte IDs
+  {top_probs, top_indices} = Nx.top_k(probs, k: 5)
+  
+  top_list = Enum.zip(Nx.to_flat_list(top_indices), Nx.to_flat_list(top_probs))
+  
+  formatted_top = Enum.map(top_list, fn {id, p} -> 
+    char = if id < 33, do: "[space]", else: <<id>>
+    "#{char}: #{Float.round(p * 100, 1)}%"
+  end) |> Enum.join(" | ")
+
+  IO.puts("Next Char Options -> #{formatted_top}")
+
+  # Pick the #1 winner to keep the sentence going
+  next_id = Nx.take(top_indices, Nx.tensor([0])) |> Nx.reshape({1, 1})
+  Nx.concatenate([acc_ids, next_id], axis: 1)
+end)
+
+IO.puts("\nScan Complete.")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Inception Scan for: 'the fast green '
+
+Next Char Options -> b: 99.9% | w: 0.1% | [space]: 0.0% | c: 0.0% | f: 0.0%
+Next Char Options -> e: 100.0% | [space]: 0.0% | [space]: 0.0% | [space]: 0.0% | [space]: 0.0%
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+** (ArgumentError) argument error
+    (stdlib 5.2) io.erl:103: :io.put_chars(:standard_io, [<<78, 101, 120, 116, 32, 67, 104, 97, 114, 32, 79, 112, 116, 105, 111, 110, 115, 32, 45, 62, 32, 91, 115, 112, 97, 99, 101, 93, 58, 32, 49, 48, 48, 46, 48, 37, 32, 124, 32, 101, 58, 32, 48, 46, 48, 37, 32, 124, 32, ...>>, 10])
+    #cell:3diib5auik26zmh5:35: (file)
+    #cell:3diib5auik26zmh5:11: (file)
+```
+
+```elixir
+# --- V3 GENERATIVE REVEAL (THE MULTIVERSE) ---
+seed_text = "the "
+max_generate = 28
+temp = 0.6 # 0.6 is the "sweet spot" for this MSE
+
+seed_ids = seed_text |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+generated_ids = seed_ids
+
+Enum.reduce(1..max_generate, generated_ids, fn _i, acc_ids ->
+  {_, current_len} = Nx.shape(acc_ids)
+  
+  # 1. Embeddings + Position
+  current_emb = Nx.take(emb_w, acc_ids)
+  p_emb = DLM.Positional.build(current_len, 128)
+  input_with_pos = Nx.add(current_emb, p_emb)
+  
+  # 2. Predict using V3 weights
+  prediction_vec = DLM.Inference.predict_next(input_with_pos, final_gen_attn, final_gen_ff)
+  
+  # 3. Probability Distribution (Softmax + Temp)
+  logits = Nx.dot(prediction_vec, Nx.transpose(emb_w)) |> Nx.reshape({256})
+  probs = DLM.Inference.softmax(Nx.divide(logits, temp))
+  
+  # 4. Sample the winner
+  {next_id_tensor, _} = Nx.Random.choice(Nx.Random.key(System.unique_integer([:positive])), Nx.iota({256}), probs)
+  next_id = Nx.reshape(next_id_tensor, {1, 1})
+
+  # Append and Print
+  new_acc = Nx.concatenate([acc_ids, next_id], axis: 1)
+  char = next_id |> Nx.to_flat_list() |> List.to_string()
+  IO.write(char)
+  
+  new_acc
+end)
+
+IO.puts("\n\nGeneration Complete.")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+error: undefined variable "final_v3_attn"
+└─ me_mind/v2.livemd#cell:i3hup4tailoj2o7v:18
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+** (CompileError) cannot compile cell (errors have been logged)
+```
+
+```elixir
+# --- V5.1 THE DEEP BURN (RESUMING TRAINING) ---
+max_lr = 0.1  # Starting at a low simmer
+min_lr = 0.01 # Fading to almost nothing
+chunks = 20   # A long, slow bake
+epochs_per_chunk = 400
+batch_size = 16 # Doubled to 16 to smooth out the MSE bounce!
+
+IO.puts("--- Resuming 256-D Burn (The Deep Bake) ---")
+
+# CRITICAL: We pass in final_v5_attn and final_v5_ff to pick up where we left off
+{deep_v5_attn, deep_v5_ff, _} = 
+  Enum.reduce(1..chunks, {final_v5_attn, final_v5_ff, 0.0}, fn c, {aw, fw, _} ->
+    current_lr = max_lr - ((max_lr - min_lr) * (c / chunks))
+    
+    indices = Enum.take_random(0..(length(v4_sentences) - 1), batch_size) |> Nx.tensor()
+    
+    batch_inputs = 
+      v4_inputs_ids 
+      |> Nx.take(indices) 
+      |> then(&Nx.take(emb_w, &1)) 
+      |> Nx.add(pos_emb) 
+
+    batch_targets = 
+      v4_targets_ids 
+      |> Nx.take(indices) 
+      |> then(&Nx.take(emb_w, &1))
+
+    {next_aw, next_fw, loss} = 
+       DLM.Optimizer.run_chunk(batch_inputs, batch_targets, aw, fw, current_lr, iterations: epochs_per_chunk)
+    
+    l_val = Nx.to_number(loss)
+    aw_safe = Nx.backend_copy(next_aw, Nx.BinaryBackend)
+    fw_safe = Nx.backend_copy(next_fw, Nx.BinaryBackend)
+    
+    Nx.backend_deallocate(next_aw); Nx.backend_deallocate(next_fw); Nx.backend_deallocate(loss)
+    :erlang.garbage_collect()
+    
+    IO.puts("Deep Chunk #{c} | LR: #{Float.round(current_lr, 4)} | MSE: #{Float.round(l_val, 8)} | RAM: #{round(:erlang.memory(:total) / 1_000_000)}MB")
+    {aw_safe, fw_safe, l_val}
+  end)
+
+IO.puts("\n✅ V5 Deep Burn Complete!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+--- Resuming 256-D Burn (The Deep Bake) ---
+Deep Chunk 1 | LR: 0.0955 | MSE: 0.91294104 | RAM: 2413MB
+Deep Chunk 2 | LR: 0.091 | MSE: 0.91107118 | RAM: 2548MB
+Deep Chunk 3 | LR: 0.0865 | MSE: 0.90156031 | RAM: 2681MB
+Deep Chunk 4 | LR: 0.082 | MSE: 0.90876698 | RAM: 2815MB
+Deep Chunk 5 | LR: 0.0775 | MSE: 0.90701377 | RAM: 2958MB
+Deep Chunk 6 | LR: 0.073 | MSE: 0.90002608 | RAM: 3156MB
+Deep Chunk 7 | LR: 0.0685 | MSE: 0.90353733 | RAM: 3289MB
+Deep Chunk 8 | LR: 0.064 | MSE: 0.90436703 | RAM: 3423MB
+Deep Chunk 9 | LR: 0.0595 | MSE: 0.90639073 | RAM: 3557MB
+Deep Chunk 10 | LR: 0.055 | MSE: 0.90726477 | RAM: 3691MB
+Deep Chunk 11 | LR: 0.0505 | MSE: 0.90254563 | RAM: 3824MB
+Deep Chunk 12 | LR: 0.046 | MSE: 0.90351814 | RAM: 3958MB
+Deep Chunk 13 | LR: 0.0415 | MSE: 0.90086544 | RAM: 4091MB
+Deep Chunk 14 | LR: 0.037 | MSE: 0.90309662 | RAM: 4239MB
+Deep Chunk 15 | LR: 0.0325 | MSE: 0.90419918 | RAM: 4465MB
+Deep Chunk 16 | LR: 0.028 | MSE: 0.90295452 | RAM: 4599MB
+Deep Chunk 17 | LR: 0.0235 | MSE: 0.89428133 | RAM: 4732MB
+Deep Chunk 18 | LR: 0.019 | MSE: 0.90285975 | RAM: 4866MB
+Deep Chunk 19 | LR: 0.0145 | MSE: 0.90734333 | RAM: 5000MB
+Deep Chunk 20 | LR: 0.01 | MSE: 0.90655243 | RAM: 5133MB
+
+✅ V5 Deep Burn Complete!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```

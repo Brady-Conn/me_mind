@@ -1,0 +1,831 @@
+# Phase 2
+
+```elixir
+# Cell 1: Setup
+Mix.install([
+  {:nx, "~> 0.7"},
+  {:exla, "~> 0.7"},
+  {:kino, "~> 0.12"}
+])
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## setup2u
+
+```elixir
+# Run this, then Restart Runtime (Important!)
+System.put_env("XLA_FLAGS", "--xla_cpu_parallel_parallelism=4")
+System.put_env("XLA_CPU_COMPILATION_PARALLELISM", "4")
+
+# This tells the underlying math library (OpenBLAS/TBB) how many threads to use
+System.put_env("OMP_NUM_THREADS", "4")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Brain
+
+```elixir
+defmodule DLM.Transformer do
+  import Nx.Defn
+
+  defn layer_norm(x, gamma, beta) do
+    mean = Nx.mean(x, axes: [-1], keep_axes: true)
+    variance = Nx.variance(x, axes: [-1], keep_axes: true)
+    normed = Nx.divide(Nx.subtract(x, mean), Nx.sqrt(Nx.add(variance, 1.0e-5)))
+    Nx.add(Nx.multiply(normed, gamma), beta)
+  end
+
+  defn attention(x, w_qkv, mask) do
+    qkv = Nx.dot(x, w_qkv) 
+    {q, k, v} = {qkv, qkv, qkv}
+    k_t = Nx.transpose(k, axes: [0, 2, 1])
+
+    logits = Nx.dot(q, [2], [0], k_t, [1], [0]) |> Nx.divide(Nx.sqrt(256))
+    logits = Nx.add(logits, mask)
+    
+    # --- 🛡️ STABLE ATTENTION SOFTMAX ---
+    # Subtract max logit to keep exp() inputs <= 0 (max exp result = 1.0)
+    logits_max = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    exp = Nx.exp(Nx.subtract(logits, logits_max))
+    sum = Nx.sum(exp, axes: [-1], keep_axes: true) |> Nx.add(1.0e-10)
+    attn = Nx.divide(exp, sum)
+    
+    Nx.dot(attn, [2], [0], v, [1], [0])
+  end
+
+  defn block(x, a1, f1, a2, f2, g1, b1, g2, b2, mask) do
+    # Layer 1: Attention
+    x_norm = layer_norm(x, g1, b1)
+    attn_out = attention(x_norm, a1, mask)
+    x = Nx.add(x, Nx.dot(attn_out, a2))
+
+    # Layer 2: FeedForward (Now with ReLU stability)
+    x_norm = layer_norm(x, g2, b2)
+    # --- 🛡️ RELU ACTIVATION ---
+    # Replacing exp() with max(0, x). Much more stable.
+    ff_hidden = Nx.dot(x_norm, f1) |> Nx.max(0) 
+    ff_out = Nx.dot(ff_hidden, f2)
+    Nx.add(x, ff_out)
+  end
+end
+
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim))))
+  end
+end
+
+defmodule DLM.Mask do
+  def causal(len) do
+    Nx.iota({len, 1})
+    |> Nx.less(Nx.iota({1, len}))
+    |> Nx.multiply(-1.0e9)
+    # Removed reshape — keep original [seq, seq] shape
+    # Nx will broadcast over the batch dim naturally
+  end
+end
+
+defmodule DLM.Optimizer do
+  import Nx.Defn
+
+  defn apply_adam(p, g, m, v, lr, step) do
+    g = Nx.clip(g, -1.0, 1.0)
+
+    b1 = 0.9
+    b2 = 0.999
+    eps = 1.0e-8
+
+    new_m = Nx.add(Nx.multiply(b1, m), Nx.multiply(1 - b1, g))
+    new_v = Nx.add(Nx.multiply(b2, v), Nx.multiply(1 - b2, Nx.pow(g, 2)))
+
+    m_hat = Nx.divide(new_m, Nx.subtract(1, Nx.pow(b1, step)))
+    v_hat = Nx.divide(new_v, Nx.subtract(1, Nx.pow(b2, step)))
+
+    new_p = Nx.subtract(p, Nx.divide(Nx.multiply(lr, m_hat), Nx.add(Nx.sqrt(v_hat), eps)))
+    {new_p, new_m, new_v}
+  end
+
+  # MUZZLE REMOVED FROM ARGUMENTS
+  defn loss_fn(ins, tgs, params, pos_emb, mask) do
+    {e, a1, f1, a2, f2, lmw, lmb, g1, b1, g2, b2} = params
+    x = Nx.add(Nx.take(e, ins), pos_emb)
+    x = DLM.Transformer.block(x, a1, f1, a2, f2, g1, b1, g2, b2, mask)
+    
+    # MUZZLE REMOVED FROM LOGITS
+    logits = Nx.add(Nx.dot(x, lmw), lmb) 
+
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    stable_logits = Nx.subtract(logits, max_logits)
+    sum_exp = Nx.sum(Nx.exp(stable_logits), axes: [-1], keep_axes: true) |> Nx.add(1.0e-10)
+    log_sum_exp = Nx.add(max_logits, Nx.log(sum_exp))
+
+    targets_exp = Nx.new_axis(tgs, -1)
+    vocab_range = Nx.iota({1, 1, 128}, axis: 2)
+    target_mask = Nx.equal(vocab_range, targets_exp)
+    target_logits = Nx.sum(Nx.multiply(logits, target_mask), axes: [-1], keep_axes: true)
+
+    Nx.mean(Nx.subtract(log_sum_exp, target_logits))
+  end
+
+  # MUZZLE REMOVED FROM ARGUMENTS
+  defn adam_step(ins, tgs, p, m, v, pos_emb, mask, lr, step) do
+    {loss, grads} = value_and_grad(p, fn params -> 
+      loss_fn(ins, tgs, params, pos_emb, mask) # MUZZLE REMOVED
+    end)
+
+    {p_e, p_a1, p_f1, p_a2, p_f2, p_lmw, p_lmb, p_g1, p_b1, p_g2, p_b2} = p
+    {g_e, g_a1, g_f1, g_a2, g_f2, g_lmw, g_lmb, g_g1, g_b1, g_g2, g_b2} = grads
+    {m_e, m_a1, m_f1, m_a2, m_f2, m_lmw, m_lmb, m_g1, m_b1, m_g2, m_b2} = m
+    {v_e, v_a1, v_f1, v_a2, v_f2, v_lmw, v_lmb, v_g1, v_b1, v_g2, v_b2} = v
+
+    {ne, me, ve}       = apply_adam(p_e, g_e, m_e, v_e, lr, step)
+    {na1, ma1, va1}    = apply_adam(p_a1, g_a1, m_a1, v_a1, lr, step)
+    {nf1, mf1, vf1}    = apply_adam(p_f1, g_f1, m_f1, v_f1, lr, step)
+    {na2, ma2, va2}    = apply_adam(p_a2, g_a2, m_a2, v_a2, lr, step)
+    {nf2, mf2, vf2}    = apply_adam(p_f2, g_f2, m_f2, v_f2, lr, step)
+    {nlmw, mlmw, vlmw} = apply_adam(p_lmw, g_lmw, m_lmw, v_lmw, lr, step)
+    {nlmb, mlmb, vlmb} = apply_adam(p_lmb, g_lmb, m_lmb, v_lmb, lr, step)
+    {ng1, mg1, vg1}    = apply_adam(p_g1, g_g1, m_g1, v_g1, lr, step)
+    {nb1, mb1, vb1}    = apply_adam(p_b1, g_b1, m_b1, v_b1, lr, step)
+    {ng2, mg2, vg2}    = apply_adam(p_g2, g_g2, m_g2, v_g2, lr, step)
+    {nb2, mb2, vb2}    = apply_adam(p_b2, g_b2, m_b2, v_b2, lr, step)
+
+    new_p = {ne, na1, nf1, na2, nf2, nlmw, nlmb, ng1, nb1, ng2, nb2}
+    new_m = {me, ma1, mf1, ma2, mf2, mlmw, mlmb, mg1, mb1, mg2, mb2}
+    new_v = {ve, va1, vf1, va2, vf2, vlmw, vlmb, vg1, vb1, vg2, vb2}
+
+    {new_p, new_m, new_v, loss}
+  end
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Checkpoint restore
+
+```elixir
+# --- THE AUTO-RESTORER ---
+checkpoint_path = "v13_full_state.bin"
+genesis_path = "v13_genesis.bin"
+
+{params, m_state, v_state, start_step} = if File.exists?(checkpoint_path) do
+  IO.puts("♻️ Resuming from Full State Checkpoint...")
+  
+  # Load the {p, m, v, step} quadruple
+  {p, m, v, step} = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+  
+  # Move everything back to the CPU backend
+  p = p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy/1) |> List.to_tuple()
+  m = m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy/1) |> List.to_tuple()
+  v = v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy/1) |> List.to_tuple()
+  
+  {p, m, v, step}
+else
+  IO.puts("🌱 No full checkpoint found. Loading Genesis Weights...")
+  
+  # Fallback to loading just the weights and initializing optimizer to zero
+  p = File.read!(genesis_path) 
+      |> :erlang.binary_to_term() 
+      |> Tuple.to_list() 
+      |> Enum.map(&Nx.backend_copy/1) 
+      |> List.to_tuple()
+
+  zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0), Nx.shape(t)) |> Nx.backend_copy() end
+  m = p |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+  v = m
+
+  {p, m, v, 1}
+end
+
+IO.puts("📍 Starting at Step: #{start_step}")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Init
+
+```elixir
+vocab_size = 128
+embed_dim  = 256
+ff_dim     = embed_dim * 4  # 1024
+
+# ---------------------------------------------------------------------------
+# Weight initializer
+# Using 0.01 std — conservative, good for training stability on CPU.
+# Kaiming/He init (std = sqrt(2/fan_in)) would be more theoretically
+# motivated for ReLU networks, but 0.01 has been working for you so keep it.
+# All tensors copied to BinaryBackend for CPU training.
+# ---------------------------------------------------------------------------
+init_param = fn shape, current_key ->
+  {tensor, next_key} = Nx.Random.normal(current_key, 0.0, 0.01, shape: shape, type: :f32)
+  {Nx.backend_copy(tensor, Nx.BinaryBackend), next_key}
+end
+
+key = Nx.Random.key(42)
+
+# Embedding
+{embed, key} = init_param.({vocab_size, embed_dim}, key)
+
+# Attention — now 4 separate matrices (Q, K, V, O)
+# Previously a1 was doing the job of all four — now each can specialise
+{w_q, key} = init_param.({embed_dim, embed_dim}, key)
+{w_k, key} = init_param.({embed_dim, embed_dim}, key)
+{w_v, key} = init_param.({embed_dim, embed_dim}, key)
+{w_o, key} = init_param.({embed_dim, embed_dim}, key)
+
+# FeedForward
+{w_ff1, key} = init_param.({embed_dim, ff_dim}, key)
+{w_ff2, key} = init_param.({ff_dim, embed_dim}, key)
+
+# Language model head
+{lm_w, key} = init_param.({embed_dim, vocab_size}, key)
+
+# Layer norm params — gamma=1, beta=0 is correct, these are not random
+ones  = Nx.broadcast(Nx.tensor(1.0, type: :f32), {embed_dim}) |> Nx.backend_copy(Nx.BinaryBackend)
+zeros = Nx.broadcast(Nx.tensor(0.0, type: :f32), {embed_dim}) |> Nx.backend_copy(Nx.BinaryBackend)
+lm_b  = Nx.broadcast(Nx.tensor(0.0, type: :f32), {vocab_size}) |> Nx.backend_copy(Nx.BinaryBackend)
+
+# Params tuple — order must match loss_fn/adam_step destructuring exactly:
+# {embed, w_q, w_k, w_v, w_o, w_ff1, w_ff2, lm_w, lm_b, g1, b1, g2, b2}
+genesis_weights = {embed, w_q, w_k, w_v, w_o, w_ff1, w_ff2, lm_w, lm_b, ones, zeros, ones, zeros}
+
+File.write!("v14_genesis.bin", :erlang.term_to_binary(genesis_weights))
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## SecScrub
+
+```elixir
+# --- V13.0: THE LEAN DICTIONARY GENERATOR ---
+input_path = "v12_structured_map.txt"
+output_path = "v13_lean_dictionary.txt"
+
+# The "Victorian Fluff" we want to violently remove from the dataset
+offending_phrases = [
+  "the state of ", "a state of ", "state of ",
+  "the act of ", "an act of ", "act of ",
+  "pertaining to ", "of or pertaining to ",
+  "a substance ", "the substance ",
+  "one who ", "that which ", "a quality of ",
+  "the quality of ", "any of a ", "a small "
+]
+
+lines = File.read!(input_path) |> String.split("\n", trim: true)
+
+# Process the lines
+cleaned_lines = Enum.map(lines, fn line ->
+  # 1. Split the line to isolate the definition text so we don't mess up the tags
+  case Regex.run(~r/(\[W\].*?\[T\].*?\[D\])(.*)/, line) do
+    [_, tags, definition] ->
+      # 2. Lowercase the definition temporarily for easier matching, 
+      # but we use Regex with case-insensitivity (?i) to preserve original case
+      lean_def = Enum.reduce(offending_phrases, definition, fn phrase, acc ->
+        Regex.replace(~r/#{phrase}/i, acc, "")
+      end)
+      
+      # 3. Clean up any double spaces or weird punctuation left behind
+      lean_def = String.replace(lean_def, ~r/\s+/, " ") |> String.trim()
+      
+      "#{tags}#{lean_def}"
+    _ -> 
+      line # Fallback if regex fails
+  end
+end)
+
+# Filter out lines that became completely empty after stripping
+final_lines = Enum.reject(cleaned_lines, fn line -> 
+  String.ends_with?(line, "[D]") or String.ends_with?(line, "[D] ") 
+end)
+
+File.write!(output_path, Enum.join(final_lines, "\n"))
+
+original_count = length(lines)
+new_count = length(final_lines)
+removed = original_count - new_count
+
+IO.puts("✅ V13 Lean Dictionary Generated!")
+IO.puts("📉 Original Entries: #{original_count}")
+IO.puts("📉 Lean Entries: #{new_count} (#{removed} completely empty entries removed)")
+IO.puts("🔥 The 'State of the State' loop has been deleted from reality.")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## ARCHIVE
+
+```elixir
+# --- THE V12 ARCHIVE ---
+current_weights = "v12_phase2_bridge.bin"
+archive_name = "v12_grammar_foundation_archive.bin"
+
+if File.exists?(current_weights) do
+  File.cp!(current_weights, archive_name)
+  IO.puts("✅ V12 Weights successfully archived as: #{archive_name}")
+else
+  IO.puts("❌ Could not find V12 weights to archive.")
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Thx Create
+
+```elixir
+# --- V12.26: THE SEMANTIC MIXER (Dataset Augmentation) ---
+input_path = "v12_structured_map.txt"
+output_path = "v12_semantic_mix.txt"
+
+regex = ~r/\[W\](.*?)\[T\](.*?)\[D\](.*)/
+
+# Stop words to filter from "related" extractions
+stop_words = ~w[a an the of or to in is are was were be been
+                being have has had do does did will would could
+                should may might shall can this that these those
+                with for from by at as it its]
+
+lines = File.read!(input_path) |> String.split("\n", trim: true)
+
+mixed_lines =
+  Enum.map(lines, fn line ->
+    case Regex.run(regex, line) do
+      [_, word, pos, definition] ->
+        rand = :rand.uniform(100)
+
+        cond do
+          # 30% — Thesaurus/Relational mode
+          # Extracts meaningful content words from the definition
+          rand <= 30 ->
+            related =
+              definition
+              |> String.downcase()
+              |> String.replace(~r/[^a-z ]/, "")
+              |> String.split(" ", trim: true)
+              |> Enum.reject(&(&1 in stop_words))
+              |> Enum.reject(&(String.length(&1) < 3))  # drop very short words
+              |> Enum.take(3)
+              |> Enum.join(", ")
+
+            "[W]#{String.trim(word)} [R]Related: #{related}."
+
+          # 30% — Jeopardy/reverse mode
+          rand <= 60 ->
+            "[D]#{String.trim(definition)} [W]#{String.trim(word)}."
+
+          # 40% — Original structured format
+          true ->
+            line
+        end
+
+      _ ->
+        line
+    end
+  end)
+
+File.write!(output_path, Enum.join(mixed_lines, "\n"))
+IO.puts("✅ Generated #{length(mixed_lines)} mixed entries.")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inference module
+
+```elixir
+defmodule DLM.Inference do
+  import Nx.Defn
+
+  # --- 🏎️ THE XLA COMPILED GENERATION LOOP ---
+  defn generate_loop(prompt_ids, params, pos_emb, muzzle, max_new_tokens) do
+    {e, a1, f1, a2, f2, lmw, lmb, g1, b1, g2, b2} = params
+    {_, prompt_len} = Nx.shape(prompt_ids)
+
+    # 1. Pre-allocate the fixed memory buffer. 
+    # By forcing the shape to be exactly {1, 256}, XLA compiles ONE static graph.
+    # This is how we defeat the RAM leak!
+    max_seq = 256
+    buffer = Nx.broadcast(0, {1, max_seq})
+    buffer = Nx.put_slice(buffer, [0, 0], prompt_ids)
+
+    # 2. Build the Static Causal Mask ONCE
+    mask = DLM.Mask.causal(max_seq)
+
+    # 3. The XLA While Loop
+    # State holds: {current_buffer_state, current_step_index}
+    initial_state = {buffer, prompt_len}
+    total_target_len = Nx.add(prompt_len, max_new_tokens)
+
+    {final_buffer, _} = 
+      while initial_state, fn {_, step} -> Nx.less(step, total_target_len) do
+        {current_buffer, current_step} ->
+          
+          # --- Forward Pass (Fixed Shape: 256) ---
+          # We embed the whole buffer, but the causal mask ensures the model 
+          # only pays attention to tokens up to the current_step.
+          x = Nx.add(Nx.take(e, current_buffer), pos_emb)
+          x = DLM.Transformer.block(x, a1, f1, a2, f2, g1, b1, g2, b2, mask)
+
+          # --- Extract Logits ---
+          logits = Nx.add(Nx.dot(x, lmw), lmb) |> Nx.add(muzzle)
+
+          # We pluck the logit for the exact token we are trying to predict
+          # (current_step - 1 is the last known token)
+          step_logits = Nx.slice(logits, [0, current_step - 1, 0], [1, 1, 128])
+          
+          # Get the most likely next ID
+          next_id = Nx.argmax(step_logits, axis: -1)
+
+          # Inject the new ID into our buffer for the next loop iteration
+          updated_buffer = Nx.put_slice(current_buffer, [0, current_step], next_id)
+
+          {updated_buffer, current_step + 1}
+      end
+
+    # Return the full buffer to standard Elixir
+    final_buffer
+  end
+
+  # --- ⌨️ THE ELIXIR WRAPPER ---
+  def sample(checkpoint_path, prompt_str, max_new_tokens \\ 40) do
+    IO.puts("\n🤖 --- V13 GENERATOR ---")
+    
+    # Load weights
+    params = File.read!(checkpoint_path) 
+             |> :erlang.binary_to_term() 
+             |> Tuple.to_list() 
+             |> Enum.map(&Nx.backend_copy/1) 
+             |> List.to_tuple()
+
+    # Rebuild Static Assets for this scope
+    pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy()
+    
+    allowed_chars = ~c" abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,:;-'\"()[]"
+    muzzle_cpu = Nx.broadcast(Nx.tensor(-1.0e10, type: :f32), {128})
+    muzzle = Enum.reduce(allowed_chars, muzzle_cpu, fn char, acc ->
+      Nx.indexed_put(acc, Nx.tensor([[char]]), Nx.tensor([0.0]))
+    end) |> Nx.backend_copy()
+
+    # Prepare Prompt
+    ids = prompt_str |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+    {_, prompt_len} = Nx.shape(ids)
+
+    # Generate!
+    full_buffer = generate_loop(ids, params, pos_emb, muzzle, max_new_tokens)
+
+    # Slice out only what we care about and convert to string
+    final_ids = Nx.slice(full_buffer, [0, 0], [1, prompt_len + max_new_tokens])
+    output_str = final_ids |> Nx.to_flat_list() |> List.to_string()
+
+    IO.puts("Prompt:  #{prompt_str}")
+    IO.puts("Output:  #{output_str}\n")
+  end
+end
+```
+
+```elixir
+# Let's see if it can finish spelling "Apple" and start the definition!
+DLM.Inference.sample("v13_genesis.bin", "[W]App", 50)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## inline test
+
+```elixir
+defmodule DLM.Probe do
+  import Nx.Defn
+
+  # --- 🛠️ Added `mask` as a required parameter here ---
+  defn get_next_token_probs(ids, params, pos_emb, mask) do
+    {e, a1, f1, a2, f2, lmw, lmb, g1, b1, g2, b2} = params
+    {_, len} = Nx.shape(ids)
+
+    x = Nx.add(Nx.take(e, ids), Nx.slice(pos_emb, [0, 0], [len, 256]))
+    
+    # Pass the pre-computed mask straight into the Transformer block
+    x = DLM.Transformer.block(x, a1, f1, a2, f2, g1, b1, g2, b2, mask)
+
+    # Grab the hidden state of the VERY LAST token
+    last_token_hidden = x[0][-1]
+    
+    # Calculate logits
+    logits = Nx.add(Nx.dot(last_token_hidden, lmw), lmb)
+    
+    # Atomic Stable Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    stable_logits = Nx.subtract(logits, max_logits)
+    exp_logits = Nx.exp(stable_logits)
+    sum_exp = Nx.sum(exp_logits, axes: [-1], keep_axes: true)
+    
+    Nx.divide(exp_logits, sum_exp)
+  end
+
+  def run(checkpoint_path, pos_emb, prompts) do
+    IO.puts("\n🔬 --- V13 PROBE TEST ---")
+
+    params = File.read!(checkpoint_path) 
+             |> :erlang.binary_to_term() 
+             |> Tuple.to_list() 
+             |> Enum.map(&Nx.backend_copy/1) 
+             |> List.to_tuple()
+
+    Enum.each(prompts, fn prompt_str ->
+      ids = prompt_str |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+      
+      # --- 🛠️ Generate the mask OUTSIDE the defn ---
+      {_, len} = Nx.shape(ids)
+      mask = DLM.Mask.causal(len) |> Nx.backend_copy()
+      
+      # Pass the mask into the XLA graph
+      probs = get_next_token_probs(ids, params, pos_emb, mask) |> Nx.to_flat_list()
+
+      top_chars =
+        probs
+        |> Enum.with_index()
+        |> Enum.sort_by(fn {prob, _idx} -> prob end, :desc)
+        |> Enum.take(3)
+        |> Enum.map(fn {prob, idx} ->
+          char_display = case <<idx::utf8>> do
+            "\n" -> "\\n"
+            " " -> "[SPACE]"
+            c -> c
+          end
+          "#{char_display} (#{Float.round(prob * 100, 2)}%)"
+        end)
+        |> Enum.join("  |  ")
+
+      IO.puts("Prompt: '#{prompt_str}'\n  ↳ #{top_chars}\n")
+    end)
+  end
+end
+```
+
+```elixir
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy()
+
+prompts = [
+  "[", 
+  "[W]Apple", 
+  "[W]App" 
+]
+
+DLM.Probe.run("v13_genesis.bin", pos_emb, prompts)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Data stream
+
+```elixir
+defmodule DLM.DataStreamer do  # renamed from V13 to match your module convention
+  def stream(path, seq_len, batch_size) do
+    path
+    |> File.read!()
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.slice(0, seq_len) |> Nx.tensor(type: :s64)
+      tgs = chunk |> Enum.slice(1, seq_len) |> Nx.tensor(type: :s64)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## GC
+
+```elixir
+# --- THE STANDALONE MANUAL FLUSH ---
+IO.puts("🕵️‍♂️ Janitor entering the room...")
+
+# 1. Clear the main training process
+:erlang.garbage_collect()
+
+# 2. Clear the binary references specifically
+:erlang.garbage_collect(:erlang.whereis(:user)) 
+
+# 3. Request a global sweep
+:erlang.check_old_code(DLM.Transformer) # Triggers a check on compiled modules
+
+IO.puts("✅ Janitor finished. Check the RAM meter in the sidebar!")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## training
+
+```elixir
+# --- Shape Sanity Check (self-contained) ---
+embed_dim  = 256
+ff_dim     = embed_dim * 4
+vocab_size = 128
+seq_len    = 256
+batch_size = 12
+
+genesis_path    = "dlm_genesis.bin"
+full_state_path = "dlm_full_state.bin"
+path            = "dlm_dictionary.txt"
+
+# Load whatever checkpoint exists
+{params, m_state, v_state, start_step} =
+  cond do
+    File.exists?(full_state_path) ->
+      IO.puts("Loading full state...")
+      {p, m, v, step} = File.read!(full_state_path) |> :erlang.binary_to_term()
+      to_active = fn t -> Tuple.to_list(t) |> Enum.map(&Nx.backend_copy/1) |> List.to_tuple() end
+      {to_active.(p), to_active.(m), to_active.(v), step}
+
+    File.exists?(genesis_path) ->
+      IO.puts("Loading genesis...")
+      p = File.read!(genesis_path) |> :erlang.binary_to_term()
+        |> Tuple.to_list() |> Enum.map(&Nx.backend_copy/1) |> List.to_tuple()
+      zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0), Nx.shape(t)) |> Nx.backend_copy() end
+      m = p |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+      {p, m, m, 1}
+
+    true ->
+      IO.puts("❌ No checkpoint or genesis found.")
+      System.halt(1)
+  end
+
+# 1. Param shape check
+# Map index → {name, expected_shape} so we don't rely on the tuple being correct
+expected = [
+  {:embed, {vocab_size, embed_dim}},
+  {:w_q,   {embed_dim, embed_dim}},
+  {:w_k,   {embed_dim, embed_dim}},
+  {:w_v,   {embed_dim, embed_dim}},
+  {:w_o,   {embed_dim, embed_dim}},
+  {:w_ff1, {embed_dim, ff_dim}},
+  {:w_ff2, {ff_dim, embed_dim}},
+  {:lm_w,  {embed_dim, vocab_size}},
+  {:lm_b,  {vocab_size}},
+  {:g1,    {embed_dim}},
+  {:b1,    {embed_dim}},
+  {:g2,    {embed_dim}},
+  {:b2,    {embed_dim}}
+]
+
+IO.puts("\n--- Param Shapes (#{tuple_size(params)} tensors in tuple) ---")
+params
+|> Tuple.to_list()
+|> Enum.zip(expected)
+|> Enum.each(fn {tensor, {name, exp_shape}} ->
+  actual = Nx.shape(tensor)
+  status = if actual == exp_shape, do: "✅", else: "❌ MISMATCH"
+  IO.puts("#{status} #{name}: expected #{inspect(exp_shape)}, got #{inspect(actual)}")
+end)
+
+# 2. Mask and pos_emb
+pos_emb = DLM.Positional.build(seq_len, embed_dim) |> Nx.backend_copy()
+mask    = DLM.Mask.causal(seq_len) |> Nx.backend_copy()
+
+IO.puts("\n--- Static Assets ---")
+IO.puts("pos_emb shape: #{inspect(Nx.shape(pos_emb))} (expected: {#{seq_len}, #{embed_dim}})")
+IO.puts("mask shape:    #{inspect(Nx.shape(mask))} (expected: {1, #{seq_len}, #{seq_len}})")
+
+# 3. Single test step
+IO.puts("\n--- Test Step ---")
+{test_ins, test_tgs} =
+  DLM.DataStreamer.stream(path, seq_len, batch_size)
+  |> Enum.take(1)
+  |> hd()
+
+IO.puts("ins shape: #{inspect(Nx.shape(test_ins))}")
+IO.puts("tgs shape: #{inspect(Nx.shape(test_tgs))}")
+
+{_, _, _, test_loss} =
+  DLM.Optimizer.adam_step(
+    test_ins, test_tgs, params, m_state, v_state,
+    pos_emb, mask,
+    Nx.tensor(0.0002, type: :f32),
+    Nx.tensor(1, type: :s32)
+  )
+
+IO.puts("✅ Test step passed. Loss: #{Nx.to_number(test_loss)}")
+IO.puts("RAM: #{round(:erlang.memory(:total) / 1_048_576)}MB")
+```
+
+```elixir
+# ===========================================================================
+# Configuration
+# ===========================================================================
+path            = "dlm_dictionary.txt"
+full_state_path = "dlm_full_state.bin"
+genesis_path    = "dlm_genesis.bin"
+
+seq_len                = 256
+batch_size             = 12
+start_lr               = 0.00020
+end_lr                 = 0.00005
+epochs                 = 15
+total_estimated_steps  = epochs * 5000
+
+# ===========================================================================
+# 1. Auto-Restorer — resumes from checkpoint or loads genesis weights
+# ===========================================================================
+to_active = fn tuple ->
+  tuple |> Tuple.to_list() |> Enum.map(&Nx.backend_copy/1) |> List.to_tuple()
+end
+
+{params, m_state, v_state, start_step} =
+  cond do
+    File.exists?(full_state_path) ->
+      IO.puts("♻️  Resuming from checkpoint...")
+      {p, m, v, step} = File.read!(full_state_path) |> :erlang.binary_to_term()
+      {to_active.(p), to_active.(m), to_active.(v), step}
+
+    File.exists?(genesis_path) ->
+      IO.puts("🌱 Loading genesis weights...")
+      p = File.read!(genesis_path) |> :erlang.binary_to_term() |> to_active.()
+
+      zero_like = fn t ->
+        Nx.broadcast(Nx.tensor(0.0), Nx.shape(t)) |> Nx.backend_copy()
+      end
+      m = p |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+
+      {p, m, m, 1}  # v starts identical to m — no need to build twice
+
+    true ->
+      IO.puts("❌ No checkpoint or genesis found. Run the initializer first.")
+      System.halt(1)
+  end
+
+IO.puts("📍 Starting at step #{start_step}")
+
+# ===========================================================================
+# 2. Static assets — built once, reused every step
+# ===========================================================================
+pos_emb = DLM.Positional.build(seq_len, 256) |> Nx.backend_copy()
+mask    = DLM.Mask.causal(seq_len) |> Nx.backend_copy()
+
+# ===========================================================================
+# 3. Checkpoint helper — called every 500 steps
+# ===========================================================================
+save_checkpoint = fn path, p, m, v, step ->
+  to_binary = fn tuple ->
+    tuple |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple()
+  end
+  state = {to_binary.(p), to_binary.(m), to_binary.(v), step}
+  File.write!(path, :erlang.term_to_binary(state))
+  IO.puts("💾 Checkpoint saved at step #{step}")
+end
+
+# ===========================================================================
+# 4. Training loop
+# ===========================================================================
+IO.puts("🚀 DLM Training — seq_len=#{seq_len} batch=#{batch_size}")
+
+Enum.reduce(1..epochs, {params, m_state, v_state, start_step}, fn epoch, epoch_acc ->
+  IO.puts("\n--- Epoch #{epoch} ---")
+
+  DLM.DataStreamer.stream(path, seq_len, batch_size)
+  |> Enum.reduce(epoch_acc, fn {ins, tgs}, {p, m, v, step} ->
+
+    # Linear LR decay — wrap in tensor to prevent XLA recompilation
+    progress   = min(step / total_estimated_steps, 1.0)
+    lr         = Nx.tensor(start_lr - progress * (start_lr - end_lr), type: :f32)
+    step_t     = Nx.tensor(step, type: :s32)
+
+    {new_p, new_m, new_v, loss} =
+      DLM.Optimizer.adam_step(ins, tgs, p, m, v, pos_emb, mask, lr, step_t)
+
+    # High-frequency GC to prevent BEAM memory accumulation
+    if rem(step, 10) == 0, do: :erlang.garbage_collect(self())
+
+    # Logging, halting, and checkpointing every 500 steps
+    if rem(step, 500) == 0 do
+      loss_val = Nx.to_number(loss)
+      mem_mb   = round(:erlang.memory(:total) / 1_048_576)
+
+      cond do
+        # Catch all forms of numerical instability
+        is_float(loss_val) and (loss_val != loss_val or abs(loss_val) > 1_000_000) ->
+          IO.puts("🛑 Step #{step}: Halting — numerical instability (loss=#{loss_val})")
+          System.halt(1)  # halt/1 is cleaner than Process.exit for Livebook
+
+        loss_val in [:nan, :inf, :"-inf"] ->
+          IO.puts("🛑 Step #{step}: Halting — Nx returned symbolic #{loss_val}")
+          System.halt(1)
+
+        true ->
+          IO.puts("🌱 Step #{step} | Epoch #{epoch} | Loss: #{Float.round(loss_val, 4)} | RAM: #{mem_mb}MB")
+          save_checkpoint.(full_state_path, new_p, new_m, new_v, step)
+      end
+    end
+
+    {new_p, new_m, new_v, step + 1}
+  end)
+end)
+
+IO.puts("\n✅ Training complete.")
+```

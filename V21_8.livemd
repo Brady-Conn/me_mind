@@ -1,0 +1,836 @@
+# V21 .8 (forked from v21) - fork - fork - fork
+
+```elixir
+# ===========================================================================
+# V20-BB Setup
+# ===========================================================================
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+System.put_env("XLA_CLIENT_MEM_FRACTION", "0.75")
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")        # ← disables the Merging Dots pass
+System.put_env("XLA_FLAGS", "--xla_gpu_enable_reassociation_for_converted_ar=false")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"}
+])
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+
+
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## USSM, Positional, Muon_Optimizer
+
+```elixir
+defmodule DLM.UniversalSSM do
+  import Nx.Defn
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn softplus(x), do: Nx.log1p(Nx.exp(x))
+  defn silu(x), do: x * Nx.sigmoid(x)
+
+  defn apply_svd_weight(x, u, v) do
+    x |> Nx.dot(u) |> silu() |> Nx.dot(v)
+  end
+
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2) do
+    # unchanged — a is now passed in per-loop rather than shared
+    x_mixed = x_t
+      |> Nx.add(apply_svd_weight(x_p1, mu1, mv1))
+      |> Nx.add(apply_svd_weight(x_p2, mu2, mv2))
+    delta_proj = apply_svd_weight(x_mixed, du, dv)
+    delta      = softplus(delta_proj)
+    a_bar      = Nx.sigmoid(Nx.multiply(delta, a))
+    b_proj     = apply_svd_weight(x_mixed, bu, bv)
+    b_bar      = Nx.multiply(delta, b_proj)
+    h_t        = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    y_ssm      = apply_svd_weight(h_t, cu, cv)
+    y_t        = Nx.add(y_ssm, x_mixed)
+    {y_t, h_t}
+  end
+
+  defn run_ssm_loop(x_seq_first, h_init, a_diag, params) do
+    {_emb, _a1, _a2, b_u, b_v, c_u, c_v, delta_u, delta_v,
+     mx_u1, mx_v1, mx_u2, mx_v2, _lm_w, _lm_b} = params
+
+    {seq_len, batch_size, embed_dim} = Nx.shape(x_seq_first)
+    y_init    = Nx.broadcast(Nx.tensor(0.0, type: :f32), {seq_len, batch_size, embed_dim})
+    zero_frame = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+
+    result_tuple =
+      while {i = 0, y_acc = y_init, h_p = h_init,
+             x_prev1 = zero_frame,
+             x_prev2 = zero_frame,
+             xs = x_seq_first,
+             a = a_diag, bu = b_u, bv = b_v, cu = c_u, cv = c_v,
+             du = delta_u, dv = delta_v,
+             mu1 = mx_u1, mv1 = mx_v1, mu2 = mx_u2, mv2 = mx_v2},
+            Nx.less(i, seq_len) do
+
+        x_t = xs[i]
+        {y_t, h_new} = ssm_recurrence(
+          x_t, x_prev1, x_prev2, h_p,
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+        )
+        y_acc_new = Nx.put_slice(y_acc, [i, 0, 0], Nx.new_axis(y_t, 0))
+        {i + 1, y_acc_new, h_new, x_t, x_prev1,
+         xs, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2}
+      end
+
+    elem(result_tuple, 1)
+  end
+
+  defn forward(indices, params, pos_emb) do
+    {embed, a_diag1, a_diag2, _bu, _bv, _cu, _cv, _du, _dv,
+     _mu1, _mv1, _mu2, _mv2, lm_w, lm_b} = params
+
+    x_input = Nx.take(embed, indices) + pos_emb
+    x_norm  = rms_norm(x_input)
+
+    {batch_size, _seq_len, embed_dim} = Nx.shape(x_norm)
+    h_init = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+    x_seq_first = Nx.transpose(x_norm, axes: [1, 0, 2])
+
+    # Each loop now gets its own independent a_diag
+    y1_seq = run_ssm_loop(x_seq_first, h_init, a_diag1, params)
+    y2_seq = run_ssm_loop(y1_seq,      h_init, a_diag2, params)
+
+    y_out   = Nx.transpose(y2_seq, axes: [1, 0, 2])
+    y_final = rms_norm(y_out)
+    Nx.dot(y_final, lm_w) + lm_b
+  end
+end
+```
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  # --- The Muon Newton-Schulz Engine ---
+  defn newton_schulz(g, iters \\ 5) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) + 1.0e-7
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, iters) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_update(grad, lr) do
+    Nx.subtract(0.0, Nx.multiply(lr, newton_schulz(grad)))
+  end
+
+  # --- Standard Adam Component ---
+  defn adam_update(param, grad, m, v, step, lr) do
+    # ⚡ THE FIX: Adam internally ensures the step is at least 1.0 to prevent division by zero
+    safe_step = step + 1.0
+
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  # --- The Hybrid Step ---
+  defn step(params, grads, ms, vs, step_count, lr) do
+    {p_emb, p_a1, p_a2, p_bu, p_bv, p_cu, p_cv, p_du, p_dv,
+      p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = params
+  
+    {g_emb, g_a1, g_a2, g_bu, g_bv, g_cu, g_cv, g_du, g_dv,
+      g_mu1, g_mv1, g_mu2, g_mv2, g_lmw, g_lmb} = grads
+  
+    {m_emb, m_a1, m_a2, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+      m_mu1, m_mv1, m_mu2, m_mv2, m_lmw, m_lmb} = ms
+  
+    {v_emb, v_a1, v_a2, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+      v_mu1, v_mv1, v_mu2, v_mv2, v_lmw, v_lmb} = vs
+  
+    # Adam for scalars and vocab tensors — now two a_diag entries
+    {up_emb, nm_emb, nv_emb} = adam_update(p_emb, g_emb, m_emb, v_emb, step_count, lr)
+    {up_a1,  nm_a1,  nv_a1}  = adam_update(p_a1,  g_a1,  m_a1,  v_a1,  step_count, lr)
+    {up_a2,  nm_a2,  nv_a2}  = adam_update(p_a2,  g_a2,  m_a2,  v_a2,  step_count, lr)
+    {up_lmw, nm_lmw, nv_lmw} = adam_update(p_lmw, g_lmw, m_lmw, v_lmw, step_count, lr)
+    {up_lmb, nm_lmb, nv_lmb} = adam_update(p_lmb, g_lmb, m_lmb, v_lmb, step_count, lr)
+  
+    # Muon for all SVD matrices — unchanged
+    up_bu  = p_bu  + muon_update(g_bu,  lr)
+    up_bv  = p_bv  + muon_update(g_bv,  lr)
+    up_cu  = p_cu  + muon_update(g_cu,  lr)
+    up_cv  = p_cv  + muon_update(g_cv,  lr)
+    up_du  = p_du  + muon_update(g_du,  lr)
+    up_dv  = p_dv  + muon_update(g_dv,  lr)
+    up_mu1 = p_mu1 + muon_update(g_mu1, lr)
+    up_mv1 = p_mv1 + muon_update(g_mv1, lr)
+    up_mu2 = p_mu2 + muon_update(g_mu2, lr)
+    up_mv2 = p_mv2 + muon_update(g_mv2, lr)
+  
+    new_params = {up_emb, up_a1, up_a2, up_bu, up_bv, up_cu, up_cv, up_du, up_dv,
+                  up_mu1, up_mv1, up_mu2, up_mv2, up_lmw, up_lmb}
+  
+    new_ms = {nm_emb, nm_a1, nm_a2, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+              m_mu1, m_mv1, m_mu2, m_mv2, nm_lmw, nm_lmb}
+  
+    new_vs = {nv_emb, nv_a1, nv_a2, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+              v_mu1, v_mv1, v_mu2, v_mv2, nv_lmw, nv_lmb}
+  
+    {new_params, new_ms, new_vs}
+  end
+end
+```
+
+```elixir
+defmodule DLM.V21_8Genesis do
+  @vocab_size 128
+  @dim 256
+  @rank 32
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    {embed,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@vocab_size, @dim})
+    # Two independent a_diag parameters — one per SSM loop
+    {a_diag1, key} = Nx.Random.normal(key, 0.0, 1.0,  shape: {@dim})
+    {a_diag2, key} = Nx.Random.normal(key, 0.0, 1.0,  shape: {@dim})
+    {b_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {b_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {c_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {c_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {d_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {d_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {lm_w,   key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @vocab_size})
+    {lm_b,  _key} = Nx.Random.normal(key, 0.0, 0.0,  shape: {@vocab_size})
+
+    {embed, a_diag1, a_diag2, b_u, b_v, c_u, c_v, d_u, d_v,
+     mx_u1, mx_v1, mx_u2, mx_v2, lm_w, lm_b}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    vs = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    {ms, vs, 1}
+  end
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inference
+
+```elixir
+defmodule DLM.InferenceV21 do
+  import Nx.Defn
+
+  @allowed_chars ~c" abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,:;-'\"()[]"
+
+  def build_muzzle(vocab_size \\ 128, allowed \\ @allowed_chars) do
+    muzzle = Nx.broadcast(Nx.tensor(-1.0e10, type: :f32), {vocab_size})
+    Enum.reduce(allowed, muzzle, fn char, acc ->
+      Nx.indexed_put(acc, Nx.tensor([[char]]), Nx.tensor([0.0]))
+    end)
+  end
+
+  defn get_next_logits(ins_padded, actual_len_tensor, params, pos_emb, muzzle) do
+    logits = DLM.UniversalSSM.forward(ins_padded, params, pos_emb)
+    target_idx = actual_len_tensor - 1
+    logits[0][target_idx] + muzzle
+  end
+
+  defn apply_rep_penalty(logits, recent_tokens, penalty_weight) do
+    vocab_size = elem(Nx.shape(logits), 0)
+    mask =
+      recent_tokens
+      |> Nx.new_axis(-1)
+      |> Nx.equal(Nx.iota({vocab_size}))
+      |> Nx.any(axes: [0])
+    penalized = Nx.select(logits > 0.0, logits / penalty_weight, logits * penalty_weight)
+    Nx.select(mask, penalized, logits)
+  end
+
+  def top_k(params, pos_emb, prompt, max_new_chars \\ 120, k \\ 3, temp \\ 0.4, muzzle \\ nil) do
+    gpu = {EXLA.Backend, client: :rocm}
+    muzzle = (muzzle || build_muzzle()) |> Nx.backend_copy(gpu)
+    prompt_chars = String.to_charlist(prompt)
+    max_seq = elem(Nx.shape(pos_emb), 0)
+    penalty_weight = Nx.tensor(1.2, type: :f32) |> Nx.backend_copy(gpu)
+
+    Enum.reduce(1..max_new_chars, {prompt_chars, Nx.Random.key(42)}, fn step, {chars, key} ->
+      window_chars = Enum.take(chars, -max_seq)
+      actual_len = length(window_chars)
+      pad_len = max_seq - actual_len
+      padded_chars = window_chars ++ List.duplicate(0, pad_len)
+
+      ins_padded = Nx.tensor([padded_chars], type: :s32) |> Nx.backend_copy(gpu)
+      len_tensor = Nx.tensor(actual_len, type: :s32)     |> Nx.backend_copy(gpu)
+
+      logits = get_next_logits(ins_padded, len_tensor, params, pos_emb, muzzle)
+
+      recent_tensor = chars |> Enum.take(-50) |> Nx.tensor(type: :s32) |> Nx.backend_copy(gpu)
+      penalized = apply_rep_penalty(logits, recent_tensor, penalty_weight)
+
+      {next_token, next_key} = sample_top_k_logits(penalized, temp, key, k: k)
+      if rem(step, 10) == 0, do: :erlang.garbage_collect(self())
+      {chars ++ [Nx.to_number(next_token)], next_key}
+    end)
+    |> elem(0)
+    |> List.to_string()
+  end
+
+  defn sample_top_k_logits(logits, temp, key, opts \\ []) do
+    k = opts[:k]
+    scaled = logits / temp
+    {values, indices} = Nx.top_k(scaled, k: k)
+    probs = Nx.exp(values) / Nx.sum(Nx.exp(values))
+    {sample_val, next_key} = Nx.Random.uniform(key)
+    cumulative = probs |> Nx.window_sum({k}, padding: :valid) |> Nx.squeeze()
+    selected_idx = Nx.argmax(cumulative > sample_val)
+    {indices[selected_idx], next_key}
+  end
+
+  def greedy(params, pos_emb, prompt, max_new_chars) do
+    gpu = {EXLA.Backend, client: :rocm}
+    # Build muzzle so it doesn't output illegal characters
+    muzzle = build_muzzle() |> Nx.backend_copy(gpu)
+    prompt_chars = String.to_charlist(prompt)
+    max_seq = elem(Nx.shape(pos_emb), 0)
+
+    # The Autoregressive Loop
+    final_tokens = Enum.reduce(1..max_new_chars, prompt_chars, fn step, chars ->
+      # Windowing and padding to keep shapes perfectly stable at [1, 256]
+      window_chars = Enum.take(chars, -max_seq)
+      actual_len = length(window_chars)
+      pad_len = max_seq - actual_len
+      padded_chars = window_chars ++ List.duplicate(0, pad_len)
+
+      ins_padded = Nx.tensor([padded_chars], type: :s32) |> Nx.backend_copy(gpu)
+      len_tensor = Nx.tensor(actual_len, type: :s32) |> Nx.backend_copy(gpu)
+
+      # 🧠 Forward pass utilizing the exact same highly-optimized defn as top_k
+      logits = get_next_logits(ins_padded, len_tensor, params, pos_emb, muzzle)
+
+      # 🎯 GREEDY MATH: Just grab the absolute highest probability index
+      next_token = Nx.argmax(logits) |> Nx.to_number()
+
+      if rem(step, 10) == 0, do: :erlang.garbage_collect(self())
+
+      chars ++ [next_token]
+    end)
+
+    # NATIVELY convert the integer list back to a viewable string
+    final_tokens
+    |> Enum.map(&max(0, min(&1, 127)))
+    |> List.to_string()
+  end
+end
+
+IO.puts("✅ DLM.InferenceV21 loaded")
+```
+
+```elixir
+# 🔍 DYNAMIC CHECKPOINT FINDER
+latest_checkpoint = 
+  Path.wildcard("v21_8_*.bin")
+  |> Enum.reject(&String.contains?(&1, "data.bin"))
+  |> Enum.max_by(fn path -> File.stat!(path).mtime end, fn -> nil end)
+
+IO.puts("🧠 Loading Weights from: #{latest_checkpoint}")
+checkpoint = File.read!(latest_checkpoint) |> :erlang.binary_to_term()
+
+gpu = {EXLA.Backend, client: :rocm}
+params = checkpoint.params |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy(gpu)
+
+# 🧪 THE PROMPT SUITE
+prompts = [
+  {"Standard Definition", "[W]Algorithm[T]n.[D]"},
+  {"Phonetic Invention", "[W]Chronoflux[T]n.[D]"},
+  {"Conversational Semantic", "Good morning BigBrain! How are you today?"},
+  {"Jeopardy Style (Reverse)", "[D]A mathematical process for solving a problem.[W]"}
+]
+
+IO.puts("\n✨ IGNITING INFERENCE ENGINE...\n")
+
+Enum.each(prompts, fn {test_name, text} ->
+  IO.puts(String.duplicate("=", 60))
+  IO.puts("🧪 TEST: #{test_name}")
+  IO.puts("📝 PROMPT: #{text}\n")
+  
+  # 🎯 1. GREEDY DECODING
+  greedy_out = DLM.InferenceV21.greedy(params, pos_emb, text, 120)
+  IO.puts("🎯 GREEDY (Highest Confidence):\n#{greedy_out}\n")
+
+  # 🎲 2. TOP-K DECODING
+  top_k_out = DLM.InferenceV21.top_k(params, pos_emb, text, 120, 3, 0.5)
+  IO.puts("🎲 TOP-K (Creative, k=3, t=0.5):\n#{top_k_out}\n")
+end)
+
+IO.puts(String.duplicate("=", 60))
+IO.puts("🏁 INFERENCE SUITE COMPLETE.")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Stream
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+end
+```
+
+```elixir
+defmodule DLM.DataBuilder do
+  @rank 32
+  @dim 256
+  @seq_len 256
+  @pad_token 0
+  @eos_token 3        # ASCII ETX — signals clean end of entry
+  @min_content_chars 64   # discard chunks that are mostly padding
+
+  @doc """
+  Takes a list of file paths, combines them, shuffles the lines 
+  to prevent overfitting, and builds the static training tensors.
+  """
+  def build_combined_tensors(file_paths) when is_list(file_paths) do
+    raw_lines =
+      Enum.flat_map(file_paths, fn path ->
+        File.stream!(path)
+        |> Stream.map(&String.trim/1)
+        |> Stream.reject(&String.starts_with?(&1, "  "))
+        |> Enum.to_list()
+      end)
+  
+    shuffled_lines = Enum.shuffle(raw_lines)
+  
+    shuffled_lines
+    |> Enum.flat_map(&parse_synset/1)   # flat_map since each line now yields 1..N chunks
+    |> Enum.reject(&is_nil/1)
+    |> Nx.tensor(type: :s32)
+  end
+
+  defp parse_synset(line) do
+    case String.split(line, " | ") do
+      [data_chunk, gloss] ->
+        tokens = String.split(data_chunk, " ", trim: true)
+        w_cnt  = String.to_integer(Enum.at(tokens, 3), 16)
+  
+        words =
+          Enum.reduce(0..(w_cnt - 1), [], fn i, acc ->
+            word_index = 4 + (i * 2)
+            raw_word   = Enum.at(tokens, word_index)
+            [String.replace(raw_word, "_", " ") | acc]
+          end)
+          |> Enum.reverse()
+  
+        [main_word | synonyms] = words
+  
+        base_entry =
+          if Enum.empty?(synonyms) do
+            "#{main_word} = #{gloss}"
+          else
+            "#{main_word} = #{gloss} | #{Enum.join(synonyms, ", ")}"
+          end
+  
+        # No more synonym cross-reference entries — just chunk the main entry
+        chunk_entry(base_entry)
+  
+      _ -> []
+    end
+  end
+  
+  
+
+  defp chunk_entry(str) do
+    chars = String.to_charlist(str <> <<@eos_token>>)
+    total = length(chars)
+  
+    if total <= @seq_len do
+      padded = chars ++ List.duplicate(@pad_token, @seq_len - total)
+      # Only keep if there's enough real content
+      if total >= @min_content_chars, do: [padded], else: []
+    else
+      overlap = 64  # increased from 32 to reduce boundary artifacts
+      step    = @seq_len - overlap
+  
+      0
+      |> Stream.iterate(&(&1 + step))
+      |> Stream.take_while(&(&1 < total))
+      |> Enum.map(fn offset ->
+        raw_window = Enum.slice(chars, offset, @seq_len)
+  
+        # Snap to nearest space so we don't cut mid-word
+        snapped_window =
+          if length(raw_window) == @seq_len do
+            # Find last space in window and trim there
+            last_space =
+              raw_window
+              |> Enum.with_index()
+              |> Enum.filter(fn {c, _} -> c == ?\s end)
+              |> List.last()
+  
+            case last_space do
+              {_, idx} -> Enum.take(raw_window, idx + 1)
+              nil      -> raw_window  # no space found, keep as-is
+            end
+          else
+            raw_window
+          end
+  
+        content_len = length(snapped_window)
+        # Discard near-empty tail chunks
+        if content_len >= @min_content_chars do
+          pad_len = @seq_len - content_len
+          snapped_window ++ List.duplicate(@pad_token, pad_len)
+        else
+          nil
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+    end
+  end
+
+  defp format_to_tensor(raw_str) do
+    chars = String.to_charlist(raw_str)
+    actual_len = length(chars)
+
+    cond do
+      actual_len == @seq_len -> 
+        chars
+      actual_len > @seq_len -> 
+        Enum.take(chars, @seq_len)
+      actual_len < @seq_len -> 
+        chars ++ List.duplicate(@pad_token, @seq_len - actual_len)
+    end
+  end
+end
+```
+
+```elixir
+# In your Init cell, BEFORE building tensors
+Nx.global_default_backend(Nx.BinaryBackend)  # ← force CPU for dataset creation
+
+files = ["data.noun", "data.verb", "data.adj", "data.adv"]
+IO.puts("Parsing WordNet and shuffling dataset...")
+training_tensors = DLM.DataBuilder.build_combined_tensors(files)
+
+# Verify it's on CPU before saving
+# IO.puts("Backend: #{inspect(Nx.backend(training_tensors))}")  # should show BinaryBackend
+
+binary_data = :erlang.term_to_binary(training_tensors)
+File.write!("bigbrain_phase1_data.bin", binary_data)
+IO.puts("Done!")
+
+# Restore GPU as default after saving
+Nx.global_default_backend({EXLA.Backend, client: :rocm})
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.V21_8Trainer do
+  import Nx.Defn
+
+  def grad_norms(grads) do
+  names = ~w[embed a_diag1 a_diag2 b_u b_v c_u c_v d_u d_v mx_u1 mx_v1 mx_u2 mx_v2 lm_w lm_b]
+    grads
+    |> Tuple.to_list()
+    |> Enum.zip(names)
+    |> Enum.map(fn {g, name} ->
+      norm = g |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+      {name, Float.round(norm, 4)}
+    end)
+  end
+
+  defn log_softmax(logits) do
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = logits - max_logits
+    sum_exp = Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)
+    safe_logits - Nx.log(sum_exp)
+  end
+
+  defn compute_loss(preds_sliced, targets) do
+    log_probs = log_softmax(preds_sliced)
+    target_probs = Nx.take_along_axis(log_probs, Nx.new_axis(targets, -1), axis: -1)
+    target_probs = Nx.squeeze(target_probs, axes: [-1])
+    mask = Nx.not_equal(targets, 0) |> Nx.as_type(:f32)
+  
+    # Guard against near-empty batches — require at least 10% real content
+    total_tokens = Nx.sum(mask)
+    min_tokens   = Nx.tensor(0.1 * 255.0 * 16.0, type: :f32)  # 10% of batch
+    safe_denom   = Nx.max(total_tokens, min_tokens)
+  
+    masked_loss = -target_probs * mask
+    Nx.sum(masked_loss) / safe_denom
+  end
+
+  defn compute_grad(params, pos_emb, batch) do
+    {loss, grads} = value_and_grad(params, fn p ->
+      batch_s32 = Nx.as_type(batch, :s32)
+      preds = DLM.UniversalSSM.forward(batch_s32, p, pos_emb)
+      preds_sliced = Nx.slice_along_axis(preds, 0, 255, axis: 1)
+      targets = Nx.slice_along_axis(batch_s32, 1, 255, axis: 1)
+      compute_loss(preds_sliced, targets)
+    end)
+  
+    {g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14} = grads
+  
+    global_norm =
+      Nx.sum(Nx.pow(g0, 2))
+      |> Nx.add(Nx.sum(Nx.pow(g1, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g2, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g3, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g4, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g5, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g6, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g7, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g8, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g9, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g10, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g11, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g12, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g13, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g14, 2)))
+      |> Nx.sqrt()
+  
+    max_norm = 1.0
+    scale = Nx.min(1.0, max_norm / (global_norm + 1.0e-6))
+  
+    clipped_grads = {
+      g0  * scale, g1  * scale, g2  * scale,
+      g3  * scale, g4  * scale, g5  * scale,
+      g6  * scale, g7  * scale, g8  * scale,
+      g9  * scale, g10 * scale, g11 * scale,
+      g12 * scale, g13 * scale, g14 * scale
+    }
+  
+    {loss, clipped_grads}
+  end
+end
+```
+
+```elixir
+IO.puts("🧠 Loading Dataset into CPU Memory...")
+full_dataset = File.read!("bigbrain_phase1_data.bin") 
+  |> :erlang.binary_to_term()
+  |> Nx.backend_copy(Nx.BinaryBackend)
+
+dataset_size = Nx.axis_size(full_dataset, 0)
+batch_size = 16
+total_steps_per_epoch = div(dataset_size, batch_size)
+
+max_epochs = 10
+save_interval = 1000
+base_lr = 3.0e-4
+warmup_steps = 1000
+gpu = {EXLA.Backend, client: :rocm}
+
+# 🔍 AUTO-RESUME OR GENESIS (V21.7)
+save_prefix = "v21_8_auto"
+latest_checkpoint = 
+  Path.wildcard("#{save_prefix}_*.bin")
+  |> Enum.reject(&String.contains?(&1, "data.bin"))
+  |> Enum.max_by(fn path -> File.stat!(path).mtime end, fn -> nil end)
+
+{params, ms, vs, global_step, current_epoch} = 
+  if latest_checkpoint do
+    IO.puts("💾 Found V21.8 checkpoint: #{latest_checkpoint}")
+    checkpoint = File.read!(latest_checkpoint) |> :erlang.binary_to_term()
+    p = checkpoint.params |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    m = checkpoint.ms |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    v = checkpoint.vs |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    {p, m, v, checkpoint.step, checkpoint.epoch}
+  else
+    IO.puts("✨ No V21.8 checkpoint found. Igniting FRESH Genesis state...")
+    raw_p = DLM.V21_8Genesis.init_params(42)
+    {raw_m, raw_v, _} = DLM.V21_8Genesis.init_optimizer(raw_p)
+    p = raw_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    m = raw_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    v = raw_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    {p, m, v, 0, 1}
+  end
+
+words_already_seen = rem(global_step * batch_size, dataset_size)
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy(gpu)
+initial_key = Nx.Random.key(global_step) 
+
+IO.puts("🚀 IGNITION: Starting V21.7 at Epoch #{current_epoch}, Global Step #{global_step}...")
+
+Enum.reduce(current_epoch..max_epochs, {params, ms, vs, global_step, initial_key, words_already_seen}, fn epoch, {p, m, v, current_step, current_key, offset_words} ->
+  IO.puts(String.duplicate("=", 50))
+  
+  target_lr = base_lr * :math.pow(0.9, epoch - 1)
+  IO.puts("🌊 EPOCH #{epoch} / #{max_epochs} | Target LR: #{target_lr}")
+  
+  IO.puts("🔀 Shuffling dataset...")
+  {shuffled_raw, next_key} = Nx.Random.shuffle(Nx.Random.key(999), full_dataset, axis: 0)
+  shuffled_dataset = Nx.backend_copy(shuffled_raw, Nx.BinaryBackend)
+
+  epoch_batches = Stream.unfold(offset_words, fn offset ->
+    if offset + batch_size > dataset_size, do: nil, else: {Nx.slice_along_axis(shuffled_dataset, offset, batch_size, axis: 0), offset + batch_size}
+  end)
+
+  # 🚀 INNER BATCH LOOP
+  {new_p, new_m, new_v, next_epoch_step, _final_skips} =
+    epoch_batches
+    |> Stream.with_index(1)
+    |> Enum.reduce({p, m, v, current_step, 0}, fn {batch, step_in_epoch}, {cp, cm, cv, cs, s_count} ->
+      gpu_batch = Nx.backend_copy(batch, gpu)
+
+      # 1. Compute Gradients
+      {loss_tensor, grads} = DLM.V21_8Trainer.compute_grad(cp, pos_emb, gpu_batch)
+      loss_val = Nx.to_number(loss_tensor)
+      if loss_val == :nan or loss_val > 6.0 do
+        cpu_batch = Nx.backend_copy(gpu_batch, Nx.BinaryBackend)
+        sequences = Nx.to_list(cpu_batch)
+        IO.puts("🔥 PATHOLOGICAL BATCH at global step #{cs}:")
+        Enum.each(sequences, fn seq ->
+          readable = seq |> Enum.reject(&(&1 == 0)) |> List.to_string()
+          IO.puts("   > #{readable}")
+        end)
+      end
+
+      # 2. Safety Gate
+      if loss_val == :nan or loss_val > 20.0 do
+        if rem(step_in_epoch, 10) == 0, do: IO.puts("⚠️ Step #{cs}: NaN/Spike detected. Skipping batch.")
+        {cp, cm, cv, cs + 1, s_count + 1}
+      else
+        # 3. Dynamic Learning Rate Warmup
+        current_lr = 
+          if cs < warmup_steps do
+            target_lr * (cs / warmup_steps)
+          else
+            target_lr
+          end
+
+        lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+        step_tensor = Nx.tensor(cs, type: :f32) |> Nx.backend_copy(gpu)
+        
+        # 4. Update Weights
+        {up_p, up_m, up_v} = DLM.MuonHybrid.step(cp, grads, cm, cv, step_tensor, lr_tensor)
+
+        # After {up_p, up_m, up_v} = DLM.MuonHybrid.step(...)
+        # Unpack, rescale d_u and d_v if their combined norm has collapsed
+        {p_emb, p_a1, p_a2, p_bu, p_bv, p_cu, p_cv, p_du, p_dv, 
+         p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = up_p
+        
+        du_norm = p_du |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+        
+        up_p = if du_norm < 0.01 do
+          IO.puts("   🔧 Rescuing dead delta gate (d_u norm=#{Float.round(du_norm, 5)})")
+          rescaled_du = Nx.multiply(p_du, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+          rescaled_dv = Nx.multiply(p_dv, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+          {p_emb, p_a1, p_a2, p_bu, p_bv, p_cu, p_cv, rescaled_du, rescaled_dv,
+           p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb}
+        else
+          up_p
+        end
+        
+        # 5. Logging (Every 50 steps)
+        if rem(step_in_epoch, 50) == 0 do
+          bpc = loss_val / :math.log(2)
+          mem = :erlang.memory(:total) |> div(1024 * 1024)
+          
+          # Pull grads back to CPU for norm inspection
+          cpu_grads = grads |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple()
+          norms = DLM.V21_8Trainer.grad_norms(cpu_grads)
+          
+          # Find the max so it jumps out visually
+          {max_name, max_norm} = Enum.max_by(norms, fn {_name, n} -> n end)
+          
+          norm_str = norms |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.join(" | ")
+          
+          IO.puts("➡️  Step #{step_in_epoch} | Global: #{cs} | Loss: #{Float.round(loss_val, 4)} | BPC: #{Float.round(bpc, 3)} | LR: #{Float.round(current_lr, 6)} | RAM: #{mem}MB")
+          IO.puts("   📐 GRAD NORMS | MAX: #{max_name}=#{max_norm}")
+          IO.puts("   #{norm_str}")
+        end
+
+        # 6. Checkpointing (Every 1000 steps)
+        if rem(cs, save_interval) == 0 and cs > 0 do
+          IO.puts("💾 Auto-Saving Checkpoint to #{save_prefix}_step#{cs}.bin...")
+          state = %{
+            params: up_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            ms: up_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            vs: up_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            step: cs, epoch: epoch
+          }
+          File.write!("#{save_prefix}_step#{cs}.bin", :erlang.term_to_binary(state))
+        end
+
+        if rem(step_in_epoch, 100) == 0, do: :erlang.garbage_collect(self())
+
+        {up_p, up_m, up_v, cs + 1, s_count}
+      end
+    end)
+
+  IO.puts("💾 Saving Completed Epoch #{epoch} State...")
+  final_state = %{
+    params: new_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    ms: new_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    vs: new_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    step: next_epoch_step, epoch: epoch
+  }
+  File.write!("#{save_prefix}_epoch#{epoch}_COMPLETE.bin", :erlang.term_to_binary(final_state))
+
+  {new_p, new_m, new_v, next_epoch_step, next_key, 0}
+end)
+
+IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
+```

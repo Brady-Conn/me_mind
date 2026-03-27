@@ -1,0 +1,752 @@
+<!-- livebook:{"autosave_interval_s":60} -->
+
+# Thought Block V1
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.9"},
+  {:exla, "~> 0.9"}
+  # Notice we don't even need Bumblebee for this test!
+])
+
+# Lock it to your CPU for fast, local testing
+Nx.global_default_backend({EXLA.Backend, client: :host})
+```
+
+## Section
+
+```elixir
+:erlang.system_info(:process_limit)
+```
+
+```elixir
+defmodule DLM.ThoughtBlock do
+  import Nx.Defn
+
+  # Keeps the data centered and at a consistent scale
+  defn norm(t), do: Nx.divide(t, Nx.add(Nx.standard_deviation(t), 1.0e-6))
+
+  defn recursive_pass(nx, aw, fw, iterations) do
+    {final_nx, _aw, _fw, _i, _iters} = 
+      while {x = nx, aw, fw, i = 0, iterations}, Nx.less(i, iterations) do
+        
+        # 1. Attention + Normalize
+        attn = Nx.dot(x, aw) |> Nx.tanh()
+        x = Nx.add(x, Nx.multiply(attn, 0.5)) |> norm()
+        
+        # 2. Feed Forward + Normalize
+        ff = Nx.dot(x, fw) |> Nx.tanh()
+        x = Nx.add(x, Nx.multiply(ff, 0.5)) |> norm()
+        
+        {x, aw, fw, i + 1, iterations}
+      end
+    final_nx
+  end
+end
+```
+
+```elixir
+# 1. Frozen, Tied Weights
+key = Nx.Random.key(777)
+# Eyes: Create a strong, static signal (-1.0 to 1.0)
+{emb_w, key} = Nx.Random.uniform(key, -1.0, 1.0, shape: {256, 16})
+# Voice: The exact reverse of the eyes
+head_w = Nx.transpose(emb_w)
+
+# 2. Re-embed "Elixir!" using our new frozen Eyes
+target_bytes = Nx.tensor([[69, 108, 105, 120, 105, 114, 33]])
+one_hot = Nx.equal(Nx.iota({1, 7, 256}, axis: 2), Nx.reshape(target_bytes, {1, 7, 1}))
+clean_x = Nx.dot(one_hot, emb_w)
+
+# 3. Re-create the Noise Canvas for training
+{target_noise, _key} = Nx.Random.normal(key, shape: {1, 7, 16})
+# For simplicity in this step, we'll just add the noise directly
+noisy_data = Nx.add(clean_x, target_noise) 
+
+IO.puts("Tied Weights and Static Targets Created!")
+```
+
+```elixir
+# 1. Initialize a random seed (PRNG key)
+key = Nx.Random.key(42)
+
+# 2. Define dimensions
+batch_size = 1
+seq_len = 8
+embed_dim = 16
+iterations = 5
+
+# 3. Generate dummy tensors
+# Notice how we pass the key in, and catch the new key for the next line!
+{dummy_input, key} = Nx.Random.uniform(key, shape: {batch_size, seq_len, embed_dim})
+{attn_weights, key} = Nx.Random.normal(key, shape: {embed_dim, embed_dim})
+{ff_weights, _key}  = Nx.Random.normal(key, shape: {embed_dim, embed_dim})
+
+# 4. Run it and inspect the shape
+result = DLM.ThoughtBlock.recursive_pass(dummy_input, attn_weights, ff_weights, iterations)
+
+IO.inspect(Nx.shape(result), label: "Final Output Shape")
+```
+
+```elixir
+defmodule DLM.Tokenizer do
+  @doc """
+  Runs on the BEAM. Takes a standard Elixir string and converts 
+  it into an Nx tensor of integers representing raw UTF-8 bytes.
+  """
+  def encode(string) do
+    # 1. 'for <<b <- string>>' is Elixir's hyper-fast binary comprehension.
+    # It rips the string apart into exact UTF-8 byte integers.
+    bytes = for <<b <- string>>, do: b
+    
+    # 2. We wrap it in a list to represent a batch_size of 1, 
+    # and explicitly cast it as an unsigned 8-bit integer tensor.
+    Nx.tensor([bytes], type: :u8)
+  end
+end
+
+defmodule DLM.Embedder do
+  import Nx.Defn
+
+  @doc """
+  Runs on the EXLA compiler. Takes the integer tensor and a 
+  256-row weight matrix, returning continuous floats.
+  """
+  defn embed(input_ids, embedding_matrix) do
+    # Nx.take acts like a massive switchboard. 
+    # If the input_id is 97 (for 'a'), it grabs the 97th row of the matrix.
+    Nx.take(embedding_matrix, input_ids)
+  end
+end
+```
+
+```elixir
+# 1. Set up our random key and dimensions
+key = Nx.Random.key(42)
+embed_dim = 16
+vocab_size = 256 # Strictly single-byte limits
+
+# 2. Generate the "Lookup Table" (256 rows, 16 columns)
+{embedding_matrix, _key} = Nx.Random.normal(key, shape: {vocab_size, embed_dim})
+
+# 3. Test the BEAM Tokenizer
+prompt = "Elixir!"
+input_ids = DLM.Tokenizer.encode(prompt)
+
+IO.puts("1. Raw Prompt: #{prompt}")
+IO.inspect(input_ids, label: "2. Tokenized Integer Tensor")
+IO.inspect(Nx.shape(input_ids), label: "   Token Shape (Batch, Seq_Len)")
+
+# 4. Test the EXLA Embedder
+embedded_floats = DLM.Embedder.embed(input_ids, embedding_matrix)
+
+IO.puts("\n--------------------------------------------------\n")
+IO.inspect(Nx.shape(embedded_floats), label: "3. Final Embedded Shape (Batch, Seq_Len, Embed_Dim)")
+```
+
+```elixir
+defmodule DLM.LanguageHead do
+  import Nx.Defn
+
+  @doc """
+  Runs on EXLA. Projects the continuous tensor back to a 256-vocab space
+  and selects the most likely byte.
+  """
+  defn predict(x, output_weights) do
+    # 1. Project the embeddings back to the vocabulary size
+    # Shape transition: {1, 7, 16} * {16, 256} -> {1, 7, 256}
+    logits = Nx.dot(x, output_weights)
+    
+    # 2. Find the index (0-255) with the highest score along the last axis
+    # Shape transition: {1, 7, 256} -> {1, 7}
+    Nx.argmax(logits, axis: -1)
+  end
+end
+
+defmodule DLM.Decoder do
+  @doc """
+  Runs on the BEAM. Takes the tensor of predicted integer bytes 
+  and converts it back into an Elixir string.
+  """
+  def decode(byte_tensor) do
+    # Flatten the tensor and convert it to a standard Elixir list of integers
+    byte_list = byte_tensor |> Nx.flatten() |> Nx.to_flat_list()
+    
+    # Pack the integers back into a binary string. 
+    # (Using a comprehension here safely ignores invalid visual characters)
+    for b <- byte_list, into: "", do: <<b>>
+  end
+end
+```
+
+```elixir
+# 1. We need a new random key for the output weights
+key = Nx.Random.key(1337)
+vocab_size = 256
+embed_dim = 16
+
+# 2. Generate the "Language Head" weights (16 rows, 256 columns)
+{output_weights, _key} = Nx.Random.normal(key, shape: {embed_dim, vocab_size})
+
+# 3. Run the prediction using the embedded floats from Cell 4!
+predicted_tokens = DLM.LanguageHead.predict(embedded_floats, output_weights)
+
+# 4. Decode the raw integers back to text
+final_text = DLM.Decoder.decode(predicted_tokens)
+
+IO.inspect(Nx.shape(predicted_tokens), label: "1. Predicted Tokens Shape")
+IO.inspect(predicted_tokens, label: "2. Raw Predicted Bytes")
+IO.puts("\n3. Final Decoded String: #{inspect(final_text)}")
+```
+
+```elixir
+defmodule DLM.Schedule do
+  import Nx.Defn
+
+  @doc """
+  Runs on the BEAM (standard def). 
+  Keeps 'timesteps' as a raw integer to satisfy the shape requirements.
+  """
+  def linear_beta_schedule(timesteps, start_beta \\ 0.0001, end_beta \\ 0.02) do
+    Nx.linspace(start_beta, end_beta, n: timesteps)
+  end
+
+  @doc """
+  Runs on EXLA (defn). 
+  Takes the generated tensor and calculates the alphas.
+  """
+  defn calculate_alphas(betas) do
+    alphas = Nx.subtract(1.0, betas)
+    alphas_cumprod = Nx.cumulative_product(alphas)
+    
+    {alphas, alphas_cumprod}
+  end
+end
+```
+
+```elixir
+# 1. Define our total timesteps for the diffusion process
+timesteps = 20
+
+# 2. Generate the schedules
+betas = DLM.Schedule.linear_beta_schedule(timesteps)
+{alphas, alphas_cumprod} = DLM.Schedule.calculate_alphas(betas)
+
+# 3. Let's look at the "Alpha Bar" (The remaining signal)
+IO.puts("--- The Signal-to-Noise Curve (Alpha Bar) ---")
+IO.puts("Step 1 (Mostly Signal): #{Nx.to_number(alphas_cumprod[0])}")
+IO.puts("Step 10 (Halfway):      #{Nx.to_number(alphas_cumprod[9])}")
+IO.puts("Step 20 (Mostly Noise): #{Nx.to_number(alphas_cumprod[19])}")
+
+IO.inspect(Nx.shape(alphas_cumprod), label: "\nShape of Schedule Tensors")
+```
+
+```elixir
+defmodule DLM.Forward do
+  import Nx.Defn
+
+  @doc """
+  Runs on EXLA. Instantly corrupts the clean text to match the exact 
+  noise level required for a specific timestep.
+  """
+  defn add_noise(clean_x, t, alphas_cumprod, key) do
+    # 1. Grab the cumulative alpha for our specific timestep 't'
+    # This acts as a scalar value (e.g., 0.85)
+    alpha_bar_t = Nx.take(alphas_cumprod, t)
+
+    # 2. Calculate the weights for the signal and the noise
+    sqrt_alpha_bar_t = Nx.sqrt(alpha_bar_t)
+    sqrt_one_minus_alpha_bar_t = Nx.sqrt(1.0 - alpha_bar_t)
+
+    # 3. Generate pure random static of the exact same shape as our text
+    {noise, new_key} = Nx.Random.normal(key, shape: Nx.shape(clean_x))
+
+    # 4. Mix them together using the formula!
+    signal_part = Nx.multiply(clean_x, sqrt_alpha_bar_t)
+    noise_part = Nx.multiply(noise, sqrt_one_minus_alpha_bar_t)
+    noisy_x = Nx.add(signal_part, noise_part)
+
+    # We return the noisy data, the pure noise (we need this to train!), and the key
+    {noisy_x, noise, new_key}
+  end
+end
+```
+
+```elixir
+# 1. We need a PRNG key and our timestep (0-indexed, so 19 is the 20th step)
+key = Nx.Random.key(999)
+timestep = Nx.tensor(19)
+
+# 2. Run the forward diffusion using the variables we generated in previous cells!
+# (Make sure 'embedded_floats' and 'alphas_cumprod' are still in memory)
+{noisy_data, target_noise, _key} = 
+  DLM.Forward.add_noise(embedded_floats, timestep, alphas_cumprod, key)
+
+# 3. Let's inspect the damage
+IO.puts("--- Forward Diffusion Results ---")
+IO.inspect(Nx.shape(noisy_data), label: "1. Noisy Data Shape")
+IO.inspect(Nx.shape(target_noise), label: "2. Target Noise Shape")
+
+# Let's look at the actual numbers to see the corruption
+clean_sample = embedded_floats[0][0][0..4]
+noisy_sample = noisy_data[0][0][0..4]
+
+IO.puts("\n--- Data Comparison (First 5 Floats of the 'E' token) ---")
+IO.inspect(clean_sample, label: "Clean")
+IO.inspect(noisy_sample, label: "Noisy")
+```
+
+```elixir
+defmodule DLM.Positional do
+  # Changed 'defn' to 'def' so seq_len and embed_dim stay as standard integers
+  def build(seq_len, embed_dim) do
+    half_dim = div(embed_dim, 2)
+    positions = Nx.iota({seq_len, 1})
+    
+    # Calculate the frequency wavelengths
+    div_term = Nx.exp(Nx.multiply(Nx.iota({half_dim}), -(:math.log(10000.0) / half_dim)))
+    args = Nx.multiply(positions, div_term)
+    
+    # Generate the waves and stick them together
+    pe = Nx.concatenate([Nx.sin(args), Nx.cos(args)], axis: 1)
+    
+    # Scale to 0.1 so it acts as a subtle watermark!
+    Nx.multiply(Nx.reshape(pe, {1, seq_len, embed_dim}), 0.1)
+  end
+end
+```
+
+```elixir
+defmodule DLM.Mask do
+  import Nx.Defn
+
+  # Build the mathematical blindfold
+  defn causal(seq_len) do
+    # Create row and column coordinates
+    row_idx = Nx.iota({seq_len, 1})
+    col_idx = Nx.iota({1, seq_len})
+    
+    # Identify the "future" (upper triangle of the matrix)
+    future_mask = Nx.greater(col_idx, row_idx)
+    
+    # Replace the future with -1 billion, keep the past as 0.0
+    Nx.select(future_mask, Nx.tensor(-1.0e9), Nx.tensor(0.0))
+  end
+end
+```
+
+```elixir
+defmodule DLM.Training do
+  import Nx.Defn
+
+  defn softmax(logits) do
+    exps = Nx.exp(Nx.subtract(logits, Nx.reduce_max(logits, axes: [-1], keep_axes: true)))
+    Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
+  end
+
+  defn loss_fn(nx, _tn, cx, aw, fw, _its) do
+    # Get the sequence length dynamically so it works for 7 chars or 40 chars
+    {_batch, seq_len, _dim} = Nx.shape(nx)
+    
+    # 1. Raw Attention
+    attn_logits = Nx.dot(nx, aw)
+    
+    # 2. Scale it (Keeps Softmax from freezing)
+    scaled_logits = Nx.divide(attn_logits, 11.3137) 
+    
+    # 3. APPLY THE BLINDFOLD
+    # We add the mask (-1.0e9) to the future, which Softmax will turn to 0.0
+    mask = DLM.Mask.causal(seq_len)
+    masked_logits = Nx.add(scaled_logits, mask)
+    
+    # 4. Softmax (The future is now completely gone)
+    attn_weights = softmax(masked_logits)
+    x = Nx.add(nx, attn_weights) |> DLM.ThoughtBlock.norm()
+    
+    # Step 2: Feed Forward
+    ff = Nx.dot(x, fw)
+    ff = Nx.select(Nx.greater(ff, 0), ff, Nx.multiply(ff, 0.01))
+    final_x = Nx.add(x, ff) |> DLM.ThoughtBlock.norm()
+    
+    diff = Nx.subtract(final_x, cx)
+    Nx.mean(Nx.pow(diff, 2))
+  end
+end
+```
+
+```elixir
+defmodule DLM.Optimizer do
+  import Nx.Defn
+
+  defn step(nx, tn, cx, aw, fw, lr) do
+    # Note: we don't need 'its' anymore for training
+    {loss, {ga, gf}} = value_and_grad({aw, fw}, fn {a, f} -> 
+      DLM.Training.loss_fn(nx, tn, cx, a, f, 1) 
+    end)
+    
+    ga = Nx.clip(ga, -0.5, 0.5)
+    gf = Nx.clip(gf, -0.5, 0.5)
+    
+    {loss, Nx.subtract(aw, Nx.multiply(ga, lr)), Nx.subtract(fw, Nx.multiply(gf, lr))}
+  end
+
+  defn run_chunk(nx, tn, cx, aw, fw, lr, epochs) do
+    {_i, _nx, _tn, _cx, f_aw, f_fw, _lr, _e, f_loss} = 
+      while {i = 0, nx, tn, cx, c_aw = aw, c_fw = fw, lr, e = epochs, _l = 0.0}, Nx.less(i, e) do
+        {loss, n_aw, n_fw} = step(nx, tn, cx, c_aw, c_fw, lr)
+        {i + 1, nx, tn, cx, n_aw, n_fw, lr, e, loss}
+      end
+    {f_aw, f_fw, f_loss}
+  end
+end
+```
+
+```elixir
+# --- 1. SETUP (128-D + Sine/Cosine Positional Encoding) ---
+batch_size = 32
+embed_dim = 128
+key = Nx.Random.key(42)
+
+{emb_w, key} = Nx.Random.uniform(key, -1.0, 1.0, shape: {256, embed_dim})
+target_bytes = Nx.tensor([[69, 108, 105, 120, 105, 114, 33]])
+clean_x_single = Nx.dot(Nx.equal(Nx.iota({1, 7, 256}, axis: 2), Nx.reshape(target_bytes, {1, 7, 1})), emb_w)
+clean_x = Nx.tile(clean_x_single, [batch_size, 1, 1])
+
+# NEW: The Smooth Sine/Cosine Watermark
+pos_emb = DLM.Positional.build(7, embed_dim)
+
+{target_noise, key} = Nx.Random.normal(key, 0.0, 0.3, shape: {batch_size, 7, embed_dim})
+
+# Add the noise and the subtle positional watermark
+noisy_batch = Nx.add(clean_x, target_noise) |> Nx.add(pos_emb)
+
+he_stddev = :math.sqrt(2 / embed_dim)
+{attn_w, key} = Nx.Random.normal(key, 0.0, he_stddev, shape: {128, 128})
+{ff_w, _key}  = Nx.Random.normal(key, 0.0, he_stddev, shape: {128, 128})
+
+# --- 2. THE SINE WAVE BURN ---
+max_lr = 0.6
+min_lr = 0.01
+chunks = 10
+epochs_per_chunk = 1000
+
+IO.puts("--- Starting 128-D Sine Wave Positional Burn ---")
+
+{final_attn, final_ff, _} = 
+  Enum.reduce(1..chunks, {attn_w, ff_w, 0.0}, fn c, {aw, fw, _} ->
+    cos_val = :math.cos((c - 1) * :math.pi() / chunks)
+    current_lr = min_lr + 0.5 * (max_lr - min_lr) * (1 + cos_val)
+    
+    {next_aw, next_fw, loss} = 
+       DLM.Optimizer.run_chunk(noisy_batch, target_noise, clean_x, aw, fw, current_lr, epochs_per_chunk)
+    
+    l_val = Nx.to_number(loss)
+    aw_safe = Nx.backend_copy(next_aw, Nx.BinaryBackend)
+    fw_safe = Nx.backend_copy(next_fw, Nx.BinaryBackend)
+    
+    Nx.backend_deallocate(next_aw); Nx.backend_deallocate(next_fw); Nx.backend_deallocate(loss)
+    Process.sleep(1200); :erlang.garbage_collect()
+    
+    IO.puts("Chunk #{c} | LR: #{Float.round(current_lr, 4)} | MSE: #{Float.round(l_val, 8)} | RAM: #{round(:erlang.memory(:total) / 1_000_000)}MB")
+    {aw_safe, fw_safe, l_val}
+  end)
+
+# --- 3. THE REVEAL ---
+{test_noise, _} = Nx.Random.normal(key, 0.0, 0.3, shape: {1, 7, embed_dim})
+test_noisy = Nx.add(clean_x_single, test_noise) |> Nx.add(pos_emb)
+
+thought_output = DLM.ThoughtBlock.recursive_pass(test_noisy, final_attn, final_ff, 50)
+predicted_ids = Nx.dot(thought_output, Nx.transpose(emb_w)) |> Nx.argmax(axis: 2) |> Nx.to_flat_list()
+safe_string = predicted_ids |> Enum.map(fn x -> if x in 32..126, do: x, else: ?. end) |> List.to_string()
+
+IO.puts("\nPredicted IDs: #{inspect(predicted_ids)}")
+IO.puts("Result String: #{safe_string}")
+```
+
+```elixir
+# --- 3. THE REVEAL (THE 1-PASS FIX) ---
+{test_noise, _} = Nx.Random.normal(key, 0.0, 0.3, shape: {1, 7, embed_dim})
+
+# Create a fresh noisy string with the watermark
+test_noisy = Nx.add(clean_x_single, test_noise) |> Nx.add(pos_emb)
+
+# THE FIX: 1 Pass. We trained a 1-step denoiser, not a loop!
+thought_output = DLM.ThoughtBlock.recursive_pass(test_noisy, final_attn, final_ff, 1)
+
+predicted_ids = Nx.dot(thought_output, Nx.transpose(emb_w)) |> Nx.argmax(axis: 2) |> Nx.to_flat_list()
+safe_string = predicted_ids |> Enum.map(fn x -> if x in 32..126, do: x, else: ?. end) |> List.to_string()
+
+IO.puts("\nPredicted IDs: #{inspect(predicted_ids)}")
+IO.puts("Result String: #{safe_string}")
+```
+
+```elixir
+# --- 4. THE GENERALIZATION TEST (DOUBLE NOISE) ---
+# We are cranking the noise standard deviation up from 0.3 to 0.6
+{extreme_noise, _} = Nx.Random.normal(key, 0.0, 0.6, shape: {1, 7, embed_dim})
+
+# Add the extreme noise and the positional watermark to the clean target
+extreme_noisy_data = Nx.add(clean_x_single, extreme_noise) |> Nx.add(pos_emb)
+
+# Pass it through your trained 1-Step Denoiser
+thought_output = DLM.ThoughtBlock.recursive_pass(extreme_noisy_data, final_attn, final_ff, 1)
+
+predicted_ids = Nx.dot(thought_output, Nx.transpose(emb_w)) |> Nx.argmax(axis: 2) |> Nx.to_flat_list()
+safe_string = predicted_ids |> Enum.map(fn x -> if x in 32..126, do: x, else: ?. end) |> List.to_string()
+
+IO.puts("\n--- EXTREME NOISE TEST (0.6 StdDev) ---")
+IO.puts("Predicted IDs: #{inspect(predicted_ids)}")
+IO.puts("Result String: #{safe_string}")
+```
+
+```elixir
+# --- SAVE TRAINED WEIGHTS ---
+save_path = "elixir_128d_weights.etf"
+
+# We pack the tensors and metadata into a simple map
+model_state = %{
+  attn: final_attn,
+  ff: final_ff,
+  embed_dim: 128,
+  word: "Elixir!"
+}
+
+# Convert the map to a highly compressed Erlang binary
+binary_data = :erlang.term_to_binary(model_state)
+
+# Write it to the hard drive
+File.write!(save_path, binary_data)
+
+IO.puts("✅ Successfully saved #{byte_size(binary_data) / 1_000_000} MB of weights to: #{save_path}")
+```
+
+```elixir
+# --- LOAD PRE-TRAINED WEIGHTS ---
+load_path = "elixir_128d_weights.etf"
+
+# Read the binary file and unpack the map
+loaded_state = File.read!(load_path) |> :erlang.binary_to_term()
+
+# Extract the tensors back into variables
+restored_attn = loaded_state.attn
+restored_ff = loaded_state.ff
+
+IO.puts("✅ Successfully loaded weights for a #{loaded_state.embed_dim}-D model trained on '#{loaded_state.word}'!")
+
+# --- QUICK VERIFICATION TEST ---
+# (Assumes 'noisy_batch', 'emb_w', and 'DLM' modules are loaded from your setup cells)
+test_noisy = Nx.take(noisy_batch, Nx.tensor([0]))
+thought_output = DLM.ThoughtBlock.recursive_pass(test_noisy, restored_attn, restored_ff, 50)
+predicted_ids = Nx.dot(thought_output, Nx.transpose(emb_w)) |> Nx.argmax(axis: 2) |> Nx.to_flat_list()
+safe_string = predicted_ids |> Enum.map(fn x -> if x in 32..126, do: x, else: ?. end) |> List.to_string()
+
+IO.puts("Verification Result: #{safe_string}")
+```
+
+```elixir
+# 1. Setup (64-D)
+embed_dim = 64
+key = Nx.Random.key(777)
+{emb_w, key} = Nx.Random.uniform(key, -1.0, 1.0, shape: {256, embed_dim})
+target_bytes = Nx.tensor([[69, 108, 105, 120, 105, 114, 33]])
+one_hot = Nx.equal(Nx.iota({1, 7, 256}, axis: 2), Nx.reshape(target_bytes, {1, 7, 1}))
+clean_x = Nx.dot(one_hot, emb_w)
+{target_noise, _key} = Nx.Random.normal(key, shape: {1, 7, embed_dim})
+noisy_data = Nx.add(clean_x, target_noise)
+
+# Initialize weights with "Quiet" values (-0.02 to 0.02)
+{attn_w, key} = Nx.Random.uniform(key, -0.02, 0.02, shape: {64, 64})
+{ff_w, _key}  = Nx.Random.uniform(key, -0.02, 0.02, shape: {64, 64})
+
+# 2. Hybrid Loop
+total_chunks = 10
+chunk_size = 250
+iterations = 5
+
+IO.puts("--- Starting Stable Hybrid Burn ---")
+
+{final_attn, final_ff, _} = 
+  Enum.reduce(1..total_chunks, {attn_w, ff_w, Nx.tensor(0.0)}, fn chunk, {aw, fw, _} ->
+    
+    # Lower, safer Learning Rate
+    lr = 0.01 # Keep it steady at 0.01 for the first 1000 epochs
+    
+    # Run 250 epochs in C++
+    {next_aw, next_fw, loss} = 
+      DLM.Optimizer.chunk_loop(noisy_data, target_noise, clean_x, aw, fw, iterations, lr, chunk_size)
+    
+    # Air-gap the result
+    safe_aw = Nx.backend_copy(next_aw, Nx.BinaryBackend)
+    safe_fw = Nx.backend_copy(next_fw, Nx.BinaryBackend)
+    safe_loss = Nx.backend_copy(loss, Nx.BinaryBackend)
+
+    IO.puts("Epoch #{chunk * chunk_size} | Loss: #{safe_loss |> Nx.squeeze() |> Nx.to_number()}")
+    
+    {safe_aw, safe_fw, safe_loss}
+  end)
+
+IO.puts("\nTraining Complete! No NaNs, No Crashes.")
+```
+
+```elixir
+defmodule DLM.Inference do
+  import Nx.Defn
+
+  @doc """
+  The 'Denoising Step'. It takes the current noisy data, asks the model
+  to predict the noise, and then subtracts that noise to get a 'cleaner' version.
+  """
+  defn p_sample(x, t, alphas, alphas_cumprod, attn_w, ff_w, iterations) do
+    # 1. Ask the model: "What part of this is noise?"
+    predicted_noise = DLM.ThoughtBlock.recursive_pass(x, attn_w, ff_w, iterations)
+
+    # 2. Grab the schedule constants for this specific timestep
+    alpha_t = Nx.take(alphas, t)
+    alpha_bar_t = Nx.take(alphas_cumprod, t)
+    
+    # 3. The Reverse Formula: This 'un-mixes' the signal from the noise
+    # We remove the predicted noise scaled by the schedule
+    coeff = (1 - alpha_t) / Nx.sqrt(1 - alpha_bar_t)
+    mean = (1 / Nx.sqrt(alpha_t)) * (x - coeff * predicted_noise)
+
+    # Return the slightly cleaner version of the data
+    mean
+  end
+end
+```
+
+```elixir
+# 1. THE DICTIONARY SYNC
+# We re-derive the head from whatever emb_w is currently in the system memory
+current_head = Nx.transpose(emb_w)
+
+# 2. SANITY CHECK: "Does the dictionary work?"
+# We take the 'clean_x' (the perfect target) and try to decode it directly.
+# If this doesn't say "Elixir!", then our emb_w and clean_x are out of sync.
+sanity_logits = Nx.dot(clean_x, current_head)
+sanity_ids = Nx.argmax(sanity_logits, axis: 2) |> Nx.to_flat_list()
+IO.puts("Sanity Check (Clean Data): #{List.to_string(sanity_ids)}")
+
+# 3. THE ACTUAL INFERENCE
+# Now we run the noisy data through the trained brain
+inference_iterations = 20
+thought_output = DLM.ThoughtBlock.recursive_pass(noisy_data, final_attn, final_ff, inference_iterations)
+
+# 4. DECODE
+inference_logits = Nx.dot(thought_output, current_head)
+predicted_ids = Nx.argmax(inference_logits, axis: 2) |> Nx.to_flat_list()
+
+IO.puts("--- The 64-D Final Reveal ---")
+IO.puts("Predicted IDs: #{inspect(predicted_ids)}")
+IO.puts("Decoded String: #{List.to_string(predicted_ids)}")
+```
+
+```elixir
+# 1. The target bytes for "Elixir!"
+target_bytes = [69, 108, 105, 120, 105, 114, 33]
+
+# 2. Your model's output (Replace these numbers with the ones from your buffer!)
+model_output = [13, 99, 80, 170, 133, 199, 241]
+
+IO.puts("Target: #{inspect(target_bytes)}")
+IO.puts("Model:  #{inspect(model_output)}")
+
+# Calculate the average distance (how far off we are)
+distances = Enum.zip(target_bytes, model_output) 
+            |> Enum.map(fn {t, m} -> abs(t - m) end)
+
+IO.inspect(distances, label: "Byte Distance (Error per Character)")
+```
+
+```elixir
+# 1. Create a "Canvas" of pure random noise
+# We use a different seed (777) to prove it's not just "remembering" the training noise
+key = Nx.Random.key(777)
+{canvas, _key} = Nx.Random.normal(key, shape: {1, 7, 16})
+
+# 2. The Reverse Diffusion Pass
+# We step backward from Step 19 (Pure Noise) to Step 0 (Clean Text)
+final_denoised_tensor = 
+  Enum.reduce(19..0//-1, canvas, fn t_idx, current_canvas ->
+    t_tensor = Nx.tensor(t_idx)
+    
+    DLM.Inference.p_sample(
+      current_canvas, 
+      t_tensor, 
+      alphas, 
+      alphas_cumprod, 
+      final_attn, 
+      final_ff, 
+      5 # iterations inside the ThoughtBlock
+    )
+  end)
+
+# 3. Decode the result
+predicted_ids = DLM.LanguageHead.predict(final_denoised_tensor, output_weights)
+decoded_string = DLM.Decoder.decode(predicted_ids)
+
+IO.puts("--- Inference Results ---")
+IO.inspect(predicted_ids, label: "Predicted Byte IDs")
+IO.inspect(decoded_string, label: "Generated String (Raw)")
+
+# 4. Let's see how close we got to "Elixir!" (69, 108, 105, 120, 105, 114, 33)
+target = [69, 108, 105, 120, 105, 114, 33]
+output = predicted_ids |> Nx.flatten() |> Nx.to_flat_list()
+diff = Enum.zip(target, output) |> Enum.map(fn {t, o} -> abs(t - o) end)
+
+IO.inspect(diff, label: "Distance from Target Bytes")
+```
+
+```elixir
+# --- 1. The 64-Dimensional Setup ---
+embed_dim = 64
+key = Nx.Random.key(777)
+
+IO.puts("Setting up 64-D Space...")
+
+# Eyes & Voice (Frozen, wide dimensions)
+{emb_w, key} = Nx.Random.uniform(key, -1.0, 1.0, shape: {256, embed_dim})
+head_w = Nx.transpose(emb_w)
+
+# Target Data mapped to 64-D
+target_bytes = Nx.tensor([[69, 108, 105, 120, 105, 114, 33]])
+one_hot = Nx.equal(Nx.iota({1, 7, 256}, axis: 2), Nx.reshape(target_bytes, {1, 7, 1}))
+clean_x = Nx.dot(one_hot, emb_w)
+
+# Re-create Noise with 64 dimensions
+{target_noise, _key} = Nx.Random.normal(key, shape: {1, 7, embed_dim})
+noisy_data = Nx.add(clean_x, target_noise)
+
+# --- 2. Initialize the 64-D Brain ---
+{attn_w, key} = Nx.Random.uniform(key, -0.1, 0.1, shape: {embed_dim, embed_dim})
+{ff_w, _key}  = Nx.Random.uniform(key, -0.1, 0.1, shape: {embed_dim, embed_dim})
+
+# --- 3. The Power Loop ---
+total_epochs = 500
+chunk_size = 50
+learning_rate = 0.05
+iterations = 5
+
+IO.puts("--- Starting 64-Dimensional Web Worker Training ---")
+
+{final_attn, final_ff, _} = 
+  Enum.reduce(1..div(total_epochs, chunk_size), {attn_w, ff_w, Nx.tensor(0.0)}, fn chunk, {aw, fw, _} ->
+    
+    worker = Task.async(fn ->
+      {next_aw, next_fw, loss} = 
+        DLM.Optimizer.train_loop(
+          noisy_data, target_noise, clean_x,
+          aw, fw, iterations, learning_rate, chunk_size
+        )
+      
+      {Nx.backend_transfer(next_aw), Nx.backend_transfer(next_fw), Nx.backend_transfer(loss)}
+    end)
+
+    {safe_aw, safe_fw, safe_loss} = Task.await(worker, 60_000)
+    
+    IO.puts("Chunk #{chunk} | Total Epochs: #{chunk * chunk_size} | Loss: #{Nx.to_number(safe_loss)}")
+    {safe_aw, safe_fw, safe_loss}
+  end)
+
+IO.puts("\n64-D Training Complete! Ready for Inference.")
+```

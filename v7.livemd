@@ -1,0 +1,394 @@
+# ME_MIND_V7
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.11"},
+  {:exla, "~> 0.11"},
+  {:req, "~> 0.5"},
+  {:nimble_csv, "~> 1.2"}
+])
+```
+
+## Core Math
+
+```elixir
+Nx.global_default_backend(EXLA.Backend)
+Nx.Defn.default_options(compiler: EXLA)
+
+# --- 1. CORE MATH ---
+defmodule DLM.Training do
+  import Nx.Defn
+  defn softmax(t), do: Nx.exp(t) |> Nx.divide(Nx.sum(Nx.exp(t), axes: [-1], keep_axes: true))
+  
+  defn layer_norm(t) do
+    mean = Nx.mean(t, axes: [-1], keep_axes: true)
+    var = Nx.variance(t, axes: [-1], keep_axes: true)
+    Nx.subtract(t, mean) |> Nx.divide(Nx.sqrt(Nx.add(var, 1.0e-5)))
+  end
+end
+
+defmodule DLM.Positional do
+  def build(seq_len, dim) do
+    positions = Nx.iota({seq_len, 1})
+    div_term = Nx.exp(Nx.multiply(Nx.iota({dim}), -0.05))
+    angles = Nx.multiply(positions, div_term)
+    Nx.add(Nx.sin(angles), Nx.cos(angles)) |> DLM.Training.layer_norm()
+  end
+end
+
+defmodule DLM.Mask do
+  def causal(seq_len) do
+    Nx.iota({seq_len, seq_len})
+    |> Nx.greater_equal(Nx.iota({seq_len, 1}))
+    |> Nx.select(0.0, -1.0e9)
+  end
+end
+
+# --- 2. INFERENCE (UPDATED FOR SLIDING WINDOW) ---
+defmodule DLM.Inference do
+  import Nx.Defn
+  
+  defn core_logic(input_emb, aw1, fw1, aw2, fw2, mask) do
+    x1 = apply_layer(input_emb, aw1, fw1, mask)
+    apply_layer(x1, aw2, fw2, mask)
+  end
+
+  defn predict_next(input_emb, aw1, fw1, aw2, fw2, lm_w, lm_b, mask, imagination_factor, imagination_seed) do
+    x2 = core_logic(input_emb, aw1, fw1, aw2, fw2, mask)
+    {noise, _} = Nx.Random.normal(imagination_seed, 0.0, 0.5, shape: Nx.shape(x2))
+    imagined_x2 = Nx.add(x2, Nx.multiply(noise, imagination_factor))
+    
+    # Returning RAW LOGITS now, no softmax!
+    logits = Nx.dot(imagined_x2 |> DLM.Training.layer_norm(), lm_w) |> Nx.add(lm_b)
+    logits |> Nx.slice_along_axis(Nx.axis_size(logits, 1) - 1, 1, axis: 1) |> Nx.squeeze()
+  end
+
+  defn apply_layer(input, aw, fw, mask) do
+    {_b, _s, dim} = Nx.shape(input)
+    transposed = Nx.transpose(input, axes: [0, 2, 1])
+    scores = Nx.dot(input, [2], [0], transposed, [1], [0])
+    masked_scores = Nx.add(Nx.divide(scores, Nx.sqrt(dim)), mask)
+    attn_weights = DLM.Training.softmax(masked_scores)
+    attended = Nx.dot(attn_weights, [2], [0], input, [1], [0])
+    x = Nx.dot(attended, aw) |> DLM.Training.layer_norm()
+    x_res = Nx.add(input, x) 
+    ff = Nx.dot(x_res, fw)
+    ff = Nx.select(Nx.greater(ff, 0), ff, Nx.multiply(ff, 0.01))
+    Nx.add(x_res, ff) |> DLM.Training.layer_norm()
+  end
+end
+
+# --- 3. OPTIMIZER ---
+defmodule DLM.Optimizer do
+  import Nx.Defn
+
+  defn loss(inputs, targets, emb, aw1, fw1, aw2, fw2, lm_w, lm_b, pos, mask) do
+    x0 = Nx.take(emb, inputs) |> Nx.add(pos)
+    x2 = DLM.Inference.core_logic(x0, aw1, fw1, aw2, fw2, mask)
+    logits = Nx.dot(x2 |> DLM.Training.layer_norm(), lm_w) |> Nx.add(lm_b)
+    probs = DLM.Training.softmax(logits)
+    
+    {batch, seq_len} = Nx.shape(targets)
+    vocab_indices = Nx.iota({128})
+    targets_expanded = Nx.reshape(targets, {batch, seq_len, 1})
+    targets_one_hot = Nx.equal(targets_expanded, vocab_indices)
+    
+    cross_entropy = Nx.multiply(targets_one_hot, Nx.log(Nx.add(probs, 1.0e-7)))
+    Nx.multiply(Nx.sum(cross_entropy, axes: [-1]), -1.0) |> Nx.mean()
+  end
+
+  defn train_step(inputs, targets, e, a1, f1, a2, f2, lmw, lmb, pos, mask, lr) do
+    {current_loss, {ge, ga1, gf1, ga2, gf2, glmw, glmb}} = 
+      value_and_grad({e, a1, f1, a2, f2, lmw, lmb}, fn {e_in, a1_in, f1_in, a2_in, f2_in, lmw_in, lmb_in} -> 
+        loss(inputs, targets, e_in, a1_in, f1_in, a2_in, f2_in, lmw_in, lmb_in, pos, mask) 
+      end)
+    
+    {
+      Nx.subtract(e, Nx.multiply(ge, Nx.divide(lr, 10))),
+      Nx.subtract(a1, Nx.multiply(ga1, lr)),
+      Nx.subtract(f1, Nx.multiply(gf1, lr)),
+      Nx.subtract(a2, Nx.multiply(ga2, lr)),
+      Nx.subtract(f2, Nx.multiply(gf2, lr)),
+      Nx.subtract(lmw, Nx.multiply(glmw, lr)),
+      Nx.subtract(lmb, Nx.multiply(glmb, lr)),
+      current_loss
+    }
+  end
+
+  defn multi_step(inputs_chunk, targets_chunk, e, a1, f1, a2, f2, lmw, lmb, pos, mask, lr) do
+    chunk_size = Nx.axis_size(inputs_chunk, 0)
+    init_state = {e, a1, f1, a2, f2, lmw, lmb, Nx.tensor(0.0), 0, inputs_chunk, targets_chunk, pos, mask, lr}
+
+    {fe, fa1, ff1, fa2, ff2, flmw, flmb, final_loss, _, _, _, _, _, _} = 
+      while state = init_state, elem(state, 8) < chunk_size do
+        {e, a1, f1, a2, f2, lmw, lmb, _l, i, in_c, tg_c, p, m, l} = state
+        {ne, na1, nf1, na2, nf2, nlmw, nlmb, step_loss} = train_step(in_c[i], tg_c[i], e, a1, f1, a2, f2, lmw, lmb, p, m, l)
+        {ne, na1, nf1, na2, nf2, nlmw, nlmb, step_loss, i + 1, in_c, tg_c, p, m, l}
+      end
+    {fe, fa1, ff1, fa2, ff2, flmw, flmb, final_loss}
+  end
+end
+IO.puts("✅ V10.5 Infrastructure Ready (Raw Logits Active)!")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## EMG Save
+
+```elixir
+# --- V10.2 DICTIONARY CHECKPOINT SAVER ---
+# Run this after stopping a burn to save the current 'Imagination' Brain
+checkpoint_path = Path.join(File.cwd!(), "v10_dictionary_brain.bin")
+
+brain_map = %{
+  e: f_e,
+  a1: f_a1,
+  f1: f_f1,
+  a2: f_a2,
+  f2: f_f2,
+  lmw: f_lmw,
+  lmb: f_lmb
+}
+
+File.write!(checkpoint_path, :erlang.term_to_binary(brain_map))
+IO.puts("💾 Dictionary Brain saved to #{checkpoint_path}")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Belt
+
+```elixir
+defmodule DLM.DataStreamer do
+  @seq_len 31
+  NimbleCSV.define(DLM.CSVParser, separator: ",", escape: "\"")
+
+  def stream_chunks(path, batch_size, chunk_size) do
+    path
+    |> File.stream!()
+    |> DLM.CSVParser.parse_stream(skip_headers: true)
+    |> Stream.map(fn row -> 
+      # Bulletproof extraction: Grab first item (Word) and last item (Definition)
+      word = List.first(row) || ""
+      definition = List.last(row) || ""
+      
+      "#{String.upcase(word)}: #{definition}"
+      |> String.trim()
+      |> String.replace(~r/[^ -~]/, "") # Keep only standard ASCII
+      |> String.pad_trailing(@seq_len + 1, "#") 
+      |> String.slice(0..@seq_len)
+      |> to_charlist()
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      full = Nx.tensor(batch)
+      {Nx.slice_along_axis(full, 0, @seq_len, axis: 1), 
+       Nx.slice_along_axis(full, 1, @seq_len, axis: 1)}
+    end)
+    |> Stream.chunk_every(chunk_size, chunk_size, :discard)
+    |> Stream.map(fn pairs ->
+      {ins, tgs} = Enum.unzip(pairs)
+      {Nx.stack(ins), Nx.stack(tgs)}
+    end)
+  end
+end
+```
+
+```elixir
+# --- V10.8 MULTI-EPOCH GRAND BURN ---
+checkpoint_path = Path.join(File.cwd!(), "v10_webster_brain.bin")
+dict_path = "english_dictionary.csv"
+batch_size = 32
+chunk_size = 10 
+lr = 0.002
+seq_len = 31
+total_epochs = 10 # Read the dictionary 10 times
+
+# 1. Load Initial Brain
+weights = if File.exists?(checkpoint_path) do
+  m = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+  {m.e, m.a1, m.f1, m.a2, m.f2, m.lmw, m.lmb}
+else
+  raise "Dictionary Brain not found! Ensure v10_webster_brain.bin exists."
+end
+
+pos_emb = DLM.Positional.build(seq_len, 256)
+causal_mask = DLM.Mask.causal(seq_len)
+
+IO.puts("--- Starting The Multi-Epoch Grand Burn (#{total_epochs} Epochs) ---")
+IO.puts("⏳ EXLA Factory is already hot. Training will begin shortly...")
+
+# 2. The Outer Epoch Loop
+final_state = Enum.reduce(1..total_epochs, {elem(weights,0), elem(weights,1), elem(weights,2), elem(weights,3), elem(weights,4), elem(weights,5), elem(weights,6), 0}, fn epoch, {e_acc, a1_acc, f1_acc, a2_acc, f2_acc, lmw_acc, lmb_acc, global_step} ->
+  
+  IO.puts("\n🚀 --- STARTING EPOCH #{epoch}/#{total_epochs} --- 🚀")
+
+  # Inner Stream Loop
+  {ne, na1, nf1, na2, nf2, nlmw, nlmb, next_step} =
+    DLM.DataStreamer.stream_chunks(dict_path, batch_size, chunk_size)
+    |> Enum.reduce({e_acc, a1_acc, f1_acc, a2_acc, f2_acc, lmw_acc, lmb_acc, global_step}, fn {ins, tgs}, {e, a1, f1, a2, f2, lmw, lmb, step} ->
+
+      if step == 0 and epoch == 1, do: IO.puts("💓 Heartbeat: First chunk reached XLA!")
+
+      {new_e, new_a1, new_f1, new_a2, new_f2, new_lmw, new_lmb, loss} =
+        DLM.Optimizer.multi_step(ins, tgs, e, a1, f1, a2, f2, lmw, lmb, pos_emb, causal_mask, lr)
+
+      # Print every 25 chunks to keep Livebook running smoothly
+      if rem(step, 25) == 0 do
+        l_val = Nx.to_number(loss)
+        total_rows = (step + 1) * chunk_size * batch_size
+        IO.puts("Epoch #{epoch} | Chunk #{step} | Rows: #{total_rows} | Loss: #{Float.round(l_val, 6)} | RAM: #{round(:erlang.memory(:total) / 1_000_000)}MB")
+      end
+
+      {
+        Nx.backend_copy(new_e, Nx.BinaryBackend),
+        Nx.backend_copy(new_a1, Nx.BinaryBackend),
+        Nx.backend_copy(new_f1, Nx.BinaryBackend),
+        Nx.backend_copy(new_a2, Nx.BinaryBackend),
+        Nx.backend_copy(new_f2, Nx.BinaryBackend),
+        Nx.backend_copy(new_lmw, Nx.BinaryBackend),
+        Nx.backend_copy(new_lmb, Nx.BinaryBackend),
+        step + 1
+      }
+    end)
+
+  # Auto-Save at the end of each epoch
+  epoch_checkpoint = Path.join(File.cwd!(), "v10_webster_brain_epoch_#{epoch}.bin")
+  File.write!(epoch_checkpoint, :erlang.term_to_binary(%{
+    e: ne, a1: na1, f1: nf1, a2: na2, f2: nf2, lmw: nlmw, lmb: nlmb
+  }))
+  
+  # Update the main checkpoint file too
+  File.write!(checkpoint_path, :erlang.term_to_binary(%{
+    e: ne, a1: na1, f1: nf1, a2: na2, f2: nf2, lmw: nlmw, lmb: nlmb
+  }))
+  IO.puts("💾 Epoch #{epoch} complete! Brain auto-saved.")
+
+  # Pass the updated weights and step counter to the next epoch
+  {ne, na1, nf1, na2, nf2, nlmw, nlmb, next_step}
+end)
+
+IO.puts("\n✅ Grand Burn Complete! 10 Epochs Finished.")
+```
+
+```elixir
+# --- V10.10 PERFECT RECALL SAMPLER ---
+checkpoint_path = Path.join(File.cwd!(), "v10_webster_brain.bin")
+
+seeds = [
+  "AARDVARK: ", 
+  "FLUMMOX: ", 
+  "CYBORG: " 
+]
+
+novelty_dial = 0.4 
+temp = 0.4 + (novelty_dial * 0.8) 
+freq_penalty = 0.2 
+
+key = Nx.Random.key(System.system_time(:millisecond))
+
+weights = if File.exists?(checkpoint_path) do
+  m = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+  {m.e, m.a1, m.f1, m.a2, m.f2, m.lmw, m.lmb}
+else
+  raise "Dictionary Brain not found!"
+end
+
+{f_e, f_a1, f_f1, f_a2, f_f2, f_lmw, f_lmb} = weights
+
+IO.puts("--- Running Dictionary Sampler (Safe Softmax Active) ---\n")
+
+Enum.reduce(seeds, key, fn seed_text, current_key ->
+  seed_ids = seed_text |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+  IO.write("#{seed_text}")
+  
+  # Limit set to strictly stay inside the 31-character trained universe
+  {_final_ids, next_seed_key} = Enum.reduce_while(1..31, {seed_ids, current_key}, fn _i, {acc_ids, k} ->
+    {_, total_len} = Nx.shape(acc_ids)
+    
+    if total_len >= 31 do
+      {:halt, {acc_ids, k}}
+    else
+      p_emb = DLM.Positional.build(total_len, 256)
+      mask = DLM.Mask.causal(total_len)
+      
+      new_keys = Nx.Random.split(k)
+      inf_key = new_keys[0]
+      dice_key = new_keys[1]
+      
+      raw_logits = DLM.Inference.predict_next(
+        Nx.add(Nx.take(f_e, acc_ids), p_emb), 
+        f_a1, f_f1, f_a2, f_f2, f_lmw, f_lmb,
+        mask, 0.0, inf_key 
+      )
+
+      char_counts = Nx.equal(Nx.reshape(acc_ids, {total_len, 1}), Nx.iota({128})) |> Nx.sum(axes: [0])
+      penalized_logits = Nx.subtract(raw_logits, Nx.multiply(char_counts, freq_penalty))
+      scaled_logits = Nx.divide(penalized_logits, temp)
+
+      # --- THE SAFE SOFTMAX FIX ---
+      # Pull the logits down from the stratosphere before running Nx.exp()
+      max_logit = Nx.reduce_max(scaled_logits, axes: [-1], keep_axes: true)
+      safe_logits = Nx.subtract(scaled_logits, max_logit)
+      final_probs = Nx.exp(safe_logits) |> Nx.divide(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true))
+
+      {choice_tensor, nk} = Nx.Random.choice(dice_key, Nx.iota({128}), final_probs)
+      next_id = choice_tensor |> Nx.squeeze() |> Nx.to_number()
+
+      if next_id == 10 or next_id == 35 do
+        {:halt, {acc_ids, nk}}
+      else
+        if next_id >= 32 and next_id < 127, do: IO.write(<<next_id>>)
+        new_acc = Nx.concatenate([acc_ids, Nx.reshape(Nx.tensor([next_id]), {1, 1})], axis: 1)
+        {:cont, {new_acc, nk}}
+      end
+    end
+  end)
+  
+  IO.puts("\n") 
+  next_seed_key
+end)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Dictionary Create
+
+```elixir
+# --- GENERATE SYNTHETIC DICTIONARY FILE ---
+# In the future, you'll replace this with the path to a real Webster's text file.
+file_path = "mini_dictionary.txt"
+
+subjects = ["Aardvark", "Abacus", "Abe", "Aide", "Ail"]
+definitions = [
+  "is a nocturnal mammal of Africa.",
+  "is an ancient counting tool.",
+  "is a name for a person.",
+  "is a helper or assistant.",
+  "is to feel pain or trouble."
+]
+
+File.open!(file_path, [:write], fn file ->
+  # Create 1,000 variations
+  for _ <- 1..200, s <- subjects, d <- definitions do
+    IO.write(file, "#{s} #{d}\n")
+  end
+end)
+
+IO.puts("✅ Created #{file_path} with 1,000 entries.")
+```
+
+```elixir
+# --- THE REAL ENGLISH DICTIONARY DOWNLOADER ---
+dict_url = "https://raw.githubusercontent.com/benjihillard/English-Dictionary-Database/main/english%20Dictionary.csv"
+dict_file = "english_dictionary.csv"
+
+unless File.exists?(dict_file) do
+  IO.puts("📥 Downloading the English Dictionary (14.5 MB)...")
+  %{body: content} = Req.get!(dict_url)
+  File.write!(dict_file, content)
+  IO.puts("✅ Downloaded #{Float.round(byte_size(content) / 1_000_000, 2)} MB of knowledge.")
+else
+  IO.puts("📂 Dictionary already exists locally.")
+end
+```

@@ -1,0 +1,1962 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# V21 .5 (forked from v21)
+
+```elixir
+# ===========================================================================
+# V20-BB Setup
+# ===========================================================================
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+System.put_env("XLA_CLIENT_MEM_FRACTION", "0.75")
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")        # ← disables the Merging Dots pass
+System.put_env("XLA_FLAGS", "--xla_gpu_enable_reassociation_for_converted_ar=false")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"}
+])
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+
+
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## USSM, Positional, Muon_Optimizer
+
+```elixir
+defmodule DLM.UniversalSSM do
+  import Nx.Defn
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn softplus(x), do: Nx.log1p(Nx.exp(x))
+  defn silu(x), do: x * Nx.sigmoid(x)
+
+  defn apply_svd_weight(x, u, v) do
+    x |> Nx.dot(u) |> silu() |> Nx.dot(v)
+  end
+
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2) do
+    # ⚡ V20's conv idea, implemented as a 3-tap FIR in the recurrence
+    x_mixed = x_t 
+      |> Nx.add(apply_svd_weight(x_p1, mu1, mv1))
+      |> Nx.add(apply_svd_weight(x_p2, mu2, mv2))
+  
+    # V19's SSM update — unchanged, just fed x_mixed instead of x_t
+    delta_proj = apply_svd_weight(x_mixed, du, dv)
+    delta      = softplus(delta_proj)
+    a_bar      = Nx.sigmoid(Nx.multiply(delta, a))
+    b_proj     = apply_svd_weight(x_mixed, bu, bv)
+    b_bar      = Nx.multiply(delta, b_proj)
+    h_t        = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    y_ssm      = apply_svd_weight(h_t, cu, cv)
+    y_t        = Nx.add(y_ssm, x_mixed)  # residual on mixed input
+  
+    {y_t, h_t}
+  end
+
+  defn run_ssm_loop(x_seq_first, h_init, params) do
+    {_emb, a_diag, b_u, b_v, c_u, c_v, delta_u, delta_v, 
+     mx_u1, mx_v1, mx_u2, mx_v2, _lm_w, _lm_b} = params
+  
+    {seq_len, batch_size, embed_dim} = Nx.shape(x_seq_first)
+    y_init    = Nx.broadcast(Nx.tensor(0.0, type: :f32), {seq_len, batch_size, embed_dim})
+    zero_frame = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+  
+    # ⚡ THE FIX: Catch the entire tuple in one variable
+    result_tuple =
+      while {i = 0, y_acc = y_init, h_p = h_init,
+             x_prev1 = zero_frame,   # ← t-1 history
+             x_prev2 = zero_frame,   # ← t-2 history
+             xs = x_seq_first,
+             a = a_diag, bu = b_u, bv = b_v, cu = c_u, cv = c_v,
+             du = delta_u, dv = delta_v,
+             mu1 = mx_u1, mv1 = mx_v1, mu2 = mx_u2, mv2 = mx_v2},
+            Nx.less(i, seq_len) do
+  
+        x_t = xs[i]
+  
+        {y_t, h_new} = ssm_recurrence(
+          x_t, x_prev1, x_prev2, h_p,
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+        )
+  
+        # XLA dynamically updates the tensor slice in place!
+        y_acc_new = Nx.put_slice(y_acc, [i, 0, 0], Nx.new_axis(y_t, 0))
+  
+        # ⚡ Shift the history window
+        {i + 1, y_acc_new, h_new, x_t, x_prev1,
+         xs, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2}
+      end
+  
+    # ⚡ THE FIX: Safely extract y_acc (which is at index 1 of the tuple)
+    elem(result_tuple, 1)
+  end
+
+  defn forward(indices, params, pos_emb) do
+    # updated params
+    {embed, _a, _bu, _bv, _cu, _cv, _du, _dv, _mu1, _mv1, _mu2, _mv2, lm_w, lm_b} = params
+    x_input = Nx.take(embed, indices) + pos_emb
+    x_norm  = rms_norm(x_input)
+    
+    {batch_size, _seq_len, embed_dim} = Nx.shape(x_norm)
+    h_init = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+    x_seq_first = Nx.transpose(x_norm, axes: [1, 0, 2])
+    
+    # 2-Loop Recursion
+    y1_seq = run_ssm_loop(x_seq_first, h_init, params)
+    y2_seq = run_ssm_loop(y1_seq, h_init, params)
+    
+    y_out = Nx.transpose(y2_seq, axes: [1, 0, 2])
+    y_final = rms_norm(y_out)
+    Nx.dot(y_final, lm_w) + lm_b
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.UniversalSSM, <<70, 79, 82, 49, 0, 0, 48, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  # --- The Muon Newton-Schulz Engine ---
+  defn newton_schulz(g, iters \\ 5) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) + 1.0e-7
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, iters) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_update(grad, lr) do
+    Nx.subtract(0.0, Nx.multiply(lr, newton_schulz(grad)))
+  end
+
+  # --- Standard Adam Component ---
+  defn adam_update(param, grad, m, v, step, lr) do
+    # ⚡ THE FIX: Adam internally ensures the step is at least 1.0 to prevent division by zero
+    safe_step = step + 1.0
+
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  # --- The Hybrid Step ---
+  defn step(params, grads, ms, vs, step_count, lr) do
+    {p_emb, p_a, p_bu, p_bv, p_cu, p_cv, p_du, p_dv,
+      p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = params
+  
+    {g_emb, g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv,
+      g_mu1, g_mv1, g_mu2, g_mv2, g_lmw, g_lmb} = grads
+  
+    {m_emb, m_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+      m_mu1, m_mv1, m_mu2, m_mv2, m_lmw, m_lmb} = ms
+    
+    {v_emb, v_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+      v_mu1, v_mv1, v_mu2, v_mv2, v_lmw, v_lmb} = vs
+
+    # 1. Apply Adam to 1D and Vocab Tensors
+    {up_emb, nm_emb, nv_emb} = adam_update(p_emb, g_emb, m_emb, v_emb, step_count, lr)
+    {up_a, nm_a, nv_a}       = adam_update(p_a, g_a, m_a, v_a, step_count, lr)
+    {up_lmw, nm_lmw, nv_lmw} = adam_update(p_lmw, g_lmw, m_lmw, v_lmw, step_count, lr)
+    {up_lmb, nm_lmb, nv_lmb} = adam_update(p_lmb, g_lmb, m_lmb, v_lmb, step_count, lr)
+
+    # 2. Apply Muon to SVD Matrices
+    up_bu = p_bu + muon_update(g_bu, lr)
+    up_bv = p_bv + muon_update(g_bv, lr)
+    up_cu = p_cu + muon_update(g_cu, lr)
+    up_cv = p_cv + muon_update(g_cv, lr)
+    up_du = p_du + muon_update(g_du, lr)
+    up_dv = p_dv + muon_update(g_dv, lr)
+    up_mu1 = p_mu1 + muon_update(g_mu1, lr)
+    up_mv1 = p_mv1 + muon_update(g_mv1, lr)
+    up_mu2 = p_mu2 + muon_update(g_mu2, lr)
+    up_mv2 = p_mv2 + muon_update(g_mv2, lr)
+
+    new_params = {up_emb, up_a, up_bu, up_bv, up_cu, up_cv, up_du, up_dv,
+                    up_mu1, up_mv1, up_mu2, up_mv2, up_lmw, up_lmb}
+
+    new_ms = {nm_emb, nm_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+          m_mu1, m_mv1, m_mu2, m_mv2, nm_lmw, nm_lmb}
+    new_vs = {nv_emb, nv_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+          v_mu1, v_mv1, v_mu2, v_mv2, nv_lmw, nv_lmb}
+
+    {new_params, new_ms, new_vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.MuonHybrid, <<70, 79, 82, 49, 0, 0, 41, ...>>, true}
+```
+
+```elixir
+defmodule DLM.V21_5Genesis do
+  @vocab_size 128
+  @dim 256
+  @rank 32
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    {embed,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@vocab_size, @dim})
+    {a_diag, key} = Nx.Random.normal(key, 0.0, 1.0,  shape: {@dim})
+    {b_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {b_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {c_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {c_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {d_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {d_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {lm_w,   key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @vocab_size})
+    {lm_b,  _key} = Nx.Random.normal(key, 0.0, 0.0,  shape: {@vocab_size})
+
+    {embed, a_diag, b_u, b_v, c_u, c_v, d_u, d_v,
+     mx_u1, mx_v1, mx_u2, mx_v2, lm_w, lm_b}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    vs = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    {ms, vs, 1}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.V21_5Genesis, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inference
+
+```elixir
+defmodule DLM.InferenceV21 do
+  import Nx.Defn
+
+  @allowed_chars ~c" abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,:;-'\"()[]"
+
+  def build_muzzle(vocab_size \\ 128, allowed \\ @allowed_chars) do
+    muzzle = Nx.broadcast(Nx.tensor(-1.0e10, type: :f32), {vocab_size})
+    Enum.reduce(allowed, muzzle, fn char, acc ->
+      Nx.indexed_put(acc, Nx.tensor([[char]]), Nx.tensor([0.0]))
+    end)
+  end
+
+  defn get_next_logits(ins_padded, actual_len_tensor, params, pos_emb, muzzle) do
+    logits = DLM.UniversalSSM.forward(ins_padded, params, pos_emb)
+    target_idx = actual_len_tensor - 1
+    logits[0][target_idx] + muzzle
+  end
+
+  defn apply_rep_penalty(logits, recent_tokens, penalty_weight) do
+    vocab_size = elem(Nx.shape(logits), 0)
+    mask =
+      recent_tokens
+      |> Nx.new_axis(-1)
+      |> Nx.equal(Nx.iota({vocab_size}))
+      |> Nx.any(axes: [0])
+    penalized = Nx.select(logits > 0.0, logits / penalty_weight, logits * penalty_weight)
+    Nx.select(mask, penalized, logits)
+  end
+
+  def top_k(params, pos_emb, prompt, max_new_chars \\ 120, k \\ 3, temp \\ 0.4, muzzle \\ nil) do
+    gpu = {EXLA.Backend, client: :rocm}
+    muzzle = (muzzle || build_muzzle()) |> Nx.backend_copy(gpu)
+    prompt_chars = String.to_charlist(prompt)
+    max_seq = elem(Nx.shape(pos_emb), 0)
+    penalty_weight = Nx.tensor(1.2, type: :f32) |> Nx.backend_copy(gpu)
+
+    Enum.reduce(1..max_new_chars, {prompt_chars, Nx.Random.key(42)}, fn step, {chars, key} ->
+      window_chars = Enum.take(chars, -max_seq)
+      actual_len = length(window_chars)
+      pad_len = max_seq - actual_len
+      padded_chars = window_chars ++ List.duplicate(0, pad_len)
+
+      ins_padded = Nx.tensor([padded_chars], type: :s32) |> Nx.backend_copy(gpu)
+      len_tensor = Nx.tensor(actual_len, type: :s32)     |> Nx.backend_copy(gpu)
+
+      logits = get_next_logits(ins_padded, len_tensor, params, pos_emb, muzzle)
+
+      recent_tensor = chars |> Enum.take(-50) |> Nx.tensor(type: :s32) |> Nx.backend_copy(gpu)
+      penalized = apply_rep_penalty(logits, recent_tensor, penalty_weight)
+
+      {next_token, next_key} = sample_top_k_logits(penalized, temp, key, k: k)
+      if rem(step, 10) == 0, do: :erlang.garbage_collect(self())
+      {chars ++ [Nx.to_number(next_token)], next_key}
+    end)
+    |> elem(0)
+    |> List.to_string()
+  end
+
+  defn sample_top_k_logits(logits, temp, key, opts \\ []) do
+    k = opts[:k]
+    scaled = logits / temp
+    {values, indices} = Nx.top_k(scaled, k: k)
+    probs = Nx.exp(values) / Nx.sum(Nx.exp(values))
+    {sample_val, next_key} = Nx.Random.uniform(key)
+    cumulative = probs |> Nx.window_sum({k}, padding: :valid) |> Nx.squeeze()
+    selected_idx = Nx.argmax(cumulative > sample_val)
+    {indices[selected_idx], next_key}
+  end
+
+  def greedy(params, pos_emb, prompt, max_new_chars) do
+    gpu = {EXLA.Backend, client: :rocm}
+    # Build muzzle so it doesn't output illegal characters
+    muzzle = build_muzzle() |> Nx.backend_copy(gpu)
+    prompt_chars = String.to_charlist(prompt)
+    max_seq = elem(Nx.shape(pos_emb), 0)
+
+    # The Autoregressive Loop
+    final_tokens = Enum.reduce(1..max_new_chars, prompt_chars, fn step, chars ->
+      # Windowing and padding to keep shapes perfectly stable at [1, 256]
+      window_chars = Enum.take(chars, -max_seq)
+      actual_len = length(window_chars)
+      pad_len = max_seq - actual_len
+      padded_chars = window_chars ++ List.duplicate(0, pad_len)
+
+      ins_padded = Nx.tensor([padded_chars], type: :s32) |> Nx.backend_copy(gpu)
+      len_tensor = Nx.tensor(actual_len, type: :s32) |> Nx.backend_copy(gpu)
+
+      # 🧠 Forward pass utilizing the exact same highly-optimized defn as top_k
+      logits = get_next_logits(ins_padded, len_tensor, params, pos_emb, muzzle)
+
+      # 🎯 GREEDY MATH: Just grab the absolute highest probability index
+      next_token = Nx.argmax(logits) |> Nx.to_number()
+
+      if rem(step, 10) == 0, do: :erlang.garbage_collect(self())
+
+      chars ++ [next_token]
+    end)
+
+    # NATIVELY convert the integer list back to a viewable string
+    final_tokens
+    |> Enum.map(&max(0, min(&1, 127)))
+    |> List.to_string()
+  end
+end
+
+IO.puts("✅ DLM.InferenceV21 loaded")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+✅ DLM.InferenceV21 loaded
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# 🔍 DYNAMIC CHECKPOINT FINDER
+latest_checkpoint = 
+  Path.wildcard("v21_5_*.bin")
+  |> Enum.reject(&String.contains?(&1, "data.bin"))
+  |> Enum.max_by(fn path -> File.stat!(path).mtime end, fn -> nil end)
+
+IO.puts("🧠 Loading Weights from: #{latest_checkpoint}")
+checkpoint = File.read!(latest_checkpoint) |> :erlang.binary_to_term()
+
+gpu = {EXLA.Backend, client: :rocm}
+params = checkpoint.params |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy(gpu)
+
+# 🧪 THE PROMPT SUITE
+prompts = [
+  {"Standard Definition", "[W]Algorithm[T]n.[D]"},
+  {"Phonetic Invention", "[W]Chronoflux[T]n.[D]"},
+  {"Conversational Semantic", "Good morning BigBrain! How are you today?"},
+  {"Jeopardy Style (Reverse)", "[D]A mathematical process for solving a problem.[W]"}
+]
+
+IO.puts("\n✨ IGNITING INFERENCE ENGINE...\n")
+
+Enum.each(prompts, fn {test_name, text} ->
+  IO.puts(String.duplicate("=", 60))
+  IO.puts("🧪 TEST: #{test_name}")
+  IO.puts("📝 PROMPT: #{text}\n")
+  
+  # 🎯 1. GREEDY DECODING
+  greedy_out = DLM.InferenceV21.greedy(params, pos_emb, text, 120)
+  IO.puts("🎯 GREEDY (Highest Confidence):\n#{greedy_out}\n")
+
+  # 🎲 2. TOP-K DECODING
+  top_k_out = DLM.InferenceV21.top_k(params, pos_emb, text, 120, 3, 0.5)
+  IO.puts("🎲 TOP-K (Creative, k=3, t=0.5):\n#{top_k_out}\n")
+end)
+
+IO.puts(String.duplicate("=", 60))
+IO.puts("🏁 INFERENCE SUITE COMPLETE.")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Loading Weights from: v21_5_auto_step36000.bin
+
+✨ IGNITING INFERENCE ENGINE...
+
+============================================================
+🧪 TEST: Standard Definition
+📝 PROMPT: [W]Algorithm[T]n.[D]
+
+
+23:16:27.892 [warning] No reference output found even though buffer checking was requested while autotuning
+🎯 GREEDY (Highest Confidence):
+[W]Algorithm[T]n.[D] of a the seres a per the ses a the serer the the seres and and the the peres of a peres an and the the seres and and an
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+[W]Algorithm[T]n.[D] and and the per and the ses a the serer the ser the serer of a ser and the the the sice of a the st the seres and and t
+
+============================================================
+🧪 TEST: Phonetic Invention
+📝 PROMPT: [W]Chronoflux[T]n.[D]
+
+🎯 GREEDY (Highest Confidence):
+[W]Chronoflux[T]n.[D] of a the seres a the ses a s and and and and a the serer of a ser an and the the seres an and the the seres and and and
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+[W]Chronoflux[T]n.[D] and the sing and and a per an of the the seand the serer of a ser an and the the sic and and the the seres and and and 
+
+============================================================
+🧪 TEST: Conversational Semantic
+📝 PROMPT: Good morning BigBrain! How are you today?
+
+🎯 GREEDY (Highest Confidence):
+Good morning BigBrain! How are you today?"; "the sere the ser and and the serer an an a the peres of a peres an and the the seres and and and an and the the of t
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+Good morning BigBrain! How are you today?"; "he pere the seres and a the serer of a ser an and the the sic and and the the seres and and and to the per the peric
+
+============================================================
+🧪 TEST: Jeopardy Style (Reverse)
+📝 PROMPT: [D]A mathematical process for solving a problem.[W]
+
+🎯 GREEDY (Highest Confidence):
+[D]A mathematical process for solving a problem.[W] whe serer the the seres and and the the peres of a peres an and the the seres and and and an and the the of the s a s o
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+[D]A mathematical process for solving a problem.[W] whe serer the the seres and and the the poresting a s a peric to the the seres and and the the per the pering and a s o
+
+============================================================
+🏁 INFERENCE SUITE COMPLETE.
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Stream
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 13, ...>>, {:stream, 3}}
+```
+
+```elixir
+defmodule DLM.DataBuilder do
+  @rank 32
+  @dim 256
+  @seq_len 256
+  @pad_token 0
+
+  @doc """
+  Takes a list of file paths, combines them, shuffles the lines 
+  to prevent overfitting, and builds the static training tensors.
+  """
+  def build_combined_tensors(file_paths) when is_list(file_paths) do
+    # 1. Read and combine all files into one massive list of lines
+    raw_lines = 
+      Enum.flat_map(file_paths, fn path ->
+        File.stream!(path)
+        |> Stream.map(&String.trim/1)
+        # Skip the copyright and license headers at the top of the file
+        |> Stream.reject(fn line -> String.starts_with?(line, "  ") end)
+        # We must convert the stream to a list here so flat_map can merge them
+        |> Enum.to_list()
+      end)
+
+    # 2. 🔀 THE CRITICAL SHUFFLE
+    # We do this in standard Elixir memory before it hits the GPU
+    shuffled_lines = Enum.shuffle(raw_lines)
+
+    # 3. Format, Pad, and Tensorize
+    shuffled_lines
+    |> Enum.map(&parse_synset/1)
+    |> Enum.reject(&is_nil/1)
+    |> Nx.tensor(type: :s32)
+  end
+
+  defp parse_synset(line) do
+    case String.split(line, " | ") do
+      [data_chunk, gloss] ->
+        tokens = String.split(data_chunk, " ", trim: true)
+        
+        # Token index 3 is the hex count of words in this synset
+        w_cnt = String.to_integer(Enum.at(tokens, 3), 16)
+        
+        # Words start at index 4 and alternate with their lex_ids
+        words = 
+          Enum.reduce(0..(w_cnt - 1), [], fn i, acc ->
+            word_index = 4 + (i * 2)
+            raw_word = Enum.at(tokens, word_index)
+            # WordNet uses underscores for spaces (e.g., "fountain_pen")
+            clean_word = String.replace(raw_word, "_", " ")
+            [clean_word | acc]
+          end)
+          |> Enum.reverse()
+
+        [main_word | synonyms] = words
+        
+        # Build the minimalist anchor string
+        raw_str = 
+          if Enum.empty?(synonyms) do
+            "#{main_word} = #{gloss}"
+          else
+            "#{main_word} = #{gloss} | #{Enum.join(synonyms, ", ")}"
+          end
+
+        format_to_tensor(raw_str)
+
+      _ -> nil
+    end
+  end
+
+  defp format_to_tensor(raw_str) do
+    chars = String.to_charlist(raw_str)
+    actual_len = length(chars)
+
+    cond do
+      actual_len == @seq_len -> 
+        chars
+      actual_len > @seq_len -> 
+        Enum.take(chars, @seq_len)
+      actual_len < @seq_len -> 
+        chars ++ List.duplicate(@pad_token, @seq_len - actual_len)
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+warning: module attribute @dim was set but never used
+└─ v21.5.livemd#cell:2o746bvyldu5romt:3: DLM.DataBuilder (module)
+
+warning: module attribute @rank was set but never used
+└─ v21.5.livemd#cell:2o746bvyldu5romt:2: DLM.DataBuilder (module)
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataBuilder, <<70, 79, 82, 49, 0, 0, 21, ...>>, {:format_to_tensor, 1}}
+```
+
+```elixir
+# In your Init cell, BEFORE building tensors
+Nx.global_default_backend(Nx.BinaryBackend)  # ← force CPU for dataset creation
+
+files = ["data.noun", "data.verb", "data.adj", "data.adv"]
+IO.puts("Parsing WordNet and shuffling dataset...")
+training_tensors = DLM.DataBuilder.build_combined_tensors(files)
+
+# Verify it's on CPU before saving
+# IO.puts("Backend: #{inspect(Nx.backend(training_tensors))}")  # should show BinaryBackend
+
+binary_data = :erlang.term_to_binary(training_tensors)
+File.write!("bigbrain_phase1_data.bin", binary_data)
+IO.puts("Done!")
+
+# Restore GPU as default after saving
+Nx.global_default_backend({EXLA.Backend, client: :rocm})
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Parsing WordNet and shuffling dataset...
+Done!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{Nx.BinaryBackend, []}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.V21_5Trainer do
+  import Nx.Defn
+
+  def grad_norms(grads) do
+    names = ~w[embed a_diag b_u b_v c_u c_v d_u d_v mx_u1 mx_v1 mx_u2 mx_v2 lm_w lm_b]
+    grads
+    |> Tuple.to_list()
+    |> Enum.zip(names)
+    |> Enum.map(fn {g, name} ->
+      norm = g |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+      {name, Float.round(norm, 4)}
+    end)
+  end
+
+  defn log_softmax(logits) do
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = logits - max_logits
+    sum_exp = Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)
+    safe_logits - Nx.log(sum_exp)
+  end
+
+  defn compute_loss(preds_sliced, targets) do
+    log_probs = log_softmax(preds_sliced)
+    target_probs = Nx.take_along_axis(log_probs, Nx.new_axis(targets, -1), axis: -1)
+    target_probs = Nx.squeeze(target_probs, axes: [-1])
+    mask = Nx.not_equal(targets, 0) |> Nx.as_type(:f32)
+    masked_loss = -target_probs * mask
+    Nx.sum(masked_loss) / Nx.sum(mask)
+  end
+
+  defn compute_grad(params, pos_emb, batch) do
+    {loss, grads} = value_and_grad(params, fn p ->
+      batch_s32 = Nx.as_type(batch, :s32)
+      preds = DLM.UniversalSSM.forward(batch_s32, p, pos_emb)
+      preds_sliced = Nx.slice_along_axis(preds, 0, 255, axis: 1)
+      targets = Nx.slice_along_axis(batch_s32, 1, 255, axis: 1)
+      compute_loss(preds_sliced, targets)
+    end)
+  
+    {g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13} = grads
+  
+    # Global norm — fully explicit, no Enum
+    global_norm =
+      Nx.sum(Nx.pow(g0, 2))
+      |> Nx.add(Nx.sum(Nx.pow(g1, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g2, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g3, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g4, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g5, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g6, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g7, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g8, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g9, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g10, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g11, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g12, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g13, 2)))
+      |> Nx.sqrt()
+  
+    max_norm = 1.0
+    scale = Nx.min(1.0, max_norm / (global_norm + 1.0e-6))
+  
+    clipped_grads = {
+      g0 * scale, g1 * scale, g2 * scale,
+      g3 * scale, g4 * scale, g5 * scale,
+      g6 * scale, g7 * scale, g8 * scale,
+      g9 * scale, g10 * scale, g11 * scale,
+      g12 * scale, g13 * scale
+    }
+  
+    {loss, clipped_grads}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.V21_5Trainer, <<70, 79, 82, 49, 0, 0, 32, ...>>, true}
+```
+
+```elixir
+IO.puts("🧠 Loading Dataset into CPU Memory...")
+full_dataset = File.read!("bigbrain_phase1_data.bin") 
+  |> :erlang.binary_to_term()
+  |> Nx.backend_copy(Nx.BinaryBackend)
+
+dataset_size = Nx.axis_size(full_dataset, 0)
+batch_size = 16
+total_steps_per_epoch = div(dataset_size, batch_size)
+
+max_epochs = 10
+save_interval = 1000
+base_lr = 3.0e-4
+warmup_steps = 1000
+gpu = {EXLA.Backend, client: :rocm}
+
+# 🔍 AUTO-RESUME OR GENESIS (V21.5)
+save_prefix = "v21_5_auto"
+latest_checkpoint = 
+  Path.wildcard("#{save_prefix}_*.bin")
+  |> Enum.reject(&String.contains?(&1, "data.bin"))
+  |> Enum.max_by(fn path -> File.stat!(path).mtime end, fn -> nil end)
+
+{params, ms, vs, global_step, current_epoch} = 
+  if latest_checkpoint do
+    IO.puts("💾 Found V21.5 checkpoint: #{latest_checkpoint}")
+    checkpoint = File.read!(latest_checkpoint) |> :erlang.binary_to_term()
+    p = checkpoint.params |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    m = checkpoint.ms |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    v = checkpoint.vs |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    {p, m, v, checkpoint.step, checkpoint.epoch}
+  else
+    IO.puts("✨ No V21.5 checkpoint found. Igniting FRESH Genesis state...")
+    raw_p = DLM.V21_5Genesis.init_params(42)
+    {raw_m, raw_v, _} = DLM.V21_5Genesis.init_optimizer(raw_p)
+    p = raw_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    m = raw_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    v = raw_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    {p, m, v, 0, 1}
+  end
+
+words_already_seen = rem(global_step * batch_size, dataset_size)
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy(gpu)
+initial_key = Nx.Random.key(global_step) 
+
+IO.puts("🚀 IGNITION: Starting V21.5 at Epoch #{current_epoch}, Global Step #{global_step}...")
+
+Enum.reduce(current_epoch..max_epochs, {params, ms, vs, global_step, initial_key, words_already_seen}, fn epoch, {p, m, v, current_step, current_key, offset_words} ->
+  IO.puts(String.duplicate("=", 50))
+  
+  target_lr = base_lr * :math.pow(0.9, epoch - 1)
+  IO.puts("🌊 EPOCH #{epoch} / #{max_epochs} | Target LR: #{target_lr}")
+  
+  IO.puts("🔀 Shuffling dataset...")
+  {shuffled_raw, next_key} = Nx.Random.shuffle(Nx.Random.key(999), full_dataset, axis: 0)
+  shuffled_dataset = Nx.backend_copy(shuffled_raw, Nx.BinaryBackend)
+
+  epoch_batches = Stream.unfold(offset_words, fn offset ->
+    if offset + batch_size > dataset_size, do: nil, else: {Nx.slice_along_axis(shuffled_dataset, offset, batch_size, axis: 0), offset + batch_size}
+  end)
+
+  # 🚀 INNER BATCH LOOP
+  {new_p, new_m, new_v, next_epoch_step, _final_skips} =
+    epoch_batches
+    |> Stream.with_index(1)
+    |> Enum.reduce({p, m, v, current_step, 0}, fn {batch, step_in_epoch}, {cp, cm, cv, cs, s_count} ->
+      gpu_batch = Nx.backend_copy(batch, gpu)
+
+      # 1. Compute Gradients
+      {loss_tensor, grads} = DLM.V21_5Trainer.compute_grad(cp, pos_emb, gpu_batch)
+      loss_val = Nx.to_number(loss_tensor)
+      if loss_val == :nan or loss_val > 6.0 do
+        cpu_batch = Nx.backend_copy(gpu_batch, Nx.BinaryBackend)
+        sequences = Nx.to_list(cpu_batch)
+        IO.puts("🔥 PATHOLOGICAL BATCH at global step #{cs}:")
+        Enum.each(sequences, fn seq ->
+          readable = seq |> Enum.reject(&(&1 == 0)) |> List.to_string()
+          IO.puts("   > #{readable}")
+        end)
+      end
+
+      # 2. Safety Gate
+      if loss_val == :nan or loss_val > 20.0 do
+        if rem(step_in_epoch, 10) == 0, do: IO.puts("⚠️ Step #{cs}: NaN/Spike detected. Skipping batch.")
+        {cp, cm, cv, cs + 1, s_count + 1}
+      else
+        # 3. Dynamic Learning Rate Warmup
+        current_lr = 
+          if cs < warmup_steps do
+            target_lr * (cs / warmup_steps)
+          else
+            target_lr
+          end
+
+        lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+        step_tensor = Nx.tensor(cs, type: :f32) |> Nx.backend_copy(gpu)
+        
+        # 4. Update Weights
+        {up_p, up_m, up_v} = DLM.MuonHybrid.step(cp, grads, cm, cv, step_tensor, lr_tensor)
+
+        # After {up_p, up_m, up_v} = DLM.MuonHybrid.step(...)
+        # Unpack, rescale d_u and d_v if their combined norm has collapsed
+        {p_emb, p_a, p_bu, p_bv, p_cu, p_cv, p_du, p_dv, 
+         p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = up_p
+        
+        du_norm = p_du |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+        
+        up_p = if du_norm < 0.01 do
+          IO.puts("   🔧 Rescuing dead delta gate (d_u norm=#{Float.round(du_norm, 5)})")
+          rescaled_du = Nx.multiply(p_du, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+          rescaled_dv = Nx.multiply(p_dv, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+          {p_emb, p_a, p_bu, p_bv, p_cu, p_cv, rescaled_du, rescaled_dv,
+           p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb}
+        else
+          up_p
+        end
+        
+        # 5. Logging (Every 50 steps)
+        if rem(step_in_epoch, 50) == 0 do
+          bpc = loss_val / :math.log(2)
+          mem = :erlang.memory(:total) |> div(1024 * 1024)
+          
+          # Pull grads back to CPU for norm inspection
+          cpu_grads = grads |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple()
+          norms = DLM.V21_5Trainer.grad_norms(cpu_grads)
+          
+          # Find the max so it jumps out visually
+          {max_name, max_norm} = Enum.max_by(norms, fn {_name, n} -> n end)
+          
+          norm_str = norms |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.join(" | ")
+          
+          IO.puts("➡️  Step #{step_in_epoch} | Global: #{cs} | Loss: #{Float.round(loss_val, 4)} | BPC: #{Float.round(bpc, 3)} | LR: #{Float.round(current_lr, 6)} | RAM: #{mem}MB")
+          IO.puts("   📐 GRAD NORMS | MAX: #{max_name}=#{max_norm}")
+          IO.puts("   #{norm_str}")
+        end
+
+        # 6. Checkpointing (Every 1000 steps)
+        if rem(cs, save_interval) == 0 and cs > 0 do
+          IO.puts("💾 Auto-Saving Checkpoint to #{save_prefix}_step#{cs}.bin...")
+          state = %{
+            params: up_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            ms: up_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            vs: up_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            step: cs, epoch: epoch
+          }
+          File.write!("#{save_prefix}_step#{cs}.bin", :erlang.term_to_binary(state))
+        end
+
+        if rem(step_in_epoch, 100) == 0, do: :erlang.garbage_collect(self())
+
+        {up_p, up_m, up_v, cs + 1, s_count}
+      end
+    end)
+
+  IO.puts("💾 Saving Completed Epoch #{epoch} State...")
+  final_state = %{
+    params: new_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    ms: new_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    vs: new_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    step: next_epoch_step, epoch: epoch
+  }
+  File.write!("#{save_prefix}_epoch#{epoch}_COMPLETE.bin", :erlang.term_to_binary(final_state))
+
+  {new_p, new_m, new_v, next_epoch_step, next_key, 0}
+end)
+
+IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+...
+   > basidiolichen = a lichen in which the fungus component is a basidiomycete
+   > discriminable = capable of being discriminated; "discriminable faults"
+   > breakdown = a cessation of normal operation; "there was a power breakdown" | equipment failure
+   > white dwarf = a faint star of enormous density | white dwarf star
+   > beg = dodge, avoid answering, or take for granted; "beg the question"; "beg the point in the discussion"
+   > thymol = a colorless crystalline solid used in perfume or preserving biological specimens or in embalming or medically as a fungicide or antiseptic | thyme camphor, thymic acid
+   > common evening primrose = a coarse biennial of eastern North America with yellow flowers that open in the evening; naturalized in Europe | German rampion, Oenothera biennis
+🔥 PATHOLOGICAL BATCH at global step 36423:
+   > Lovell = English astronomer who pioneered radio astronomy (born in 1913) | Sir Bernard Lovell, Sir Alfred Charles Bernard Lovell
+   > revet = construct a revetment
+   > Bougainville Trench = a depression in the floor of the Pacific Ocean between New Guinea and the Solomon Islands
+   > Norman = of or relating to or characteristic of Normandy; "Norman beaches"
+   > delay = time during which some action is awaited; "instant replay caused too long a delay"; "he ordered a hold in the action" | hold, time lag, postponement, wait
+   > arrayed = in ceremonial attire and paraphernalia; "professors arrayed in robes" | panoplied
+   > ateleiotic = of or relating to ateleiosis
+   > ride = sit and travel on the back of animal, usually while controlling its motions; "She never sat a horse!"; "Did you ever ride a camel?"; "The girl liked to drive the young mare" | sit
+   > licorice fern = fern having rootstock of a sweetish flavor | Polypodium glycyrrhiza
+   > tobramycin = an antibiotic (trade name Nebcin) that is especially effective against Gram-negative bacteria | Nebcin
+   > soaking = extremely wet; "dripping wet"; "soaking wet" | sopping, dripping
+   > message = send a message to; "She messaged the committee"
+   > improvise = manage in a makeshift way; do with whatever is at hand; "after the hurricane destroyed our house, we had to improvise for weeks" | extemporize
+   > recondition = bring into an improved condition; "He reconditioned the old appliances"
+   > fish = seek indirectly; "fish for compliments" | angle
+   > demanding = requiring more than usually expected or thought due; especially great patience and effort and skill; "found the job very demanding"; "a baby can be so demanding"
+🔥 PATHOLOGICAL BATCH at global step 36424:
+   > glorify = bestow glory upon; "The victory over the enemy glorified the Republic"
+   > treasury = a depository (a room or building) where wealth and precious objects can be kept safely
+   > unchanging = conforming to the same principles or course of action over time
+   > tarpaulin = waterproofed canvas | tarp
+   > movie = a form of entertainment that enacts a story by sound and a sequence of images giving the illusion of continuous movement; "they went to a movie every Saturday night"; "the film was shot on location" | film, picture, moving picture, moving-picture s
+   > safety match = a paper match that strikes only on a specially prepared surface | book matches
+   > cosmic ray = highly penetrating ionizing radiation of extraterrestrial origin; consisting chiefly of protons and alpha particles; collision with atmospheric particles results in rays and particles of many kinds
+   > flowering quince = Asiatic ornamental shrub with spiny branches and pink or red blossoms
+   > reflect = show an image of; "her sunglasses reflected his image"
+   > shooting script = the final detailed script for making a movie or TV program
+   > occupational therapy = therapy based on engagement in meaningful activities of daily life, especially to enable or encourage participation in such activities in spite of impairments or limitations in physical or mental functions
+   > tucker = a sewer who tucks
+   > rebukingly = in the manner of someone delivering a rebuke
+   > sink = go under; "The raft sank and its occupants drowned" | settle, go down, go under
+   > broad-headed = having a brachycephalic head | roundheaded, short-headed
+   > legal separation = a judicial decree regulating the rights and responsibilities of a married couple living apart | judicial separation
+🔥 PATHOLOGICAL BATCH at global step 36425:
+   > thickness = resistance to flow
+   > pallasite = a meteorite composed principally of olivine and metallic iron
+   > fatty liver = yellow discoloration as a result of the accumulation of certain fats (triglycerides) in the liver; can be caused by alcoholic cirrhosis or pregnancy or exposure to certain toxins
+   > embitter = cause to be bitter or resentful; "These injustices embittered her even more" | envenom, acerbate
+   > Alecto = one of the three Furies
+   > Pavo = a small constellation near the South Pole between Tucana and Ara
+   > fallow = undeveloped but potentially useful; "a fallow gold market"
+   > direct antonym = antonyms that are commonly associated (e.g., `wet' and `dry')
+   > pastoral = of or relating to a pastor; "pastoral work"; "a pastoral letter"
+   > observe = stick to correctly or closely; "The pianist kept time with the metronome"; "keep count"; "I cannot keep track of all my employees" | keep, maintain
+   > zymoid = resembling an enzyme
+   > do the honors = act as the host and receive or introduce one's guests
+   > restricted = the lowest level of official classification for documents
+   > Coropuna = a mountain peak in the Andes in Peru (21,083 feet high)
+   > stillness = calmness without winds | windlessness
+   > vocal music = music intended to be performed by one or more singers, usually with instrumental accompaniment | vocal
+🔥 PATHOLOGICAL BATCH at global step 36426:
+   > egg noodle = narrow strip of pasta dough made with eggs
+   > pathetic = inspiring mixed contempt and pity; "their efforts were pathetic"; "pitiable lack of character"; "pitiful exhibition of cowardice" | pitiable, pitiful
+   > uncomprehended = not fully understood; "an uncomprehended mystery"
+   > pteropogon = southern Australian plant having feathery hairs surrounding the fruit | Pteropogon humboltianum
+   > canaliculus = a small canal or duct as in some bones and parts of plants
+   > steroidal = of or relating to steroid hormones or their effects
+   > large-leaved magnolia = large deciduous shrub or tree of southeastern United States having huge leaves in dense false whorls and large creamy flowers tinged purple toward the base | large-leaved cucumber tree, great-leaved macrophylla, Magnolia macrophylla
+   > brawl = to quarrel noisily, angrily or disruptively; "The bar keeper threw them out, but they continued to wrangle on down the street" | wrangle
+   > power drill = a power tool for drilling holes into hard materials
+   > anaerobe = an organism (especially a bacterium) that does not require air or free oxygen to live
+   > sower = someone who sows
+   > vibrato = (music) a pulsating effect in an instrumental or vocal tone produced by slight and rapid variations in pitch
+   > ovoid = an egg-shaped object
+   > Renaissance man = a modern scholar who is in a position to acquire more than superficial knowledge about many different interests; "a statistician has to be something of a generalist" | generalist
+   > plunderage = the act of plundering (especially the embezzlement of goods on shipboard)
+   > corner = (architecture) solid exterior angle of a building; especially one formed by a cornerstone | quoin
+🔥 PATHOLOGICAL BATCH at global step 36427:
+   > Jat = a member of an Indo-European people widely scattered throughout the northwest of the Indian subcontinent and consisting of Muslims and Hindus and Sikhs
+   > reveille = a signal to get up in the morning; in the military it is a bugle call at sunrise
+   > trial balloon = a balloon sent up to test air currents
+   > musical instrument = any of various devices or contrivances that can be used to produce musical tones or sounds | instrument
+   > alright = nonstandard usage
+   > victim = a person who is tricked or swindled | dupe
+   > body covering = any covering for the body or a body part
+   > aquatic = relating to or consisting of or being in water; "an aquatic environment"
+   > Old Icelandic = the extinct dialect of Old Norse that was spoken in Iceland up until about 1600
+   > allograph = a variant form of a grapheme, as `m' or `M' or a handwritten version of that grapheme
+   > American pasqueflower = short hairy perennial with early spring blue-violet or lilac flowers; North America and Siberia | Eastern pasque flower, wild crocus, lion's beard, prairie anemone, blue tulip, American pulsatilla, Pulsatilla patens, Anemone ludovic
+   > wistfulness = a sadly pensive longing
+   > analyze = break down into components or essential features; "analyze today's financial market" | analyse
+   > travelogue = a film or illustrated lecture on traveling | travelog
+   > Teredinidae = shipworms | family Teredinidae
+   > military drill = training in marching and the use of weapons
+🔥 PATHOLOGICAL BATCH at global step 36428:
+   > ossiferous = containing bones (especially fossil bones); "ossiferous caves"
+   > scot free = free from harm or penalty; "he went scot-free"
+   > bias = a partiality that prevents objective consideration of an issue or situation | prejudice, preconception
+   > Paracheirodon = a genus of Characidae | genus Paracheirodon
+   > assembly = a unit consisting of components that have been fitted together
+   > nonvolatile = not volatilizing readily; "a nonvolatile acid" | nonvolatilizable, nonvolatilisable
+   > newspaper critic = a critic who writes a column for the newspapers
+   > Luculus = Roman general famous for giving lavish banquets (110-57 BC) | Lucius Licinius Luculus
+   > scallop = shape or cut in scallops; "scallop the hem of the dress" | scollop
+   > labetalol = antihypertensive drug (trade names Trandate and Normodyne) that blocks alpha and beta-adrenergic receptors of the sympathetic nervous system (leading to a decrease in blood pressure) | labetalol hydrochloride, Trandate, Normodyne
+   > grab = capture the attention or imagination of; "This story will grab you"; "The movie seized my imagination" | seize
+   > reversely = in an opposite way; so as to be reversed
+   > lemon drop = a hard candy with lemon flavor and a yellow color and (usually) the shape of a lemon
+   > range = the limits within which something can be effective; "range of motion"; "he was beyond the reach of their fire" | reach
+   > funny bone = a point on the elbow where the ulnar nerve passes near the surface; a sharp tingling sensation results when the nerve is knocked against the bone; "the funny bone is not humerus" | crazy bone
+   > boustrophedon = an ancient writing system: having alternate lines written in opposite directions; literally `as the ox ploughs'
+🔥 PATHOLOGICAL BATCH at global step 36429:
+   > lavish = very generous; "distributed gifts with a lavish hand"; "the critics were lavish in their praise"; "a munificent gift"; "his father gave him a half-dollar and his mother a quarter and he thought them munificent"; "prodigal praise"; "unsparing gener
+   > misdirection = an incorrect charge to a jury given by a judge
+   > site = the piece of land on which something is located (or is to be located); "a good site for the school" | land site
+   > industriously = in an industrious manner; "they hoed up weeds industriously all morning"
+   > bicycle traffic = bicycles coming and going
+   > bay myrtle = evergreen aromatic shrubby tree of southeastern United States having small hard berries thickly coated with white wax used for candles | puckerbush, Myrica cerifera
+   > gawker = a spectator who stares stupidly without intelligent awareness
+   > unrefined = not refined or processed; "unrefined ore"; "crude oil" | unprocessed, crude
+   > derailment = an accident in which a train runs off its track
+   > shank's mare = you own legs; "I traveled on shank's mare" | shanks' mare, shank's pony, shanks' pony
+   > Peace of Westphalia = the peace treaty that ended the Thirty Years' War in 1648
+   > Aristolochiaceae = family of birthworts (including wild ginger) | family Aristolochiaceae, birthwort family
+   > swag = a bundle containing the personal belongings of a swagman
+   > amethyst = a transparent purple variety of quartz; used as a gemstone
+   > evasive = avoiding or escaping from difficulty or danger especially enemy fire; "pilots are taught to take evasive action"
+   > pyroelectricity = generation of an electric charge on certain crystals (such as tourmaline) as a result of a change in temperature
+⚠️ Step 36429: NaN/Spike detected. Skipping batch.
+🔥 PATHOLOGICAL BATCH at global step 36430:
+   > dissociate = to undergo a reversible or temporary breakdown of a molecule into simpler molecules or atoms; "acids dissociate to give hydrogen ions"
+   > everyman = the ordinary person
+   > scammony = twining plant of Asia Minor having cream-colored to purple flowers and long thick roots yielding a cathartic resin | Convolvulus scammonia
+   > Osmerus = type genus of the Osmeridae | genus Osmerus
+   > frore = very cold; "whatever the evenings be--frosty and frore or warm and wet"
+   > refit = outfitting a ship again (by repairing or replacing parts)
+   > community center = a center where the members of a community can gather for social or cultural activities | civic center
+   > Mead = United States anthropologist noted for her claims about adolescence and sexual behavior in Polynesian cultures (1901-1978) | Margaret Mead
+   > sacrament = a formal religious ceremony conferring a specific grace on those who receive it; the two Protestant ceremonies are baptism and the Lord's Supper; in the Roman Catholic Church and the Eastern Orthodox Church there are seven traditional rites acc
+   > glazed = (of foods) covered with a shiny coating by applying e.g. beaten egg or a sugar or gelatin mixture; "glazed doughnuts"; "a glazed ham"
+   > genus Sesbania = small genus of tropical and subtropical leguminous herbs or shrubs or trees
+   > homonymy = the relation between two words that are spelled the same way but differ in meaning or the relation between two words that are pronounced the same way but differ in meaning
+   > clear = rid of instructions or data; "clear a memory buffer"
+   > rug = floor covering consisting of a piece of thick heavy fabric (usually with nap or pile) | carpet, carpeting
+   > burden = weight down with a load | burthen, weight, weight down
+   > arson = malicious burning to destroy property; "the British term for arson is fire-raising" | incendiarism, fire-raising
+🔥 PATHOLOGICAL BATCH at global step 36431:
+   > Bahai = a teacher of or believer in Bahaism
+   > agglomerator = a device that causes material to gather into rounded balls; "a sonic agglomerator"
+   > nerve center = a center that provides information and control; "the nerve center of the diamond industry is in Amsterdam" | nerve centre
+   > brail = haul fish aboard with brails
+   > intellectualization = (psychiatry) a defense mechanism that uses reasoning to block out emotional stress and conflict | intellectualisation
+   > crossbred = bred from parents of different varieties or species
+   > dexterously = with dexterity; in a dexterous manner; "dextrously he untied the knots" | dextrously, deftly
+   > barograph = a recording barometer; automatically records on paper the variations in atmospheric pressure
+   > millifarad = a unit of capacitance equal to one thousandth of a farad
+   > scud = the act of moving along swiftly (as before a gale) | scudding
+   > pigweed = leaves sometimes used as potherbs; seeds used as cereal; southern United States to Central America; India and China | Amaranthus hypochondriacus
+   > pass = travel past; "The sports car passed all the trucks" | overtake, overhaul
+   > firkin = a British unit of capacity equal to 9 imperial gallons
+   > heat of condensation = heat liberated by a unit mass of gas at its boiling point as it condenses into a liquid; "the heat of condensation is equal to the heat of vaporization"
+   > anathematization = the formal act of pronouncing (someone or something) accursed | anathematisation
+   > point of honor = a concern that seriously reflects on your honor
+🔥 PATHOLOGICAL BATCH at global step 36432:
+   > orthoptics = treatment of defects of binocular vision (such as strabismus and amblyopia) by nonsurgical measures (especially by exercises to strengthen the eye muscles)
+   > Florence = a town in northeast South Carolina; transportation center
+   > chilly = lacking warmth of feeling; "a chilly greeting"
+   > middling = any commodity of intermediate quality or size (especially when coarse particles of ground wheat are mixed with bran)
+   > gestate = have the idea for; "He conceived of a robot that would help paralyzed patients"; "This library was well conceived" | conceive, conceptualize, conceptualise
+   > document = a written account of ownership or obligation
+   > unfurrowed = not marked with shallow depressions or furrows; "an unfurrowed field"; "unfurrowed cheeks"
+   > chartaceous = of or like paper | papery, paperlike
+   > Latinism = a word or phrase borrowed from Latin
+   > tenant = any occupant who dwells in a place
+   > Portuguese man-of-war = large siphonophore having a bladderlike float and stinging tentacles | man-of-war, jellyfish
+   > bibliolatrous = given to Bible-worship
+   > Barbarea = biennial or perennial herbs of north temperate regions: winter cress | genus Barbarea
+   > brain tumor = a tumor in the brain | brain tumour
+   > irreversible = incapable of being reversed; "irreversible momentum toward revolution"
+   > count down = count backwards; before detonating a bomb, for example
+🔥 PATHOLOGICAL BATCH at global step 36433:
+   > weakness = the property of lacking physical or mental strength; liability to failure under pressure or stress or strain; "his weakness increased as he became older"; "the weakness of the span was overlooked until it collapsed"
+   > attach = become attached; "The spider's thread attached to the window sill"
+   > respiration = the metabolic processes whereby certain organisms obtain energy from organic molecules; processes that take place in the cells and tissues during which energy is released and carbon dioxide is produced and absorbed by the blood to be transpor
+   > occidentalism = the quality or customs or mannerisms characteristic of Western civilizations
+   > hypocycloid = a line generated by a point on a circle that rolls around inside another circle
+   > farmplace = a farm together with its buildings | farm-place, farmstead
+   > hard shoulder = a paved strip beside a motorway (for stopping in emergencies)
+   > harmonious = existing together in harmony; "harmonious family relationships"
+   > Gnaphalium = large widely distributed genus of coarse hairy herbs with whitish involucres | genus Gnaphalium
+   > double = twice as great or many; "ate a double portion"; "the dose is doubled"; "a twofold increase" | doubled, twofold, two-fold
+   > red-orange = of orange tinged with red | reddish-orange, flame-orange
+   > millinery = hats for women; the wares sold by a milliner | woman's hat
+   > rinse = washing lightly without soap
+   > sesame oil = oil obtained from sesame seeds
+   > Zoroaster = Persian prophet who founded Zoroastrianism (circa 628-551 BC) | Zarathustra
+   > short saphenous vein = a vein running from the foot up the back of the leg to the knee
+🔥 PATHOLOGICAL BATCH at global step 36434:
+   > abracadabra = gibberish and nonsense
+   > cardiology = the branch of medicine dealing with the heart and its diseases
+   > fish loaf = flaked fish baked in a loaf with bread crumbs and various seasonings
+   > marathoner = someone who participates in long-distance races (especially in marathons) | marathon runner, road runner, long-distance runner
+   > autoecious = of parasites especially rust fungi; completing the entire life cycle on a single host; "autoecious rust fungi" | homoecious
+   > sworn = bound by or stated on oath; "now my sworn friend and then mine enemy"- Shakespeare
+   > seta = a stiff hair or bristle
+   > Celsius scale = a temperature scale that defines the freezing point of water as 0 degrees and the boiling point of water as 100 degrees | international scale, centigrade scale
+   > Daubentoniidae = comprising solely the aye-aye | family Daubentoniidae
+   > call = lure by imitating the characteristic call of an animal; "Call ducks"
+   > twig blight = a disease of the ends of twigs of woody plants
+   > liquid assets = assets in the form of cash (or easily convertible into cash) | current assets, quick assets
+   > indicative = (usually followed by `of') pointing out or revealing clearly; "actions indicative of fear" | indicatory, revelatory, significative, suggestive
+   > Boniface VIII = pope who declared that Catholic princes are subject to the pope in temporal as well as in theological matters (1235-1303) | Benedetto Caetani
+   > locking = the act of locking something up to protect it | lockup
+   > awareness = having knowledge of; "he had no awareness of his mistakes"; "his sudden consciousness of the problem he faced"; "their intelligence and general knowingness was impressive" | consciousness, cognizance, cognisance, knowingness
+🔥 PATHOLOGICAL BATCH at global step 36435:
+   > wheat future = wheat bought or sold at an agreed price for delivery at a specified future date
+   > Chordeiles = a genus of Caprimulgidae | genus Chordeiles
+   > specialization = the act of specializing; making something suitable for a special purpose | specialisation
+   > uncannily = in an uncanny manner; "uncannily human robots"
+   > join = become part of; become a member of a group or organization; "He joined the Communist Party as a young man" | fall in, get together
+   > republication = the act of publishing again | republishing
+   > oriental poppy = commonly cultivated Asiatic perennial poppy having stiff heavily haired leaves and bright scarlet or pink to orange flowers | Papaver orientale
+   > abnormal = departing from the normal in e.g. intelligence and development; "they were heartbroken when they learned their child was abnormal"; "an abnormal personality"
+   > utterer = an organism that can utter vocal sounds; "an utterer of foul oaths"; "is the giraffe a vocalizer?" | vocalizer, vocaliser
+   > unprocessed = not treated or prepared by a special process
+   > yellow bile = a humor that was once believed to be secreted by the liver and to cause irritability and anger | choler
+   > soap opera = a serialized program usually dealing with sentimentalized family matters that is broadcast on radio or television (frequently sponsored by a company advertising soap products)
+   > Cydippida = ctenophores having two long pinnate tentacles | order Cydippida, Cydippidea, order Cydippidea, Cydippea, order Cydippea
+   > hyaluronic acid = a viscous mucopolysaccharide found in the connective tissue space and the synovial fluid of movable joints and the humors of the eye; a cementing and protective substance
+   > Samoyed = a Samoyedic-speaking person in northwestern Siberia
+   > catatonia = extreme tonus; muscular rigidity; a common symptom in catatonic schizophrenia
+🔥 PATHOLOGICAL BATCH at global step 36436:
+   > Unitarian = adherent of Unitarianism
+   > lather = the foam resulting from excessive sweating (as on a horse)
+   > deserter = a person who abandons their duty (as on a military post) | defector
+   > espionage network = a network of spies
+   > porosity = the property of being porous; being able to absorb fluids | porousness
+   > bacteriophage = a virus that is parasitic (reproduces itself) in bacteria; "phage uses the bacterium's machinery and energy to produce more phage until the bacterium is destroyed and phage is released to invade surrounding bacteria" | phage
+   > third = the musical interval between one note and another three notes away from it; "a simple harmony written in major thirds"
+   > wield = handle effectively; "The burglar wielded an axe"; "The young violinist didn't manage her bow very well" | handle, manage
+   > carbon black = a black colloidal substance consisting wholly or principally of amorphous carbon and used to make pigments and ink | lampblack, soot, smut, crock
+   > titer = the concentration of a solution as determined by titration | titre
+   > apocryphal = being of questionable authenticity
+   > unguarded = lacking protection or a guard; "an unguarded gate"; "his unguarded queen was open to attack"
+   > cantankerous = having a difficult and contrary disposition; "a cantankerous and venomous-tongued old lady"- Dorothy Sayers | crotchety, ornery
+   > appreciate = be fully aware of; realize fully; "Do you appreciate the full meaning of this letter?" | take account
+   > bandicoot = any of various agile ratlike terrestrial marsupials of Australia and adjacent islands; insectivorous and herbivorous
+   > hieroglyphically = by means of hieroglyphs; "hieroglyphically written"
+🔥 PATHOLOGICAL BATCH at global step 36437:
+   > currish = resembling a cur; snarling and rude
+   > excretory = of or relating to the process of excretion
+   > Benedictine = a monk or nun belonging to the order founded by Saint Benedict
+   > dinghy = a small boat of shallow draft with cross thwarts for seats and rowlocks for oars with which it is propelled | dory, rowboat
+   > ague = a fit of shivering or shaking
+   > powdered = consisting of fine particles; "powdered cellulose"; "powdery snow"; "pulverized sugar is prepared from granulated sugar by grinding" | powdery, pulverized, pulverised, small-grained, fine-grained
+   > blush = turn red, as if in embarrassment or shame; "The girl blushed when a young man whistled as she walked by" | crimson, flush, redden
+   > venogram = an X ray of a vein injected with a radiopaque contrast medium | phlebogram
+   > Stilwell = United States general who commanded the Allied forces in China and Burma and India during World War II (1883-1946) | Joseph Warren Stilwell, Vinegar Joe Stilwell, Uncle Joe
+   > stable = not taking part readily in chemical change
+   > major-league team = a team that plays in a major league | major-league club
+   > spread = distribute or disperse widely; "The invaders spread their language all over the country" | distribute
+   > Agathis = kauri pine | genus Agathis
+   > statue = a sculpture representing a human or animal
+   > paralyze = make powerless and unable to function; "The bureaucracy paralyzes the entire operation" | paralyse
+   > feminist = a supporter of feminism | women's rightist, women's liberationist, libber
+🔥 PATHOLOGICAL BATCH at global step 36438:
+   > ironshod = shod or cased with iron; "ironshod hooves"; "ironshod wheels"
+   > turnover = a dish made by folding a piece of pastry over a filling
+   > segregated = separated or isolated from others or a main group; "a segregated school system"; "a segregated neighborhood" | unintegrated
+   > Acanthoscelides = a genus of Bruchidae | genus Acanthoscelides
+   > splash = the act of scattering water about haphazardly | splashing
+   > catch = a person regarded as a good matrimonial prospect | match
+   > postdate = be later in time; "Tuesday always follows Monday" | follow
+   > tapeworm infection = intestinal infection by a species of parasitic tapeworm; usually the result of eating inadequately cooked meat or fish
+   > theme song = a melody that recurs and comes to represent a musical play or movie
+   > chariot = transport in a chariot
+   > holy day of obligation = a day when Catholics must attend Mass and refrain from servile work, and Episcopalians must take Communion
+   > play out = become spent or exhausted; "The champion's strength played out fast"
+   > disbelieve = reject as false; refuse to accept | discredit
+   > audile = one whose mental imagery is auditory rather than visual or motor
+   > pest = any unwanted and destructive insect or other animal that attacks food or crops or livestock etc.; "he sprayed the garden to get rid of pests"; "many pests have developed resistance to the common pesticides"
+   > endoskeleton = the internal skeleton; bony and cartilaginous structure (especially of vertebrates)
+🔥 PATHOLOGICAL BATCH at global step 36439:
+   > Chilean = of or relating to or characteristic of Chile or its people; "Chilean volcanoes"
+   > stitch = a sharp spasm of pain in the side resulting from running
+   > trumpet = utter in trumpet-like sounds; "Elephants are trumpeting"
+   > female body = the body of a female human being
+   > peroneal vein = accompany the peroneal arteries; arising in the heel and running up the back of the leg to join the posterior tibial veins of the popliteal vein | fibular vein, vena peroneus
+   > dirty joke = an indelicate joke | dirty story, blue joke, blue story
+   > lexical database = a database of information about words
+   > noble = inert especially toward oxygen; "a noble gas such as helium or neon"; "noble metals include gold and silver and platinum"
+   > unkindness = lack of sympathy
+   > ride horseback = ride on horseback
+   > Fox = English religious leader who founded the Society of Friends (1624-1691) | George Fox
+   > tea garden = a public garden where tea is served
+   > macerate = separate into constituents by soaking
+   > linguistic relation = a relation between linguistic forms or constituents
+   > perorate = conclude a speech with a formal recapitulation
+   > Central American = a native or inhabitant of Central America
+⚠️ Step 36439: NaN/Spike detected. Skipping batch.
+🔥 PATHOLOGICAL BATCH at global step 36440:
+   > depiction = representation by drawing or painting etc | delineation, portrayal
+   > uncomfortably = in physical discomfort; "she lay on the couch, her body uncomfortably twisted"
+   > hedgehop = fly very close to the ground | flat-hat
+   > Sphacelotheca = genus of smut fungus | genus Sphacelotheca
+   > oculus dexter = the right eye | OD
+   > saga = a narrative telling the adventures of a hero or a family; originally (12th to 14th centuries) a story of the families that settled Iceland and their descendants but now any prose narrative that resembles such an account
+   > warhorse = horse used in war
+   > purposeless = not evidencing any purpose or goal
+   > enveloping(a) = surrounding and closing in on or hemming in; "the army's enveloping maneuver"
+   > argent = a metal tincture used in heraldry to give a silvery appearance
+   > malpighian body = the capsule that contains Bowman's capsule and a glomerulus at the expanded end of a nephron | malpighian corpuscle, renal corpuscle
+   > long hundred = the cardinal number that is the product of ten and twelve | great hundred, 120
+   > osmotically = by means of osmosis
+   > marlite = metamorphic rock with approximately the same composition as marl | marlstone
+   > lazy daisy stitch = long chain stitches arranged in flower patterns
+   > Chrysophyta = mostly freshwater eukaryotic algae having the chlorophyll masked by brown or yellow pigment; yellow-green and golden-brown algae and diatoms: Xanthophyceae, Chrysophyceae, Bacillariophyceae; some classification systems superseded or subsumed 
+🔥 PATHOLOGICAL BATCH at global step 36441:
+   > anamorphosis = a distorted projection or perspective; especially an image distorted in such a way that it becomes visible only when viewed in a special manner | anamorphism
+   > junior varsity = a college or university team that competes at a level below the varsity team | JV
+   > eyas = an unfledged or nestling hawk
+   > case agreement = agreement in grammatical case between words in the same construction
+   > Trollope = English writer of novels (1815-1882) | Anthony Trollope
+   > putrescence = in a state of progressive putrefaction | putridness, rottenness, corruption
+   > pretty = pleasing by delicacy or grace; not imposing; "pretty girl"; "pretty song"; "pretty room"
+   > Umbrian = an extinct Italic language of ancient southern Italy
+   > bring out = encourage to be less reserved; "The teacher tried to bring out the shy boy"
+   > turnpike = an expressway on which tolls are collected | toll road
+   > basic point defense missile system = a shipboard missile system
+   > hawser = large heavy rope for nautical use
+   > hypothermia = subnormal body temperature
+   > pigeonhole = treat or classify according to a mental stereotype; "I was stereotyped as a lazy Southern European" | stereotype, stamp
+   > ruggedize = produce in a version designed to withstand rough usage; "Detroit ruggedized the family car" | ruggedise
+   > little blue heron = small bluish-grey heron of the western hemisphere | Egretta caerulea
+🔥 PATHOLOGICAL BATCH at global step 36442:
+   > haploidy = the condition of being haploid
+   > tenor saxophonist = a musician who plays the tenor saxophone | tenorist
+   > come to light = be revealed or disclosed; "The truth finally came to light" | come to hand
+   > limber = (used of artifacts) easily bent
+   > fire trench = a trench especially constructed for the delivery of small-arms fire
+   > methylated spirit = ethyl alcohol denatured with methyl alcohol to prevent its use as an alcoholic beverage
+   > coordinate bond = a covalent bond in which both electrons are provided by one of the atoms | dative bond
+   > equilibrium = a stable situation in which forces cancel one another
+   > ego = an inflated feeling of pride in your superiority to others | egotism, self-importance
+   > Kawasaki disease = an acute disease of young children characterized by a rash and swollen lymph nodes and fever; of unknown cause | mucocutaneous lymph node syndrome
+   > crumb cake = cake or coffeecake topped with a mixture of sugar and butter and flour
+   > biologically = with respect to biology; "biologically related"
+   > common starling = gregarious bird having plumage with dark metallic gloss; builds nests around dwellings and other structures; naturalized worldwide | Sturnus vulgaris
+   > uncrossed = (of a check) not crossed
+   > dizzy = make dizzy or giddy; "a dizzying pace"
+   > lumma = 100 lumma equal 1 dram in Armenia
+🔥 PATHOLOGICAL BATCH at global step 36443:
+   > pinite = grey or green or brown mineral similar to mica and containing aluminum and potassium sulphates
+   > semiopaque = partially opaque
+   > directing = showing the way by conducting or leading; imposing direction on; "felt his mother's directing arm around him"; "the directional role of science on industrial progress" | directional, directive, guiding
+   > music school = a school specializing in music
+   > cut = form or shape by cutting or incising; "cut paper dolls"
+   > headdress = clothing for the head | headgear
+   > nim = game in which matchsticks are arranged in rows and players alternately remove one or more of them; in some versions the object is to take the last remaining matchstick on the table and in other versions the object is to avoid taking the last remainin
+   > dissent = withhold assent; "Several Republicans dissented"
+   > mnemonic = a device (such as a rhyme or acronym) used to aid recall
+   > adverb = the word class that qualifies verbs or clauses
+   > bugger all = little or nothing at all; "I asked for a raise and they gave me bugger-all"; "I know sweet Fanny Adams about surgery" | fuck all, Fanny Adams, sweet Fanny Adams
+   > indication = the act of indicating or pointing out by name | denotation
+   > mix = a commercially prepared mixture of dry ingredients | premix
+   > rhinolaryngology = the medical specialty that deals with diseases of the ear, nose and throat | otorhinolaryngology, otolaryngology
+   > push = approach a certain age or speed; "She is pushing fifty" | crowd
+   > spyware = computer software that obtains information from a user's computer without the user's knowledge or consent
+🔥 PATHOLOGICAL BATCH at global step 36444:
+   > sodium-vapor lamp = lamp in which an electric current passed through a tube of sodium vapor makes a yellow light; used is street lighting | sodium-vapour lamp
+   > theorization = the production or use of theories | theorisation
+   > cachinnate = laugh loudly and in an unrestrained way
+   > olive = of a yellow-green color similar to that of an unripe olive
+   > charm = control by magic spells, as by practicing witchcraft | becharm
+   > mechanical system = a system of elements that interact on mechanical principles
+   > Nov-Esperanto = an artificial language based on Esperanto
+   > chain stitch = a looped stitch resembling the links of a chain; used in embroidery and in sewing
+   > affair = a vaguely specified social event; "the party was quite an affair"; "an occasion arranged to honor the president"; "a seemingly endless round of social functions" | occasion, social occasion, function, social function
+   > ill = with difficulty or inconvenience; scarcely or hardly; "we can ill afford to buy a new car just now"
+   > methamphetamine = an amphetamine derivative (trade name Methedrine) used in the form of a crystalline hydrochloride; used as a stimulant to the nervous system and as an appetite suppressant | methamphetamine hydrochloride, Methedrine, meth, deoxyephedrine,
+   > decrease = a change downward; "there was a decrease in his temperature as the fever subsided"; "there was a sharp drop-off in sales" | lessening, drop-off
+   > rekindle = arouse again; "rekindle hopes"; "rekindle her love"
+   > popularization = the act of making something attractive to the general public | popularisation, vulgarization, vulgarisation
+   > sucrose = a complex carbohydrate found in many plants and used as a sweetening agent | saccharose
+   > chorus girl = a woman who dances in a chorus line | showgirl, chorine
+🔥 PATHOLOGICAL BATCH at global step 36445:
+   > distributor = someone who markets merchandise | distributer
+   > assertiveness = aggressive self-assurance; given to making bold assertions | self-assertiveness
+   > funeral = a ceremony at which a dead person is buried or cremated; "hundreds of people attended his funeral" | obsequy
+   > fidelity = the quality of being faithful | faithfulness
+   > junction barrier = a junction unit for connecting 2 cables without the need for plugs | barrier strip
+   > Ho Chi Minh = Vietnamese communist statesman who fought the Japanese in World War II and the French until 1954 and South Vietnam until 1975 (1890-1969) | Nguyen Tat Thanh
+   > antiquity = the historic period preceding the Middle Ages in Europe
+   > pathology = the branch of medical science that studies the causes and nature and effects of diseases
+   > thebe = 100 thebe equal 1 pula in Botswana
+   > trichloroacetic acid = a strong acid made by chlorinating acetic acid | trichloracetic acid
+   > dive = plunge into water; "I was afraid to dive from the board into the pool"
+   > erythroblastosis = a blood disease characterized by the abnormal presence of erythroblasts in the blood
+   > pothos = any of various tropical lianas of the genus Scindapsus
+   > Mercury program = a program of rocket-powered flights undertaken by US between 1961 and 1963 with the goal of putting a man in orbit around the earth; "under the Mercury program each flight had one astronaut"
+   > fraught(p) = filled with or attended with; "words fraught with meaning"; "an incident fraught with danger"; "a silence pregnant with suspense" | pregnant
+   > telpherage = a transportation system in which cars (telphers) are suspended from cables and operated on electricity | telferage
+🔥 PATHOLOGICAL BATCH at global step 36446:
+   > keyboard instrument = a musical instrument that is played by means of a keyboard
+   > common ageratum = small tender herb grown for its fluffy brushlike blue to lavender blooms | Ageratum houstonianum
+   > headhunter = a recruiter of personnel (especially for corporations)
+   > cold chisel = narrow chisel made of steel; used to cut stone or bricks | set chisel
+   > admit = give access or entrance to; "The French doors admit onto the yard"
+   > bird's-foot violet = common violet of the eastern United States with large pale blue or purple flowers resembling pansies | pansy violet, Johnny-jump-up, wood violet, Viola pedata
+   > buckle = fold or collapse; "His knees buckled" | crumple
+   > delectable = capable of arousing sexual desire; "the delectable Miss Haynes" | sexually attractive
+   > matricide = a person who murders their mother
+   > minutia = a small or minor detail; "he had memorized the many minutiae of the legal code"
+   > inconsequence = having no important effects or influence
+   > false saber-toothed tiger = North American cat of the Miocene and Pliocene; much earlier and less specialized than members of the genus Smiledon
+   > split-pea = dried hulled pea; used in soup
+   > outwardly = in outward appearance; "outwardly, she appeared composed"
+   > belay = turn a rope round an object or person in order to secure it or him
+   > short ribs = cut of beef containing rib ends near the sternum
+🔥 PATHOLOGICAL BATCH at global step 36447:
+   > horse's foot = the hoof of a horse
+   > rubbishy = cheap and inferior; of no value; "rubbishy newspapers that form almost the sole reading of the majority"; "trashy merchandise" | trashy
+   > Galilean = of or relating to Galileo or his works
+   > Galwegian = of or relating to or characteristic of the Scottish district of Galloway or its people
+   > All Saints' Day = a Christian feast day honoring all the saints; first observed in 835 | Allhallows, November 1, Hallowmas, Hallowmass
+   > bombing run = that part of the flight that begins with the approach to the target; includes target acquisition and ends with the release of the bombs
+   > educative = resulting in education; "an educative experience"
+   > Hydrobatidae = storm petrels | family Hydrobatidae
+   > genus Teredo = type genus of the family Teredinidae
+   > photosensitize = make (an organism or substance) sensitive to the influence of radiant energy and especially light | photosensitise
+   > skimpily = in a skimpy manner; "a skimpily dressed woman"; "scantily clad" | scantily
+   > ladies' room = a woman's restroom in a public (or semipublic) building | powder room
+   > bird = watch and study birds in their natural habitat | birdwatch
+   > jaywalk = cross the road at a red light
+   > Columbian = of or relating to Christopher Columbus
+   > raindrop = a drop of rain
+🔥 PATHOLOGICAL BATCH at global step 36448:
+   > Dinornis = type genus of the Dinornithidae: large moas | genus Dinornis
+   > strength = the condition of financial success; "the strength of the company's stock in recent weeks"
+   > leopard plant = any of various plants of temperate Eurasia; grown for their yellow flowers and handsome foliage
+   > captainship = the post of captain | captaincy
+   > Piperaceae = tropical woody vines and herbaceous plants having aromatic herbage and minute flowers in spikelets | family Piperaceae, pepper family
+   > toxic = of or relating to or caused by a toxin or poison; "suffering from exposure to toxic substances"
+   > beneficiary = having or arising from a benefice; "a beneficiary baron"
+   > rolling mill = steel mill where metal is rolled into sheets and bars
+   > pollinator = an insect that carries pollen from one flower to another
+   > operations research = research designed to determine most efficient way to do something
+   > excitability = excessive sensitivity of an organ or body part | irritability
+   > Danube = the 2nd longest European river (after the Volga); flows from southwestern Germany to the Black Sea; "Vienna, Budapest, and Belgrade are on the banks of the Danube" | Danube River, Danau
+   > Peripatopsidae = a family of Onychophora | family Peripatopsidae
+   > simper = a silly self-conscious smile
+   > oligodactyly = congenital condition in which some fingers or toes are missing
+   > ungregarious = not disposed to seek company; "a lonely ungregarious person"
+🔥 PATHOLOGICAL BATCH at global step 36449:
+   > seam = joint consisting of a line formed by joining two pieces
+   > venous blood = blood found in the veins; "except in the pulmonary vein venous blood is rich in carbon dioxide and poor in oxygen"
+   > Neolentinus ponderosus = a gilled polypore with a large cap (up to 15 inches in diameter) and a broad stalk; edible when young and tender
+   > Ringling = United States showman whose song-and-dance troop evolved into a circus (1863-1926) | Charles Ringling
+   > wine lover = a connoisseur of fine wines; a grape nut
+   > cant = insincere talk about religion or morals | pious platitude
+   > chipboard = a cheap hard material made from wood chips that are pressed together and bound with synthetic resin | hardboard
+   > Omani = a native or inhabitant of Oman
+   > infinite = having no limits or boundaries in time or space or extent or magnitude; "the infinite ingenuity of man"; "infinite wealth"
+   > hundred-and-seventieth = the ordinal number of one hundred seventy in counting order | 170th
+   > stolon = a horizontal branch from the base of plant that produces new plants from buds at its tips | runner, offset
+   > pot plant = a plant suitable for growing in a flowerpot (especially indoors)
+   > fettle = remove mold marks or sand from (a casting)
+   > titterer = a person who laughs nervously | giggler
+   > naked-tailed = having a tail that is hairless
+   > open = affording unobstructed entrance and exit; not shut or closed; "an open door"; "they left the door open" | unfastened
+⚠️ Step 36449: NaN/Spike detected. Skipping batch.
+🔥 PATHOLOGICAL BATCH at global step 36450:
+   > Scutellaria = an asterid dicot genus that includes the skullcaps | genus Scutellaria
+   > bad = not capable of being collected; "a bad (or uncollectible) debt" | uncollectible
+   > dearly-won = entailing great loss or sacrifice; "a dearly-won victory" | costly
+   > lightsomely = moving with quick light steps; "she walked lightsomely down the long staircase" | trippingly
+   > pointer = an indicator as on a dial
+   > thrombocytopenic purpura = purpura associated with a reduction in circulating blood platelets which can result from a variety of factors | idiopathic thrombocytopenic purpura, purpura hemorrhagica, Werlhof's disease
+   > flare = a sudden burst of flame
+   > emaciate = grow weak and thin or waste away physically; "She emaciated during the chemotherapy"
+   > cap off = finish or complete, as with some decisive action; "he capped off the meeting with a radical proposal"
+   > abfarad = a capacitance unit equal to one billion farads
+   > Parsons table = a sturdy rectangular table with block legs at the four corners; the top and the legs are the same width
+   > jilt = a woman who jilts a lover
+   > glaciate = become frozen and covered with glaciers
+   > cow manure = cow excreta used as fertilizer
+   > knobkerrie = a short wooden club with a heavy knob on one end; used by aborigines in southern Africa | knobkerry
+   > faultfinding = persistent petty and unjustified criticism | carping
+🔥 PATHOLOGICAL BATCH at global step 36451:
+   > Actitis = a genus of Scolopacidae | genus Actitis
+   > associational = of or relating to associations or associationism
+   > defensiveness = excessive sensitivity to criticism; "his defensiveness was manifested in hurt silence"; "the fear of being sued for malpractice has magnified physicians' defensiveness"
+   > take off = take time off from work; stop working temporarily | take time off
+   > rebus = a puzzle where you decode a message consisting of pictures representing syllables and words
+   > Korbut = Soviet gymnast (born in 1955) | Olga Korbut
+   > florida selaginella = occurs widely in Florida | Selaginella eatonii
+   > choline = a B-complex vitamin that is a constituent of lecithin; essential in the metabolism of fat
+   > rededicate = dedicate anew; "They were asked to rededicate themselves to their country"
+   > panchromatic film = photographic film sensitive to light of all colors (including red)
+   > true = conforming to definitive criteria; "the horseshoe crab is not a true crab"; "Pythagoras was the first true mathematician"
+   > cauliflower = compact head of white undeveloped flowers
+   > service = (law) the acts performed by an English feudal tenant for the benefit of his lord which formed the consideration for the property granted to him
+   > Sarasvati = Hindu goddess of learning and the arts
+   > glimmery = shining softly and intermittently; "glimmery candlelight"
+   > Wilson = author of the first novel by an African American that was published in the United States (1808-1870) | Harriet Wilson
+🔥 PATHOLOGICAL BATCH at global step 36452:
+   > aggressive = having or showing determination and energetic pursuit of your ends; "an aggressive businessman"; "an aggressive basketball player"; "he was aggressive and imperious; positive in his convictions"; "aggressive drivers"
+   > runup = a substantial increase over a relatively short period of time; "a runup in interest rates"; "market runups are followed by corrections" | run-up
+   > argentinosaur = huge herbivorous dinosaur of Cretaceous found in Argentina
+   > facility = a building or place that provides a particular service or is used for a particular industry; "the assembly plant is an enormous facility" | installation
+   > capital = a seat of government
+   > rubber = returned for lack of funds; "a rubber check"; "a no-good check" | no-good
+   > ply = apply oneself diligently; "Ply one's trade"
+   > federally = by federal government; "it's federally regulated"
+   > crack = a usually brief attempt; "he took a crack at it"; "I gave it a whirl" | fling, go, pass, whirl, offer
+   > bandmaster = the conductor of a band
+   > clerical collar = a stiff white collar with no opening in the front; a distinctive symbol of the clergy | Roman collar, dog collar
+   > biplane flying fish = having both pectoral and pelvic fins enlarged | four-wing flying fish
+   > break = an act of delaying or interrupting the continuity; "it was presented without commercial breaks"; "there was a gap in his account" | interruption, disruption, gap
+   > curtain lecture = a private lecture to a husband by his wife
+   > hardbacked = having a hard back or cover; "hardback books" | hardback, hardbound, hardcover
+   > remove = remove from a position or an office
+🔥 PATHOLOGICAL BATCH at global step 36453:
+   > I Chronicles = the first of two Old Testament books telling the history of Judah and Israel until the return from the Babylonian Captivity in 536 BC | 1 Chronicles
+   > earnest = something of value given by one person to another to bind a contract
+   > Demerara = a former Dutch colony in South America; now a part of Guyana
+   > Sumer = an area in the southern region of Babylonia in present-day Iraq; site of the Sumerian civilization of city-states that flowered during the third millennium BC
+   > call loan = a loan that is repayable on demand | demand loan
+   > Dasyurus = type genus of the family Dasyuridae: native cats | genus Dasyurus
+   > tilt = charge with a tilt
+   > sell = exchange or deliver for money or its equivalent; "He sold his house in January"; "She sells her body to survive and support her drug habit"
+   > insecticide = a chemical used to kill insects | insect powder
+   > black morel = a morel whose pitted fertile body is attached to the stalk with little free skirt around it; the fertile body is grey when young and black in old age | Morchella conica, conic morel, Morchella angusticeps, narrowhead morel
+   > used-car = a car that has been previously owned; not a new car | secondhand car
+   > polyphemus moth = very large yellowish-brown American silkworm moth with large eyespots on hind wings; larvae feed on fruit and shade trees | Antheraea polyphemus
+   > sallow = any of several Old World shrubby broad-leaved willows having large catkins; some are important sources for tanbark and charcoal
+   > American state = one of the 50 states of the United States
+   > offset = cause (printed matter) to transfer or smear onto another surface
+   > Haldane = Scottish physiologist and brother of Richard Haldane and Elizabeth Haldane; noted for research into industrial diseases (1860-1936) | John Haldane, John Scott Haldane
+🔥 PATHOLOGICAL BATCH at global step 36454:
+   > British Imperial System = a system of weights and measures based on the foot and pound and second and pint | English system, British system
+   > joggle = fasten or join with a joggle
+   > run = occur persistently; "Musical talent runs in the family"
+   > railroad track = a line of track providing a runway for wheels; "he walked along the railroad track" | railroad, railway
+   > currish = base and cowardly
+   > dove = any of numerous small pigeons
+   > coir = stiff coarse fiber from the outer husk of a coconut
+   > infrared ray = a ray of infrared radiation; produces a thermal effect (as from an infrared lamp)
+   > bartlett = juicy yellow pear | bartlett pear
+   > amatory = expressive of or exciting sexual love or romance; "her amatory affairs"; "amorous glances"; "a romantic adventure"; "a romantic moonlight ride" | amorous, romantic
+   > Quechua = a community of South American Indians in Peru who were formerly the ruling class of the Incan Empire | Kechua
+   > butcher's broom = shrub with stiff flattened stems resembling leaves (cladophylls); used for making brooms | Ruscus aculeatus
+   > mauve = a moderate purple
+   > Asama = a volcano in central Honshu near Nagano; one of the largest volcanoes in Japan (8,340 feet) | Mount Asama
+   > Western sand cherry = dwarf ornamental shrub of western United States having large black to red and yellow sweet edible fruit | Rocky Mountains cherry, Prunus besseyi
+   > reappraise = appraise anew; "Homes in our town are reappraised every five years and taxes are increased accordingly"
+🔥 PATHOLOGICAL BATCH at global step 36455:
+   > domesticated = accustomed to home life; "some men think it unmanly to be domesticated; others find gratification in it"
+   > dimpled chad = a chad that has been punched or dimpled but all four corners are still attached | pregnant chad, dimple
+   > radio receiver = an electronic receiver that detects and demodulates and amplifies transmitted signals | receiving set, radio set, radio, tuner, wireless
+   > curettage = surgery to remove tissue or growths from a bodily cavity (as the uterus) by scraping with a curette | curettement
+   > incautiously = without caution or prudence; "one unfortunately sees historic features carelessly lost when estates fall into unsympathetic hands" | carelessly
+   > regally = in a regal manner; "a regally appropriate representative"
+   > termer = a person who serves a specified term; "there are not many fourth termers in the Senate"
+   > backstitch = an overlapping stitch made by starting the next stitch at the middle of the preceding one
+   > Judith = Jewish heroine in one of the books of the Apocrypha; she saved her people by decapitating the Assyrian general Holofernes
+   > eucalyptus oil = an essential oil obtained from the leaves of eucalypts
+   > barbette = (formerly) a mound of earth inside a fort from which heavy gun can be fired over the parapet
+   > hit the dirt = fall or drop suddenly, usually to evade some danger; "The soldiers hit the dirt when they heard gunfire" | hit the deck
+   > poke = tall coarse perennial American herb having small white flowers followed by blackish-red berries on long drooping racemes; young fleshy stems are edible; berries and root are poisonous | pigeon berry, garget, scoke, Phytolacca americana
+   > altitude = elevation especially above sea level or above the earth's surface; "the altitude gave her a headache" | height
+   > telling = informing by words | apprisal, notification
+   > sun = any star around which a planetary system revolves
+🔥 PATHOLOGICAL BATCH at global step 36456:
+   > vestibular apparatus = organs mediating the labyrinthine sense; concerned with equilibrium | vestibular system
+   > Dicrostonyx = pied lemmings | genus Dicrostonyx
+   > teashop = a restaurant where tea and light meals are available | teahouse, tearoom, tea parlor, tea parlour
+   > Ringer's solution = an aqueous solution containing the chlorides of sodium and potassium and calcium that is isotonic to animal tissues; used to correct dehydration and (in physiological experiments) as a medium for in vitro preparations | Ringer solution
+   > ruminant = any of various cud-chewing hoofed mammals having a stomach divided into four (occasionally three) compartments
+   > paintball = a capsule filled with water-soluble dye used as a projectile in playing the game of paintball
+   > arms manufacturer = someone who manufactures arms and munitions
+   > Bathsheba = (Old Testament) the wife of Uriah and later the wife of king David; Solomon was her son by David (circa 10th century BC)
+   > lily-white = of a pure white color
+   > counterpoint = write in counterpoint; "Bach perfected the art of counterpointing"
+   > demiglace = sauce Espagnole with extra beef stock simmered down and seasoned with dry wine or sherry | demi-glaze
+   > unsecured bond = the ability of a customer to obtain goods or services before payment, based on the trust that payment will be made in the future | debenture, debenture bond
+   > balm of Gilead = a fragrant oleoresin
+   > restriction site = the specific sites at which a restriction enzyme will cleave DNA
+   > works program = a program to provide jobs on public works paid for by government funds
+   > soleless = having no sole
+🔥 PATHOLOGICAL BATCH at global step 36457:
+   > water pump = the pump in the cooling system of an automobile that cause the water to circulate
+   > glass cutter = someone who cuts flat glass to size | glass-cutter, glassworker, glazier, glazer
+   > creepy-crawlies = feelings of dislike and anxiety; "the cave gave me the creepy-crawlies"
+   > incur = make oneself subject to; bring upon oneself; become liable to; "People who smoke incur a great danger to their health"
+   > tepary bean = twining plant of southwestern United States and Mexico having roundish white or yellow or brown or black beans | Phaseolus acutifolius latifolius
+   > ethyl chloride = a colorless flammable gas used as a local surface anesthetic
+   > alderleaf Juneberry = shrub or small tree of northwestern North America having fragrant creamy white flowers and small waxy purple-red fruits | alder-leaved serviceberry, Amelanchier alnifolia
+   > lasher = a driver who urges the animals on with lashes of a whip
+   > regret = decline formally or politely; "I regret I can't come to the party"
+   > interchange = reverse (a direction, attitude, or course of action) | tack, switch, alternate, flip, flip-flop
+   > Asiatic black bear = bear with a black coat living in central and eastern Asia | black bear, Ursus thibetanus, Selenarctos thibetanus
+   > elephantiasis = hypertrophy of certain body parts (usually legs and scrotum); the end state of the disease filariasis
+   > sounding board = a person whose reactions to something serve as an indication of its acceptability; "I would use newspapermen as a sounding board for such policies"
+   > lift = make audible; "He lifted a war whoop"
+   > asyndeton = the omission of conjunctions where they would normally be used
+   > black market = an illegal market in which goods or currencies are bought and sold in violation of rationing or controls
+🔥 PATHOLOGICAL BATCH at global step 36458:
+   > burrow = move through by or as by digging; "burrow through the forest" | tunnel
+   > blitz = attack suddenly and without warning; "Hitler blitzed Poland"
+   > retrain = teach new skills; "We must retrain the linguists who cannot find employment"
+   > cabbage butterfly = white butterfly whose larvae (cabbageworms) feed on cabbage
+   > block = interrupt the normal function of by means of anesthesia; "block a nerve"; "block a muscle"
+   > attentiveness = the trait of being observant and paying attention
+   > time immemorial = the distant past beyond memory | time out of mind
+   > centrifugal force = the outward force on a body moving in a curved path around another body
+   > nominal = insignificantly small; a matter of form only (`tokenish' is informal); "the fee was nominal"; "a token gesture of resistance"; "a tokenish gesture" | token(a), tokenish
+   > scratch pad = pad for preliminary or hasty writing or notes or sketches etc; "scribbling block" is a British term | scratch paper, scribbling block
+   > Eurasian woodcock = short-legged long-billed migratory Old World woodcock | Scolopax rusticola
+   > phreatic = of or relating to ground water
+   > ash-blonde = of hair color; whitish | platinum-blonde, towheaded
+   > unreality = the quality possessed by something that is unreal
+   > feature = an article of merchandise that is displayed or advertised more than other articles
+   > Anglophilic = characterized by Anglophilia
+🔥 PATHOLOGICAL BATCH at global step 36459:
+   > coordinate axis = one of the fixed reference lines of a coordinate system
+   > conjunctival = of or relating to the conjunctiva
+   > point = be positionable in a specified manner; "The gun points with ease"
+   > lanseh = East Indian tart yellow berrylike fruit | lansa, lansat, lanset
+   > prosthetics = the branch of medicine dealing with the production and use of artificial body parts
+   > muskmelon = the fruit of a muskmelon vine; any of several sweet melons related to cucumbers | sweet melon
+   > hang = kill by hanging; "The murderer was hanged on Friday" | string up
+   > Thatcher = British stateswoman; first woman to serve as Prime Minister (born in 1925) | Margaret Thatcher, Margaret Hilda Thatcher, Baroness Thatcher of Kesteven, Iron Lady
+   > poisoning = the act of giving poison to a person or animal with the intent to kill
+   > South American poison toad = a South American toad
+   > nausea = the state that precedes vomiting | sickness
+   > non-nucleoside reverse transcriptase inhibitor = an antiviral drug used against HIV; binds directly to reverse transcriptase and prevents RNA conversion to DNA; often used in combination with other drugs | NNRTI
+   > ditto = repeat an action or statement; "The next speaker dittoed her argument"
+   > bowl = the quantity contained in a bowl | bowlful
+   > lipstick = form by tracing with lipstick; "The clown had lipsticked circles on his cheeks"
+   > deer mouse = brownish New World mouse; most widely distributed member of the genus | Peromyscus maniculatus
+⚠️ Step 36459: NaN/Spike detected. Skipping batch.
+🔥 PATHOLOGICAL BATCH at global step 36460:
+   > melosa = South American herb with sticky glandular foliage; source of madia oil | Chile tarweed, madia oil plant, Madia sativa
+   > multitude = a large gathering of people | throng, concourse
+   > ethnic cleansing = the mass expulsion and killing of one ethnic or religious group in an area by another ethnic or religious group in that area
+   > Melba = Australian operatic soprano (1861-1931) | Dame Nellie Melba, Helen Porter Mitchell
+   > malfeasant = one guilty of malfeasance
+   > toy dog = any of several breeds of very small dogs kept purely as pets | toy
+   > case = look over, usually with the intention to rob; "They men cased the housed"
+   > Oglala = a Siouan language spoken by the Oglala | Ogalala
+   > elementarily = in an elementary manner
+   > marshalship = the post of marshall
+   > Uca = fiddler crabs | genus Uca
+   > acutely = having a rapid onset; "an acutely debilitating virus"
+   > Lent = a period of 40 weekdays from Ash Wednesday to Holy Saturday | Lententide
+   > schistosome = flatworms parasitic in the blood vessels of mammals | blood fluke
+   > parathyroid hormone = hormone synthesized and released into the blood stream by the parathyroid glands; regulates phosphorus and calcium in the body and functions in neuromuscular excitation and blood clotting | parathormone
+   > adhesive tape = tape coated with adhesive
+🔥 PATHOLOGICAL BATCH at global step 36461:
+   > domesticity = domestic activities or life; "making a hobby of domesticity"
+   > desert four o'clock = wildflower having vibrant deep pink tubular evening-blooming flowers; found in sandy and desert areas from southern California to southern Colorado and into Mexico | Colorado four o'clock, maravilla, Mirabilis multiflora
+   > bellied = curving outward | bellying, bulbous, bulging, bulgy, protuberant
+   > inelasticity = the lack of elasticity
+   > banana peel = the skin of a banana (especially when it is stripped off and discarded); "he slipped on a banana skin and almost fell" | banana skin
+   > service = employment in or work for another; "he retired after 30 years of service"
+   > clientele = customers collectively; "they have an upper class clientele" | patronage, business
+   > Pitymys = pine mice | genus Pitymys
+   > couture = high fashion designing and dressmaking
+   > theologize = make theoretical speculations about theology or discuss theological subjects | theologise
+   > away = indicating continuing action; continuously or steadily; "he worked away at the project for more than a year"; "the child kept hammering away as if his life depended on it"
+   > homespun = a rough loosely woven fabric originally made with yarn that was spun at home
+   > head = the pressure exerted by a fluid; "a head of steam"
+   > hire = a newly hired employee; "the new hires need special training"
+   > Moorish = a style of architecture common in Spain from the 13th to 16th centuries; characterized by horseshoe-shaped arches | Moorish architecture
+   > inhale = draw deep into the lungs in by breathing; "Clinton smoked marijuana but never inhaled"
+🔥 PATHOLOGICAL BATCH at global step 36462:
+   > manly = possessing qualities befitting a man | manful, manlike
+   > mining = laying explosive mines in concealed places to destroy enemy personnel and equipment | minelaying
+   > lag = hang (back) or fall (behind) in movement, progress, development, etc. | dawdle, fall back, fall behind
+   > celiocentesis = removal of fluid from the abdomen by centesis
+   > incommensurate = not corresponding in size or degree or extent; "a reward incommensurate with his effort"
+   > Euterpe = a monocotyledonous genus of graceful palm trees in tropical America | genus Euterpe
+   > Teiidae = whiptails; etc. | family Teiidae
+   > cold = the sensation produced by low temperatures; "he shivered from the cold"; "the cold helped clear his head" | coldness
+   > monogamist = someone who practices monogamy (one spouse at a time) | monogynist
+   > friary = a monastery of friars
+   > mailing list = a list of names and addresses to which advertising material is mailed
+   > sec = (of champagne) moderately dry | unsweet
+   > better = to make better; "The editor improved the manuscript with his changes" | improve, amend, ameliorate, meliorate
+   > vibrant = of colors that are bright and striking
+   > recur = return in thought or speech to something | go back
+   > singularly = in a singular manner or to a singular degree; "Lord T. was considered singularly licentious even for the courts of Russia and Portugal; he acquired three wives and fourteen children during his Portuguese embassy alone"
+🔥 PATHOLOGICAL BATCH at global step 36463:
+   > maltose = a white crystalline sugar formed during the digestion of starches | malt sugar
+   > Burton = English explorer who with John Speke was the first European to explore Lake Tanganyika (1821-1890) | Richard Burton, Sir Richard Burton, Sir Richard Francis Burton
+   > hereunder = under the terms of this agreement
+   > tetrachoric correlation coefficient = a correlation coefficient computed for two normally distributed variables that are both expressed as a dichotomy | tetrachoric correlation
+   > enduring = patiently bearing continual wrongs or trouble; "an enduring disposition"; "a long-suffering and uncomplaining wife" | long-suffering
+   > belated = after the expected or usual time; delayed; "a belated birthday card"; "I'm late for the plane"; "the train is late"; "tardy children are sent to the principal"; "always tardy in making dental appointments" | late, tardy
+   > empty-handed = carrying nothing in the hands
+   > overbid = to bid for more tricks than one can expect to win,
+   > inoculate = introduce a microorganism into
+   > army = a large number of people united for some specific purpose
+   > diphthong = a vowel sound that starts near the articulatory position for one vowel and moves toward the position for another
+   > whine = complain whiningly | grizzle, yammer, yawp
+   > kidney disease = a disease affecting the kidneys | renal disorder, nephropathy, nephrosis
+   > intrude = thrust oneself in as if by force; "The colors don't intrude on the viewer" | obtrude
+   > leptocephalus = slender transparent larva of eels and certain fishes
+   > hypnotherapy = the use of hypnosis in psychotherapy
+🔥 PATHOLOGICAL BATCH at global step 36464:
+   > meaningful = having a meaning or purpose; "a meaningful explanation"; "a meaningful discussion"; "a meaningful pause"
+   > mollusk = invertebrate having a soft unsegmented body usually enclosed in a shell | mollusc, shellfish
+   > dispense = grant a dispensation; grant an exemption; "I was dispensed from this terrible task"
+   > tip = remove the tip from; "tip artichokes"
+   > pinnate = (of a leaf shape) featherlike; having leaflets on each side of a common axis | pinnated
+   > veld = elevated open grassland in southern Africa | veldt
+   > Chaos = (Greek mythology) the most ancient of gods; the personification of the infinity of space preceding creation of the universe
+   > match-up = the pairing of people or things as for comparison or competition; "it was a good match-up but the home team won"; "we need a matchup of the best teachers with the neediest schools" | matchup
+   > Microhylidae = narrow-mouthed toads and sheep frogs; some burrow and some are arboreal; found worldwide | family Microhylidae, Brevicipitidae, family Brevicipitidae
+   > osteitis = inflammation of a bone as a consequence of infection or trauma or degeneration
+   > restoration = the act of restoring something or someone to a satisfactory state
+   > Formica fusca = an ant frequently enslaved
+   > Angora = a domestic breed of goat raised for its long silky hair which is the true mohair | Angora goat
+   > carbonyl group = the bivalent radical CO
+   > stained = marked or dyed or discolored with foreign matter; "a badly stained tablecloth"; "tear-stained cheeks"
+   > soluble = (of a substance) capable of being dissolved in some solvent (usually water)
+🔥 PATHOLOGICAL BATCH at global step 36465:
+   > sweet bells = bushy deciduous shrub of the eastern United States with long racemes of pinkish flowers | Leucothoe racemosa
+   > observation station = a station set up for making observations of something
+   > Scincella = a reptile genus of Scincidae | genus Scincella
+   > company = a social gathering of guests or companions; "the house was filled with company when I arrived"
+   > Dona = a Spanish courtesy title or form of address for a woman; "Dona Marguerita"
+   > prewar = existing or belonging to a time before a war; "prewar levels of industrial production"
+   > Cash = United States country music singer and songwriter (1932-2003) | Johnny Cash, John Cash
+   > pitch pine = large three-needled pine of the eastern United States and southeastern Canada; closely related to the pond pine | northern pitch pine, Pinus rigida
+   > grit = clench together; "grit one's teeth"
+   > plasma cell = a cell that develops from a B lymphocyte in reaction to a specific antigen; found in bone marrow and sometimes in the blood | plasmacyte
+   > nugget = a solid lump of a precious metal (especially gold) as found in the earth
+   > Sten gun = a lightweight British submachine gun
+   > safflower = thistlelike Eurasian plant widely grown for its red or orange flower heads and seeds that yield a valuable oil | false saffron, Carthamus tinctorius
+   > white hope = someone (or something) expected to achieve great success in a given field; "this company is the great white hope of the nuclear industry's waste management policy" | great white hope
+   > lemonwood = South African evergreen having hard tough wood | lemon-wood, lemonwood tree, lemon-wood tree, Psychotria capensis
+   > scape = erect leafless flower stalk growing directly from the ground as in a tulip | flower stalk
+🔥 PATHOLOGICAL BATCH at global step 36466:
+   > toll-free = having no toll levied for its use; "a toll-free road"; "a toll-free telephone number"
+   > dysphagia = condition in which swallowing is difficult or painful
+   > breathless = not breathing or able to breathe except with difficulty; "breathless at thought of what I had done"; "breathless from running"; "followed the match with breathless interest" | dyspneic, dyspnoeic, dyspneal, dyspnoeal
+   > genus Corythosaurus = genus of duck-billed dinosaurs of late Cretaceous
+   > mobile = capable of changing quickly from one state or condition to another; "a highly mobile face"
+   > esophageal veins = small veins from the esophagus emptying into the brachiocephalic vein or the azygos veins | oesophageal veins, venae esophageae
+   > hemophilia = congenital tendency to uncontrolled bleeding; usually affects males and is transmitted from mother to son | haemophilia, bleeder's disease
+   > hockey player = an athlete who plays hockey | ice-hockey player
+   > Danish monetary unit = monetary unit in Denmark
+   > wash out = wear or destroy by the force of water; "The hail storms had washed out the bridges"
+   > glance = hit at an angle
+   > pajama = a pair of loose trousers tied by a drawstring around the waist; worn by men and women in some Asian countries | pyjama
+   > operation = a business especially one run on a large scale; "a large-scale farming operation"; "a multinational operation"; "they paid taxes on every stage of the operation"; "they had to consolidate their operations"
+   > spark gap = a component of an ignition system; consists of two shaped electrodes and the space between them
+   > trefoil arch = a pointed arch having cusps in the intrados on either side of the apex
+   > mechanical energy = energy in a mechanical form
+🔥 PATHOLOGICAL BATCH at global step 36467:
+   > hard drug = a narcotic that is considered relatively strong and likely to cause addiction
+   > cut = discharge from a group; "The coach cut two players from the team"
+   > nonsteroidal = not steroidal or not having the effects of steroid hormones
+   > Plataea = a former town in Boeotia; site of a battle between the Greeks and Persians in 479 BC
+   > firebug = a true bug: brightly colored bug that can exude a stain
+   > defendant = a person or institution against whom an action is brought in a court of law; the person being sued or accused | suspect
+   > Guangdong = a province in southern China | Kwangtung, Guangdong province
+   > jewels-of-opar = erect plant with tuberous roots and terminal panicles of red to yellow flowers; southwestern North America to Central America; widely introduced elsewhere | Talinum paniculatum
+   > colorful = having much or varied color; "colorful autumn leaves" | colourful
+   > Taoist = of or relating to the popular Chinese religious system based on the teachings of Lao-tzu but including a pantheon of gods along with divination and magic; "Taoist temples"
+   > grass fern = epiphytic fern found in lowland forests of tropical America | ribbon fern, Vittaria lineata
+   > scrambled = thrown together in a disorderly fashion; "a scrambled plan of action"
+   > crested = (of a knight's helmet) having a decorative plume | plumed
+   > format = set (printed matter) into a specific format; "Format this letter so it can be printed out" | arrange
+   > Sporobolus = cosmopolitan annual and perennial grasses (as dropseed or rush grass) | genus Sporobolus
+   > remise = (fencing) a second thrust made on the same lunge (as when your opponent fails to riposte)
+🔥 PATHOLOGICAL BATCH at global step 36468:
+   > prefix = attach a prefix to; "prefixed words"
+   > madder = Eurasian herb having small yellow flowers and red roots formerly an important source of the dye alizarin | Rubia tinctorum
+   > eighteen = the cardinal number that is the sum of seventeen and one | 18, XVIII
+   > to leeward = the side sheltered from the wind | leeward side
+   > purple-blue = of blue tinged with purple | purplish-blue
+   > stratum granulosum = the layer of epidermis just under the stratum corneum or (on the palms and soles) just under the stratum lucidum; contains cells (with visible granules) that die and move to the surface
+   > ethereal = of or containing or dissolved in ether; "ethereal solution"
+   > Siluridae = Old World catfishes | family Siluridae
+   > bobsled = formerly two short sleds coupled together | bobsleigh
+   > execute = sign in the presence of witnesses; "The President executed the treaty"
+   > Latin = relating to people or countries speaking Romance languages; "Latin America"
+   > tremble = a reflex motion caused by cold or fear or excitement | shiver, shake
+   > larder = a supply of food especially for a household
+   > synonymy = the semantic relation that holds between two words that can (in a given context) express the same meaning | synonymity, synonymousness
+   > dollhouse = a small model of a house used as a toy by children | doll's house
+   > skim = reading or glancing through quickly | skimming
+🔥 PATHOLOGICAL BATCH at global step 36469:
+   > preach = deliver a sermon; "The minister is not preaching this Sunday" | prophesy
+   > cognitive psychology = an approach to psychology that emphasizes internal mental processes
+   > exocrine gland = a gland that secretes externally through a duct | exocrine, duct gland
+   > Abu Hafs al-Masri Brigades = a terrorist group that has worked with Al Qaeda; claimed responsibility for attacks in Iraq and Turkey
+   > Ionian Sea = an arm of the Mediterranean Sea between western Greece and southern Italy
+   > utter = put into circulation; "utter counterfeit currency"
+   > naval officer = an officer in the navy
+   > girlishness = being characteristic of a girl
+   > appropriation = a deliberate act of acquisition of something, often without the permission of the owner; "the necessary funds were obtained by the government's appropriation of the company's operating unit"; "a person's appropriation of property belonging 
+   > shade tree = a tree planted or valued chiefly for its shade from sunlight
+   > intensive care = close monitoring and constant medical care of patients with life-threatening conditions
+   > British West Indies = the islands in the West Indies that were formerly under British control, including the Bahamas, Saint Lucia, Antigua, Grenada, Jamaica, Barbados, and Trinidad
+   > article = nonfictional prose forming an independent part of a publication
+   > front = the part of something that is nearest to the normal viewer; "he walked to the front of the stage"
+   > Poplar Bluff = a town in southeast Missouri
+   > Hilbert space = a metric space that is linear and complete and (usually) infinite-dimensional
+⚠️ Step 36469: NaN/Spike detected. Skipping batch.
+🔥 PATHOLOGICAL BATCH at global step 36470:
+   > Descartes = French philosopher and mathematician; developed dualistic theory of mind and matter; introduced the use of coordinates to locate a point in two or three dimensions (1596-1650) | Rene Descartes
+   > Regius professor = holder of a British professorship created by a royal patron
+   > unshockable = incapable of being shocked; "he was warmhearted, sensible and unshockable" | broad-minded
+   > Traubel = United States operatic soprano (1903-1972) | Helen Traubel
+   > Cynomys = prairie dogs | genus Cynomys
+   > spectral = of or relating to a spectrum; "spectral colors"; "spectral analysis"
+   > eastern = lying toward or situated in the east; "the eastern end of the island"
+   > progressive tax = any tax in which the rate increases as the amount subject to taxation increases | graduated tax
+   > break = undergo breaking; "The simple vowels broke in many Germanic languages"
+   > pajama = (usually plural) loose-fitting nightclothes worn for sleeping or lounging; have a jacket top and trousers | pyjama, pj's, jammies
+   > Didion = United States writer (born in 1934) | Joan Didion
+   > chin = raise oneself while hanging from one's hands until one's chin is level with the support bar | chin up
+   > cardiography = diagnostic procedure consisting of recording the activity of the heart electronically with a cardiograph (and producing a cardiogram) | electrocardiography
+   > villainy = a criminal or vicious act
+   > common mackerel = important food fish of the northern Atlantic and Mediterranean; its body is greenish-blue with dark bars and small if any scales | shiner, Scomber scombrus
+   > announced = declared publicly; made widely known; "their announced intentions"; "the newspaper's proclaimed adherence to the government's policy" | proclaimed
+🔥 PATHOLOGICAL BATCH at global step 36471:
+   > report = to give an account or representation of in words; "Discreet Italian police described it in a manner typically continental" | describe, account
+   > harlequin opal = a reddish opal with small patches of brilliant color
+   > summation = a concluding summary (as in presenting a case before a law court) | summing up, rundown
+   > preliterate = used of a society that has not developed writing | nonliterate
+   > Ontario = a prosperous and industrialized province in central Canada
+   > cutout = a photograph from which the background has been cut away
+   > profound = showing intellectual penetration or emotional depth; "the differences are profound"; "a profound insight"; "a profound book"; "a profound mind"; "profound contempt"; "profound regret"
+   > seagirt = surrounded or enclosed by the sea
+   > meagerly = to a meager degree or in a meager manner; "these voices are meagerly represented at the conference"; "the area is slenderly endowed with natural resources" | sparingly, slenderly, meagrely
+   > blazing star = any of various North American plants of the genus Liatris having racemes or panicles of small discoid flower heads | button snakeroot, gayfeather, gay-feather, snakeroot
+   > Old World monkey = of Africa or Arabia or Asia; having nonprehensile tails and nostrils close together | catarrhine
+   > sea lily = crinoid with delicate radiating arms and a stalked body attached to a hard surface
+   > sour orange = any of various common orange trees yielding sour or bitter fruit; used as grafting stock | Seville orange, bitter orange, bitter orange tree, bigarade, marmalade orange, Citrus aurantium
+   > snail mail = any mail that is physically delivered by the postal service; "email is much faster than snail mail"
+   > ineffectually = in an ineffectual manner; "she tried ineffectually to light the primus, and Thomas came to help her"
+   > vinifera = common European grape cultivated in many varieties; chief source of Old World wine and table grapes | vinifera grape, common grape vine, Vitis vinifera
+🔥 PATHOLOGICAL BATCH at global step 36472:
+   > dropseed = a grass of the genus Sporobolus | drop-seed
+   > Russian roulette = a stunt in which you spin the cylinder of a revolver that is loaded with only one bullet and then point the muzzle at your head and pull the trigger
+   > peptone = any of various water-soluble compounds that form by hydrolysis in the digestion of proteins to amino acids
+   > checkers = a checkerboard game for two players who each have 12 pieces; the object is to jump over and so capture the opponent's pieces | draughts
+   > urban area = a geographical area constituting a city or town | populated area
+   > neutral = having no net electric charge | electroneutral
+   > calmness = a feeling of calm; an absence of agitation or excitement
+   > olfactory nerve = a collective term for numerous olfactory filaments in the nasal mucosa | nervii olfactorii, first cranial nerve
+   > hatha yoga = yogic exercises (popular in the West) that combine difficult postures (which force the mind to withdraw from the outside world) with controlled breathing
+   > dry nurse = a nurse who cares for but does not suckle an infant
+   > round trip = a trip to some place and back again
+   > meeting house = columbine of eastern North America having long-spurred red flowers | honeysuckle, Aquilegia canadensis
+   > size stick = a mechanical measuring stick used by shoe fitters to measure the length and width of your foot
+   > ballast = an attribute that tends to give stability in character and morals; something that steadies the mind or feelings
+   > young = (used of living things especially persons) in an early period of life or development or growth; "young people" | immature
+   > stomach = an appetite for food; "exercise gave him a good stomach for dinner"
+🔥 PATHOLOGICAL BATCH at global step 36473:
+   > aversive stimulus = any negative stimulus to which an organism will learn to make a response that avoids it
+   > herbal = of or relating to herbs; "herbal tea, herbal medicine"
+   > round = a cut of beef between the rump and the lower leg
+   > Young = United States civil rights leader (1921-1971) | Whitney Young, Whitney Moore Young Jr.
+   > sago palm = dwarf palmlike cycad of Japan that yields sago | Cycas revoluta
+   > extinction = the act of extinguishing; causing to stop burning; "the extinction of the lights" | extinguishing, quenching
+   > sigh = heave or utter a sigh; breathe deeply and heavily; "She sighed sadly" | suspire
+   > transfer = a ticket that allows a passenger to change conveyances
+   > compress = squeeze or press together; "she compressed her lips"; "the spasm contracted the muscle" | constrict, squeeze, compact, contract, press
+   > conduct = lead, as in the performance of a composition; "conduct an orchestra; Barenboim conducted the Chicago symphony for years" | lead, direct
+   > poleax = an ax used to slaughter cattle; has a hammer opposite the blade | poleaxe
+   > beggary = the state of being a beggar or mendicant; "they were reduced to mendicancy" | mendicancy, mendicity
+   > Actium = the naval battle in which Antony and Cleopatra were defeated by Octavian's fleet under Agrippa in 31 BC
+   > riser = a vertical pipe in a building | riser pipe, riser pipeline, riser main
+   > ducat = formerly a gold coin of various European countries
+   > correspondence = communication by the exchange of letters
+🔥 PATHOLOGICAL BATCH at global step 36474:
+   > Lambert = English composer and conductor (1905-1951) | Constant Lambert, Leonard Constant Lambert
+   > Pinnotheres = type genus of the family Pinnotheridae: pea crabs | genus Pinnotheres
+   > door = anything providing a means of access (or escape); "we closed the door to Haitian immigrants"; "education is the door to success"
+   > stint = an individual's prescribed share of work; "her stint as a lifeguard exhausted her"
+   > relax = make less severe or strict; "The government relaxed the curfew after most of the rebels were caught" | loosen
+   > foreboding = an unfavorable omen
+   > Secretary of the Interior = the person who holds the secretaryship of the Interior Department; "President Taylor appointed Thomas Ewing as the first Secretary of the Interior" | Interior Secretary
+   > afoul(ip) = especially of a ship's lines etc; "with its sails afoul"; "a foul anchor" | foul, fouled
+   > reconstructed = adapted to social or economic change; "a reconstructed feminist"
+   > rose quartz = a translucent rose-red variety of quartz used for ornaments
+   > actual eviction = the physical ouster of a tenant from the leased premises; the tenant is relieved of any further duty to pay rent
+   > offload = transfer to a peripheral device, of computer data
+   > adagio = (music) a composition played in adagio tempo (slowly and gracefully); "they played the adagio too quickly"
+   > form = to compose or represent; "This wall forms the background of the stage setting"; "The branches made a roof"; "This makes a fine introduction" | constitute, make
+   > cholla = arborescent cacti having very spiny cylindrical stem segments; southwestern United States and Mexico | Opuntia cholla
+   > ageism = discrimination on the basis of a person's age | agism
+🔥 PATHOLOGICAL BATCH at global step 36475:
+   > Hughes = United States writer (1902-1967) | Langston Hughes, James Langston Hughes
+   > sleuth = a detective who follows a trail | sleuthhound
+   > air reconnaissance = reconnaissance either by visual observation from the air or through the use of airborne sensors
+   > O'Brien = Irish writer (born in 1932) | Edna O'Brien
+   > nuclear weapon = a weapon of mass destruction whose explosive power derives from a nuclear reaction | atomic weapon
+   > hypo-eutectoid steel = a steel that contains less that 0.9% carbon
+   > Black Hills = mountains in southwestern South Dakota and northeastern Wyoming; sacred to the Sioux (whites settling in the Black Hills led to the Battle of Little Bighorn); site of Mount Rushmore
+   > shower = washing yourself by standing upright under water sprayed from a nozzle; "he took a shower after the game" | shower bath
+   > doorstop = a stop that keeps open doors from moving | doorstopper
+   > expect = regard something as probable or likely; "The meteorologists are expecting rain for tomorrow" | anticipate
+   > acuteness = a sensitivity that is keen and highly developed; "dogs have a remarkable acuteness of smell"
+   > adverbial = of or relating to or functioning as an adverb; "adverbial syntax"
+   > Germanic = a branch of the Indo-European family of languages; members that are spoken currently fall into two major groups: Scandinavian and West Germanic | Germanic language
+   > yak = large long-haired wild ox of Tibet often domesticated | Bos grunniens
+   > Wesley = English clergyman and brother of John Wesley who wrote many hymns (1707-1788) | Charles Wesley
+   > solve = find the solution to (a problem or question) or understand the meaning of; "did you solve the problem?"; "Work out your problems with the boss"; "this unpleasant situation isn't going to work itself out"; "did you get it?"; "Did you get my meaning?
+🔥 PATHOLOGICAL BATCH at global step 36476:
+   > vaulting horse = a gymnastic horse without pommels and with one end elongated; used lengthwise for vaulting | long horse, buck
+   > haymaker = a hard punch that renders the opponent unable to continue boxing | knockout punch, KO punch, Sunday punch
+   > tossup = an unpredictable phenomenon; "it's a toss-up whether he will win or lose" | toss-up, even chance
+   > auspices = kindly endorsement and guidance; "the tournament was held under the auspices of the city council" | protection, aegis
+   > mishpocha = (Yiddish) the entire family network of relatives by blood or marriage (and sometimes close friends); "she invited the whole mishpocha" | mishpachah
+   > maxwell = a cgs unit of magnetic flux equal to the flux perpendicular to an area of 1 square centimeter in a magnetic field of 1 gauss | Mx
+   > Hesperis = biennial or perennial erect herbs having nocturnally fragrant flowers | genus Hesperis
+   > Balzacian = of or relating to Honore de Balzac or his writings
+   > Angara = a river in southeastern Siberia that flows northwest from Lake Baikal to become a tributary of the Yenisei River | Angara River, Tunguska, Upper Tunguska
+   > nevoid elephantiasis = thickening of the skin (usually unilateral on an extremity) caused by congenital enlargement of lymph vessel and lymph vessel obstruction | pachyderma
+   > rein = any means of control; "he took up the reins of government"
+   > Erie = a member of an Iroquoian people formerly living on the south shore of Lake Erie in northern Ohio and northwest Pennsylvania and western New York
+   > Stations = (Roman Catholic Church) a devotion consisting of fourteen prayers said before a series of fourteen pictures or carvings representing successive incidents during Jesus' passage from Pilate's house to his crucifixion at Calvary | Stations of the C
+   > shocker = a sensational message (in a film or play or novel)
+   > endorser = a person who transfers his ownership interest in something by signing a check or negotiable security | indorser
+   > afforestation = the conversion of bare or cultivated land into forest (originally for the purpose of hunting)
+🔥 PATHOLOGICAL BATCH at global step 36477:
+   > chlamydia = a sexually transmitted infection caused by bacteria of the genus Chlamydia
+   > dyer's rocket = European mignonette cultivated as a source of yellow dye; naturalized in North America | dyer's mignonette, weld, Reseda luteola
+   > Ramalina = shrubby lichens of the family Usneaceae having a flattened thallus | genus Ramalina
+   > look = accord in appearance with; "You don't look your age!"
+   > basic = reduced to the simplest and most significant form possible without loss of generality; "a basic story line"; "a canonical syllable pattern" | canonic, canonical
+   > style = designate by an identifying term; "They styled their nation `The Confederate States'" | title
+   > American chestnut = large tree found from Maine to Alabama | American sweet chestnut, Castanea dentata
+   > aquavit = Scandinavian liquor usually flavored with caraway seeds | akvavit
+   > spherical trigonometry = (mathematics) the trigonometry of spherical triangles
+   > Coniferales = profusely branching and chiefly evergreen trees and some shrubs having narrow or needlelike leaves | order Coniferales
+   > verrucose = (of skin) covered with warts or projections that resemble warts | warty, wartlike
+   > gesture = motion of hands or body to emphasize or help to express a thought or feeling
+   > speak for = be a spokesperson for; "He represents the Government's position"
+   > commissary = a snack bar in a film studio
+   > Pluvialis = golden plovers | genus Pluvialis
+   > worldly possession = a commodity or good associated with the earthly, rather than the spiritual, existence of human beings | worldly good
+🔥 PATHOLOGICAL BATCH at global step 36478:
+   > hygrodeik = a wet and dry bulb hygrometer
+   > arbovirus = a large heterogeneous group of RNA viruses divisible into groups on the basis of the virions; they have been recovered from arthropods, bats, and rodents; most are borne by arthropods; they are linked by the epidemiologic concept of transmissio
+   > release = a device that when pressed will release part of a mechanism | button
+   > bark = the sound made by a dog
+   > match play = golf scoring by holes won
+   > dewlap = a hanging fold of loose skin on an elderly person's neck
+   > Sauvignon blanc = a California wine
+   > line = a mark that is long relative to its width; "He drew a line on the chart"
+   > straight line = a line traced by a point traveling in a constant direction; a line of zero curvature; "the shortest distance between two points is a straight line"
+   > genetic engineering = the technology of preparing recombinant DNA in vitro by cutting up DNA molecules and splicing together fragments from more than one organism | gene-splicing, recombinant DNA technology
+   > souchong = a fine quality of black tea native to China | soochong
+   > thermos = vacuum flask that preserves temperature of hot or cold drinks | thermos bottle, thermos flask
+   > villainy = the quality of evil by virtue of villainous behavior | villainousness
+   > musicology = the scholarly and scientific study of music
+   > cloud bank = a layer of clouds seen from a distance
+   > factoid = a brief (usually one sentence and usually trivial) news item
+🔥 PATHOLOGICAL BATCH at global step 36479:
+   > camp = temporary living quarters specially built by the army for soldiers; "wherever he went in the camp the men were grumbling" | encampment, cantonment, bivouac
+   > margarin = a glyceryl ester of margaric acid | glycerol trimargarate
+   > leaf shape = any of the various shape that leaves of plants can assume | leaf form
+   > New Waver = a film maker who follows New Wave ideas
+   > Nilsson = Swedish operatic soprano who played Wagnerian roles (born in 1918) | Brigit Nilsson, Marta Brigit Nilsson
+   > bulbed = having a bulb
+   > Dodecanese = a group of islands in the southeast Aegean Sea | Dhodhekanisos
+   > trogon = forest bird of warm regions of the New World having brilliant lustrous plumage and long tails
+   > clarify = make clear by removing impurities or solids, as by heating; "clarify the butter"; "clarify beer"
+   > chalk talk = a talk that uses a blackboard and chalk
+   > HAZMAT = an abbreviation for `hazardous material' used on warning signs; "NO HAZMATS IN TUNNEL"
+   > teaser = a worker who teases wool
+   > pass = the location in a range of mountains of a geological formation that is lower than the surrounding peaks; "we got through the pass before it started to snow" | mountain pass, notch
+   > Marantaceae = tropical perennial herbs with usually starchy rhizomes | family Marantaceae, arrowroot family
+   > Doctor of Musical Arts = a doctor's degree in musical arts | AMusD
+   > riverbank = the bank of a river | riverside
+⚠️ Step 36479: NaN/Spike detected. Skipping batch.
+🔥 PATHOLOGICAL BATCH at global step 36480:
+   > mycelium = the vegetative part of a fungus consisting of a mass of branching threadlike hyphae
+   > bottleneck = the narrow part of a bottle near the top
+   > stitchwort = low-growing north temperate herb having small white star-shaped flowers; named for its alleged ability to ease sharp pains in the side | greater stitchwort, starwort, Stellaria holostea
+   > fall over = fall forward and down; "The old woman went over without a sound" | go over
+   > skimming = the act of removing floating material from the surface of a liquid
+   > mobile = migratory; "a restless mobile society"; "the nomadic habits of the Bedouins"; "believed the profession of a peregrine typist would have a happy future"; "wandering tribes" | nomadic, peregrine, roving, wandering
+   > voicelessness = having no voice in the management or control of affairs; "the voicelessness of those who live in situations of hopelessness"
+   > little sister = a younger sister
+   > barricade = render unsuitable for passage; "block the way"; "barricade the streets"; "stop the busy road" | block, blockade, stop, block off, block up, bar
+   > nonrepresentative = not standing for something else | unsymbolic
+   > Doha = the capital and chief port of Qatar | Bida, El Beda, capital of Qatar
+   > blink = a reflex that closes and opens the eyes rapidly | eye blink, blinking, wink, winking, nictitation, nictation
+   > silks = the brightly colored garments of a jockey; emblematic of the stable
+   > Louis VII = king of France who led the unsuccessful Second Crusade and fought frequent wars with Henry II of England (1120-1180)
+   > misrepresentation = a misleading falsehood | deceit, deception
+   > cluster bomb = bomb consisting of a canister that is dropped from a plane and that opens to release a cluster of bomblets (usually fragmentation bombs) over a wide area; "cluster bombs cannot be targeted precisely"
+```
+
+```elixir
+test_grad = Nx.broadcast(Nx.tensor(2.0), {256, 32})  # simulate a hot b_v grad
+test_lr = Nx.tensor(0.0002)
+result = DLM.MuonHybrid.muon_update(test_grad, test_lr)
+IO.puts("Update norm: #{result |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()}")
+IO.puts("Input norm:  #{test_grad |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()}")
+# If the fix is working, update norm should be << input norm
+# If they're similar, the scaling isn't happening
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+
+00:30:36.491 [info] Merging Dots in computation: region_1.2
+Update norm: 1.9999995129182935e-4
+Input norm:  181.0193328857422
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```

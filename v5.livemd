@@ -1,0 +1,366 @@
+# V5 Me_Mind
+
+```elixir
+# --- V9 BOOTSTRAP ---
+Mix.install([
+  {:nx, "~> 0.11"},
+  {:exla, "~> 0.11"}
+])
+
+Nx.global_default_backend(EXLA.Backend)
+```
+
+## Section
+
+```elixir
+# --- 1. DATA SETUP (The 625 Deterministic Multiverse) ---
+subjects = ["fox", "cat", "dog", "owl", "bee"]
+adjectives = ["quick", "slow", "fast", "tiny", "lazy"]
+colors = ["brown", "black", "white", "green", "grey"]
+actions = ["jumps", "flies", "leaps", "runs", "walks"]
+
+v4_raw = for s <- subjects, adj <- adjectives, c <- colors, act <- actions do
+  "the #{adj} #{c} #{s} #{act}." |> String.pad_trailing(32, "#")
+end
+
+v4_corpus_tensor = Nx.tensor(Enum.map(v4_raw, &to_charlist/1))
+
+seq_len = 31
+v4_inputs_ids = Nx.slice_along_axis(v4_corpus_tensor, 0, seq_len, axis: 1)
+v4_targets_ids = Nx.slice_along_axis(v4_corpus_tensor, 1, seq_len, axis: 1)
+
+# --- 2. BASE MODULES ---
+defmodule DLM.Training do
+  import Nx.Defn
+  defn softmax(t), do: Nx.exp(t) |> Nx.divide(Nx.sum(Nx.exp(t), axes: [-1], keep_axes: true))
+  defn layer_norm(t) do
+    mean = Nx.mean(t, axes: [-1], keep_axes: true)
+    var = Nx.variance(t, axes: [-1], keep_axes: true)
+    Nx.subtract(t, mean) |> Nx.divide(Nx.sqrt(Nx.add(var, 1.0e-5)))
+  end
+end
+
+defmodule DLM.Positional do
+  def build(seq_len, dim) do
+    positions = Nx.iota({seq_len, 1})
+    div_term = Nx.exp(Nx.multiply(Nx.iota({dim}), -0.05))
+    angles = Nx.multiply(positions, div_term)
+    Nx.add(Nx.sin(angles), Nx.cos(angles)) |> DLM.Training.layer_norm()
+  end
+end
+
+defmodule DLM.Mask do
+  def causal(seq_len) do
+    Nx.iota({seq_len, seq_len})
+    |> Nx.greater_equal(Nx.iota({seq_len, 1}))
+    |> Nx.select(0.0, -1.0e9)
+  end
+end
+
+# --- 3. THE V9.0 PROBABILISTIC INFERENCE MODULE ---
+defmodule DLM.Inference do
+  import Nx.Defn
+  
+  # Added 'imagination_factor' and 'imagination_seed' to the arguments
+  defn predict_next(input_emb, aw1, fw1, aw2, fw2, lm_w, lm_b, mask, imagination_factor, imagination_seed) do
+    x1 = apply_layer(input_emb, aw1, fw1, mask)
+    x2 = apply_layer(x1, aw2, fw2, mask)
+    
+    # --- THE IMAGINATION LAYER ---
+    # We generate a pseudo-random "imagination" vector of the same shape as Layer 2's output.
+    # When imagination_factor is 0.0, this does nothing.
+    # When it's 1.0, it adds "color" to the thoughts.
+    {noise, _} = Nx.Random.normal(imagination_seed, 0.0, 0.5, shape: Nx.shape(x2))
+    imagined_x2 = Nx.add(x2, Nx.multiply(noise, imagination_factor))
+    
+    # Project the "imagined" thoughts to probabilities
+    logits = Nx.dot(imagined_x2 |> DLM.Training.layer_norm(), lm_w) |> Nx.add(lm_b)
+    
+    logits
+    |> Nx.slice_along_axis(Nx.axis_size(logits, 1) - 1, 1, axis: 1)
+    |> DLM.Training.softmax()
+  end
+
+  defn apply_layer(input, aw, fw, mask) do
+    {_b, _s, dim} = Nx.shape(input)
+    transposed = Nx.transpose(input, axes: [0, 2, 1])
+    scores = Nx.dot(input, [2], [0], transposed, [1], [0])
+    masked_scores = Nx.add(Nx.divide(scores, Nx.sqrt(dim)), mask)
+    
+    attn_weights = DLM.Training.softmax(masked_scores)
+    attended = Nx.dot(attn_weights, [2], [0], input, [1], [0])
+    
+    x = Nx.dot(attended, aw) |> DLM.Training.layer_norm()
+    x_res = Nx.add(input, x) 
+    
+    ff = Nx.dot(x_res, fw)
+    ff = Nx.select(Nx.greater(ff, 0), ff, Nx.multiply(ff, 0.01))
+    
+    Nx.add(x_res, ff) |> DLM.Training.layer_norm()
+  end
+end
+
+# --- 4. THE V9.0 CROSS-ENTROPY OPTIMIZER ---
+defmodule DLM.Optimizer do
+  import Nx.Defn
+
+  defn loss(inputs, targets, emb, aw1, fw1, aw2, fw2, lm_w, lm_b, pos, mask) do
+    # 1. Forward Pass
+    x0 = Nx.take(emb, inputs) |> Nx.add(pos)
+    x1 = DLM.Inference.apply_layer(x0, aw1, fw1, mask)
+    x2 = DLM.Inference.apply_layer(x1, aw2, fw2, mask)
+    
+    # 2. LM Head Projection (Output shape: {batch, seq_len, 128})
+    logits = Nx.dot(x2 |> DLM.Training.layer_norm(), lm_w) |> Nx.add(lm_b)
+    probs = DLM.Training.softmax(logits)
+    
+    # 3. Create One-Hot Targets
+    {batch, seq_len} = Nx.shape(targets)
+    vocab_indices = Nx.iota({128})
+    targets_expanded = Nx.reshape(targets, {batch, seq_len, 1})
+    targets_one_hot = Nx.equal(targets_expanded, vocab_indices)
+    
+    # 4. Cross-Entropy Math
+    cross_entropy = Nx.multiply(targets_one_hot, Nx.log(Nx.add(probs, 1.0e-7)))
+    Nx.multiply(Nx.sum(cross_entropy, axes: [-1]), -1.0) |> Nx.mean()
+  end
+
+  defn run_chunk(inputs, targets, e, a1, f1, a2, f2, lmw, lmb, pos, mask, lr, iterations) do
+    {e_out, a1_out, f1_out, a2_out, f2_out, lmw_out, lmb_out, last_loss, _, _, _, _, _, _, _} = 
+      while {e, a1, f1, a2, f2, lmw, lmb, _loss_acc = 0.0, i = 0, inputs, targets, pos, mask, lr, iterations}, i < iterations do
+        
+        {current_loss, {ge, ga1, gf1, ga2, gf2, glmw, glmb}} = 
+          value_and_grad({e, a1, f1, a2, f2, lmw, lmb}, fn {e_in, a1_in, f1_in, a2_in, f2_in, lmw_in, lmb_in} -> 
+            loss(inputs, targets, e_in, a1_in, f1_in, a2_in, f2_in, lmw_in, lmb_in, pos, mask) 
+          end)
+        
+        {
+          Nx.subtract(e, Nx.multiply(ge, Nx.divide(lr, 10))),  # Highly protect embeddings
+          Nx.subtract(a1, Nx.multiply(ga1, Nx.divide(lr, 2))), # Protect Layer 1 grammar
+          Nx.subtract(f1, Nx.multiply(gf1, Nx.divide(lr, 2))),
+          Nx.subtract(a2, Nx.multiply(ga2, Nx.divide(lr, 2))), # Protect Layer 2 grammar
+          Nx.subtract(f2, Nx.multiply(gf2, Nx.divide(lr, 2))),
+          Nx.subtract(lmw, Nx.multiply(glmw, lr)),             # Full throttle for new LM Head!
+          Nx.subtract(lmb, Nx.multiply(glmb, lr)),
+          current_loss, i + 1, inputs, targets, pos, mask, lr, iterations
+        }
+      end
+    
+    {e_out, a1_out, f1_out, a2_out, f2_out, lmw_out, lmb_out, last_loss}
+  end
+end
+
+pos_emb = DLM.Positional.build(seq_len, 256)
+causal_mask = DLM.Mask.causal(seq_len)
+IO.puts("✅ V9.0 Probabilistic Bootstrap Complete. Modules compiled.")
+```
+
+```elixir
+# --- V9.0 POST-BURN RESTORATION ---
+checkpoint_path = Path.join(File.cwd!(), "v9_prob_checkpoint.bin")
+
+{f_emb, f_a1, f_f1, f_a2, f_f2, f_lmw, f_lmb} = 
+  if File.exists?(checkpoint_path) do
+    brain_map = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+    
+    IO.puts("🧠 V9.0 Probabilistic Brain Restored from Checkpoint!")
+    
+    {
+      brain_map.e, 
+      brain_map.a1, 
+      brain_map.f1, 
+      brain_map.a2, 
+      brain_map.f2, 
+      brain_map.lmw, 
+      brain_map.lmb
+    }
+  else
+    raise "Could not find V9 Checkpoint at: #{checkpoint_path}"
+  end
+```
+
+```elixir
+# --- V9.2 IMAGINATION SAMPLER (FIXED KEY SPLIT) ---
+seeds = ["the fast green ", "the tiny black "]
+
+novelty_dial = 0.6 
+temp = 0.8
+key = Nx.Random.key(System.system_time(:millisecond))
+
+IO.puts("--- Running V9.2 Imagination Sampler (Novelty: #{novelty_dial}) ---\n")
+
+Enum.each(seeds, fn seed_text ->
+  seed_ids = seed_text |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+  IO.write("#{seed_text}")
+  
+  Enum.reduce_while(1..25, {seed_ids, key}, fn _i, {acc_ids, k} ->
+    {_, len} = Nx.shape(acc_ids)
+    p_emb = DLM.Positional.build(len, 256)
+    mask = DLM.Mask.causal(len)
+    
+    # Corrected: Splitting the tensor and indexing
+    new_keys = Nx.Random.split(k)
+    dice_key = new_keys[0]
+    imagination_key = new_keys[1]
+    
+    # Pass the imagination arguments to the brain
+    probs = DLM.Inference.predict_next(
+      Nx.add(Nx.take(f_emb, acc_ids), p_emb), 
+      f_a1, f_f1, f_a2, f_f2, f_lmw, f_lmb,
+      mask,
+      novelty_dial,
+      imagination_key
+    ) |> Nx.squeeze()
+
+    # Apply Temperature
+    logits = Nx.log(Nx.add(probs, 1.0e-7)) |> Nx.divide(temp)
+    final_probs = DLM.Training.softmax(logits)
+
+    # Dice roll
+    {next_id_tensor, new_key} = Nx.Random.choice(dice_key, Nx.iota({128}), final_probs)
+    next_id = next_id_tensor |> Nx.squeeze() |> Nx.to_number()
+
+    if next_id == 35 or len >= 31 do
+      {:halt, {acc_ids, new_key}}
+    else
+      if next_id > 31 and next_id < 127, do: IO.write(<<next_id>>)
+      new_acc = Nx.concatenate([acc_ids, Nx.reshape(Nx.tensor([next_id]), {1, 1})], axis: 1)
+      {:cont, {new_acc, new_key}}
+    end
+  end)
+  IO.puts("") 
+end)
+```
+
+```elixir
+# --- V9.0 CHIMERA LOADER ---
+# (Make sure this path points to where your v8_brain_checkpoint.bin is saved!)
+checkpoint_path = Path.join(File.cwd!(), "v8_brain_checkpoint.bin")
+
+{start_emb, start_a1, start_f1, start_a2, start_f2, start_lmw, start_lmb} = 
+  if File.exists?(checkpoint_path) do
+    brain_map = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+    
+    # Fresh Weights for the LM Head (Projecting 256 -> 128)
+    key = Nx.Random.key(42)
+    {lmw_init, _key} = Nx.Random.normal(key, 0.0, 0.02, shape: {256, 128})
+    lmb_init = Nx.tensor(List.duplicate(0.0, 128)) # Biases start at 0
+
+    IO.puts("🧠 V9.0 Architecture Ready!")
+    IO.puts("- Deep Stack: Restored from V8.0 (Chunk 15)")
+    IO.puts("- LM Head: Initialized fresh (Cross-Entropy Mode)")
+    
+    # Extract the 7 variables to the global scope
+    {
+      brain_map.e, 
+      brain_map.a1, 
+      brain_map.f1, 
+      brain_map.a2, 
+      brain_map.f2, 
+      lmw_init, 
+      lmb_init
+    }
+  else
+    raise "Could not find V8 Checkpoint at: #{checkpoint_path}"
+  end
+```
+
+```elixir
+# --- V9.0 THE PROBABILISTIC BURN ---
+max_lr = 0.05  # We can be aggressive with the new LM Head
+min_lr = 0.005
+chunks = 15    # We likely won't even need 20 chunks
+epochs_per_chunk = 300 
+batch_size = 32 
+
+IO.puts("--- Starting V9.0 Probabilistic Burn (Cross-Entropy) ---")
+
+{f_emb, f_a1, f_f1, f_a2, f_f2, f_lmw, f_lmb, _} = 
+  Enum.reduce(1..chunks, {start_emb, start_a1, start_f1, start_a2, start_f2, start_lmw, start_lmb, 0.0}, fn c, {e, a1, f1, a2, f2, lmw, lmb, _} ->
+    current_lr = max_lr - ((max_lr - min_lr) * (c / chunks))
+    
+    indices = Enum.take_random(0..(length(v4_raw) - 1), batch_size) |> Nx.tensor()
+    b_in = Nx.take(v4_inputs_ids, indices) 
+    b_tg = Nx.take(v4_targets_ids, indices) 
+
+    {ne, na1, nf1, na2, nf2, nlmw, nlmb, loss} = 
+       DLM.Optimizer.run_chunk(b_in, b_tg, e, a1, f1, a2, f2, lmw, lmb, pos_emb, causal_mask, current_lr, epochs_per_chunk)
+    
+    l_val = Nx.to_number(loss)
+    
+    # Save V9 Checkpoint
+    if rem(c, 5) == 0 do
+      path = Path.join(File.cwd!(), "v9_prob_checkpoint.bin")
+      safe_checkpoint = %{
+        e: Nx.backend_copy(ne, Nx.BinaryBackend),
+        a1: Nx.backend_copy(na1, Nx.BinaryBackend),
+        f1: Nx.backend_copy(nf1, Nx.BinaryBackend),
+        a2: Nx.backend_copy(na2, Nx.BinaryBackend),
+        f2: Nx.backend_copy(nf2, Nx.BinaryBackend),
+        lmw: Nx.backend_copy(nlmw, Nx.BinaryBackend),
+        lmb: Nx.backend_copy(nlmb, Nx.BinaryBackend)
+      }
+      File.write!(path, :erlang.term_to_binary(safe_checkpoint))
+    end
+
+    # Memory Cleanup (Now tracking 7 weight sets)
+    eb = Nx.backend_copy(ne, Nx.BinaryBackend)
+    a1b = Nx.backend_copy(na1, Nx.BinaryBackend)
+    f1b = Nx.backend_copy(nf1, Nx.BinaryBackend)
+    a2b = Nx.backend_copy(na2, Nx.BinaryBackend)
+    f2b = Nx.backend_copy(nf2, Nx.BinaryBackend)
+    lmwb = Nx.backend_copy(nlmw, Nx.BinaryBackend)
+    lmbb = Nx.backend_copy(nlmb, Nx.BinaryBackend)
+    
+    Nx.backend_deallocate(ne); Nx.backend_deallocate(na1); Nx.backend_deallocate(nf1); 
+    Nx.backend_deallocate(na2); Nx.backend_deallocate(nf2); Nx.backend_deallocate(nlmw);
+    Nx.backend_deallocate(nlmb); Nx.backend_deallocate(loss)
+    :erlang.garbage_collect()
+    
+    IO.puts("Prob Chunk #{c} | Cross-Entropy Loss: #{Float.round(l_val, 6)} | RAM: #{round(:erlang.memory(:total) / 1_000_000)}MB")
+    {eb, a1b, f1b, a2b, f2b, lmwb, lmbb, l_val}
+  end)
+
+IO.puts("\n✅ V9.0 Probabilistic Burn Complete!")
+```
+
+```elixir
+# --- V9.0 FINAL PROBABILISTIC SAMPLER (FIXED SHAPES) ---
+seeds = [
+  "the fast green ",
+  "the slow white ",
+  "the tiny black ",
+  "the lazy brown ",
+  "the quick grey "
+]
+
+IO.puts("--- Running V9.0 Final Probabilistic Sampler ---\n")
+
+Enum.each(seeds, fn seed_text ->
+  seed_ids = seed_text |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+  IO.write("#{seed_text}")
+  
+  Enum.reduce_while(1..25, seed_ids, fn _i, acc_ids ->
+    {_, len} = Nx.shape(acc_ids)
+    p_emb = DLM.Positional.build(len, 256)
+    mask = DLM.Mask.causal(len)
+    
+    probs = DLM.Inference.predict_next(
+      Nx.add(Nx.take(f_emb, acc_ids), p_emb), 
+      f_a1, f_f1, f_a2, f_f2, f_lmw, f_lmb,
+      mask
+    )
+    
+    # COLLAPSE: {1, 1} -> scalar
+    next_id = probs |> Nx.argmax(axis: -1) |> Nx.squeeze() |> Nx.to_number()
+
+    if next_id == 35 or len >= 31 do
+      {:halt, acc_ids}
+    else
+      if next_id > 31 and next_id < 127, do: IO.write(<<next_id>>)
+      {:cont, Nx.concatenate([acc_ids, Nx.reshape(Nx.tensor([next_id]), {1, 1})], axis: 1)}
+    end
+  end)
+  IO.puts("") 
+end)
+```
