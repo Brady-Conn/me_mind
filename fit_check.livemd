@@ -1,0 +1,259 @@
+# Overfit Check
+
+```elixir
+# --- THE ROCKET ENGINE SETUP ---
+Mix.install([
+  {:nx, "~> 0.9"},    # Or whatever your current version is
+  {:exla, "~> 0.9"}   # Must match your Nx version!
+])
+
+# Tell Nx to use EXLA for everything
+Nx.global_default_backend(EXLA.Backend)
+Nx.Defn.global_default_options(compiler: EXLA)
+
+IO.puts("🚀 EXLA Compiler Engaged!")
+```
+
+## Brain
+
+```elixir
+defmodule DLM.Transformer do
+  import Nx.Defn
+
+  defn softmax(x) do
+    max_val = Nx.reduce_max(x, axes: [-1], keep_axes: true)
+    exps = Nx.exp(Nx.subtract(x, max_val))
+    Nx.divide(exps, Nx.sum(exps, axes: [-1], keep_axes: true))
+  end
+
+  defn layer_norm(x, g, b, eps \\ 1.0e-6) do
+    mean = Nx.mean(x, axes: [-1], keep_axes: true)
+    var = Nx.mean(Nx.pow(Nx.subtract(x, mean), 2), axes: [-1], keep_axes: true)
+    x |> Nx.subtract(mean) |> Nx.divide(Nx.sqrt(Nx.add(var, eps))) |> Nx.multiply(g) |> Nx.add(b)
+  end
+
+  defn block(x, a1, f1, a2, f2, mask) do
+    attn_out = attn(x, mask)
+    x = layer_norm(Nx.add(x, attn_out), a1, 0.0)
+    ffn_out = ffn(x, f1, f2)
+    layer_norm(Nx.add(x, ffn_out), a2, 0.0)
+  end
+
+  defn attn(x, mask) do
+    # scores: {Batch, Seq, Seq}
+    # We use [0] for batch axes on both, contracting on the hidden dim [2]
+    scores = Nx.dot(x, [2], [0], x, [2], [0]) 
+             |> Nx.divide(16.0) 
+             |> Nx.add(mask)
+    
+    probs = softmax(scores)
+    
+    # context: {Batch, Seq, Hidden}
+    # Multiply the {S,S} scores by the {S,H} values within the same batch
+    Nx.dot(probs, [2], [0], x, [1], [0])
+  end
+
+  defn ffn(x, f1, f2) do
+    # Simplified: Nx.dot handles the batch/seq dims of x automatically
+    x |> Nx.dot(f1) |> Nx.max(0) |> Nx.dot(f2)
+  end
+end
+
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim))))
+  end
+end
+
+defmodule DLM.Mask do
+  def causal(len) do
+    Nx.iota({len, 1}) |> Nx.less(Nx.iota({1, len})) |> Nx.multiply(-1.0e9)
+  end
+end
+
+defmodule DLM.Optimizer do
+  import Nx.Defn
+
+  # --- LOSS FUNCTIONS ---
+  defn loss_fn(logits, targets) do
+    max_l = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    log_sum_exp = logits 
+                  |> Nx.subtract(max_l) 
+                  |> Nx.exp() 
+                  |> Nx.sum(axes: [-1], keep_axes: true) 
+                  |> Nx.log() 
+                  |> Nx.add(max_l)
+    log_probs = Nx.subtract(logits, log_sum_exp)
+    
+    indices = Nx.reshape(targets, {:auto, 1})
+    flat_log_probs = Nx.reshape(log_probs, {:auto, 128})
+    target_log_probs = Nx.take_along_axis(flat_log_probs, indices, axis: 1)
+    
+    Nx.mean(Nx.multiply(target_log_probs, -1.0))
+  end
+
+  defn loss_fn_with_muzzle(logits, targets, muzzle) do
+    masked_logits = Nx.add(logits, muzzle)
+    loss_fn(masked_logits, targets) # Reusing standard loss logic after applying muzzle
+  end
+
+  # --- ADAM CORE MATH ---
+  defn adam_update(w, grad, m, v, step, lr) do
+    beta1 = 0.9
+    beta2 = 0.999
+    epsilon = 1.0e-8
+
+    # Update momentum and velocity
+    m_new = Nx.add(Nx.multiply(beta1, m), Nx.multiply(1.0 - beta1, grad))
+    v_new = Nx.add(Nx.multiply(beta2, v), Nx.multiply(1.0 - beta2, Nx.pow(grad, 2)))
+
+    # Bias correction (prevents Adam from being too slow at step 1)
+    m_hat = Nx.divide(m_new, Nx.subtract(1.0, Nx.pow(beta1, step)))
+    v_hat = Nx.divide(v_new, Nx.subtract(1.0, Nx.pow(beta2, step)))
+
+    # Update weights
+    w_new = Nx.subtract(w, Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), epsilon))))
+
+    {w_new, m_new, v_new}
+  end
+
+  # --- ADAM TRAINING STEP ---
+  defn adam_step(ins, tgs, params, m_state, v_state, pos, mask, lr, step) do
+    # Unpack the states
+    {e, a1, f1, a2, f2, lmw, lmb} = params
+    {m_e, m_a1, m_f1, m_a2, m_f2, m_lmw, m_lmb} = m_state
+    {v_e, v_a1, v_f1, v_a2, v_f2, v_lmw, v_lmb} = v_state
+
+    # Forward pass and gradient calculation
+    {loss, grads} = value_and_grad(params, fn {ce, ca1, cf1, ca2, cf2, clmw, clmb} ->
+      x = Nx.add(Nx.take(ce, ins), pos)
+      x = DLM.Transformer.block(x, ca1, cf1, ca2, cf2, mask)
+      logits = Nx.add(Nx.dot(x, clmw), clmb)
+      
+      loss_fn(logits, tgs)
+    end)
+
+    {ge, ga1, gf1, ga2, gf2, glmw, glmb} = grads
+
+    # Apply Adam updates to every parameter
+    {ne, nm_e, nv_e} = adam_update(e, ge, m_e, v_e, step, lr)
+    {na1, nm_a1, nv_a1} = adam_update(a1, ga1, m_a1, v_a1, step, lr)
+    {nf1, nm_f1, nv_f1} = adam_update(f1, gf1, m_f1, v_f1, step, lr)
+    {na2, nm_a2, nv_a2} = adam_update(a2, ga2, m_a2, v_a2, step, lr)
+    {nf2, nm_f2, nv_f2} = adam_update(f2, gf2, m_f2, v_f2, step, lr)
+    {nlmw, nm_lmw, nv_lmw} = adam_update(lmw, glmw, m_lmw, v_lmw, step, lr)
+    {nlmb, nm_lmb, nv_lmb} = adam_update(lmb, glmb, m_lmb, v_lmb, step, lr)
+
+    # Repack the states
+    new_params = {ne, na1, nf1, na2, nf2, nlmw, nlmb}
+    new_m = {nm_e, nm_a1, nm_f1, nm_a2, nm_f2, nm_lmw, nm_lmb}
+    new_v = {nv_e, nv_a1, nv_f1, nv_a2, nv_f2, nv_lmw, nv_lmb}
+
+    {new_params, new_m, new_v, loss}
+  end
+
+  # (Standard multi_step and multi_step_with_muzzle remain unchanged below if you still need them)
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## test
+
+```elixir
+# --- THE OVERFIT SANDBOX (ADAM UPGRADE) ---
+
+seq_len = 32
+vocab_size = 128
+batch_size = 10
+
+raw_words = [
+  "[W]ELIXIR[T]n.", "[W]COMPUTER[T]n.", "[W]LEATHER[T]n.", 
+  "[W]ASCEND[T]v.", "[W]MITHRIL[T]n.", "[W]GAMBIT[T]n.", 
+  "[W]STATISTIC[T]n.", "[W]AARDVARK[T]n.", "[W]ZEPHYR[T]n.", "[W]QUARTZ[T]n."
+]
+
+padded_data = Enum.map(raw_words, fn w -> 
+  String.pad_trailing(w, seq_len + 1, " ") |> String.to_charlist()
+end)
+tensor_data = Nx.tensor(padded_data)
+ins = Nx.slice_along_axis(tensor_data, 0, seq_len, axis: 1)
+tgs = Nx.slice_along_axis(tensor_data, 1, seq_len, axis: 1)
+
+# --- ADAM HYPERPARAMETERS ---
+lr = 0.003    # Adam works best with slightly smaller learning rates
+epochs = 500  # We only need a fraction of the time now!
+
+IO.puts("🔍 Reading blueprint from Phase 1 brain...")
+blueprint = File.read!("v12_phase1_spelling.bin") |> :erlang.binary_to_term()
+
+init_param = fn shape, key, default_1d ->
+  if shape == {256} do
+    {Nx.broadcast(Nx.tensor(default_1d, type: :f32), shape), key}
+  else
+    Nx.Random.normal(key, 0.0, 0.02, shape: shape)
+  end
+end
+
+key = Nx.Random.key(42)
+{e, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {vocab_size, 256})
+{a1, key} = init_param.(Nx.shape(blueprint.a1), key, 1.0)
+{f1, key} = init_param.(Nx.shape(blueprint.f1), key, 0.0)
+{a2, key} = init_param.(Nx.shape(blueprint.a2), key, 1.0)
+{f2, key} = init_param.(Nx.shape(blueprint.f2), key, 0.0)
+{lmw, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {256, vocab_size})
+lmb = Nx.broadcast(Nx.tensor(0.0), {vocab_size})
+
+# Bundle params
+params = {e, a1, f1, a2, f2, lmw, lmb}
+
+# Initialize Adam States (All zeros, matching the shape of each parameter)
+zero_like = fn tensor -> Nx.broadcast(Nx.tensor(0.0), Nx.shape(tensor)) end
+m_state = {zero_like.(e), zero_like.(a1), zero_like.(f1), zero_like.(a2), zero_like.(f2), zero_like.(lmw), zero_like.(lmb)}
+v_state = m_state 
+
+pos_emb = DLM.Positional.build(seq_len, 256)
+mask = DLM.Mask.causal(seq_len)
+
+IO.puts("🚀 Launching Adam Sanity Check...")
+
+# THE ADAM BURN
+initial_acc = {params, m_state, v_state}
+{final_params, _, _} = Enum.reduce(1..epochs, initial_acc, fn step, {p_acc, m_acc, v_acc} ->
+  
+  {new_p, new_m, new_v, loss} = 
+    DLM.Optimizer.adam_step(ins, tgs, p_acc, m_acc, v_acc, pos_emb, mask, lr, step)
+  
+  if rem(step, 50) == 0 do
+    IO.puts("Step #{step}/#{epochs} | Loss: #{Float.round(Nx.to_number(loss), 4)}")
+  end
+  
+  {new_p, new_m, new_v}
+end)
+
+# THE ADAM EXAM
+{fe, fa1, ff1, fa2, ff2, flmw, flmb} = final_params
+IO.puts("\n🎓 --- Adam Overfit Exam Results ---")
+
+seeds = ["[W]ELIX", "[W]COMP", "[W]LEAT", "[W]ASCE", "[W]MITH", "[W]GAMB", "[W]STAT", "[W]AARD", "[W]ZEPH", "[W]QUAR"]
+
+Enum.each(seeds, fn seed_text ->
+  curr_ids = seed_text |> to_charlist() |> Nx.tensor() |> Nx.reshape({1, :auto})
+  
+  sample = Enum.reduce(1..15, curr_ids, fn _, acc ->
+    {_, len} = Nx.shape(acc)
+    curr_pos = Nx.slice(pos_emb, [0, 0], [len, 256])
+    x = Nx.add(Nx.take(fe, acc), curr_pos)
+    x = DLM.Transformer.block(x, fa1, ff1, fa2, ff2, DLM.Mask.causal(len))
+    logits = Nx.add(Nx.dot(x[0][-1], flmw), flmb)
+    
+    next_id = logits |> Nx.argmax() |> Nx.reshape({1, 1})
+    Nx.concatenate([acc, next_id], axis: 1)
+  end)
+
+  result = sample |> Nx.to_flat_list() |> List.to_string() |> String.trim()
+  IO.puts("#{String.pad_trailing(seed_text, 10)} -> #{result}")
+end)
+```

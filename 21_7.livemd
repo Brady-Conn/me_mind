@@ -1,0 +1,1479 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# V21 .7 (forked from v21) - fork - fork
+
+```elixir
+# ===========================================================================
+# V20-BB Setup
+# ===========================================================================
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+System.put_env("XLA_CLIENT_MEM_FRACTION", "0.75")
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")        # ← disables the Merging Dots pass
+System.put_env("XLA_FLAGS", "--xla_gpu_enable_reassociation_for_converted_ar=false")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"}
+])
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+
+
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## USSM, Positional, Muon_Optimizer
+
+```elixir
+defmodule DLM.UniversalSSM do
+  import Nx.Defn
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn softplus(x), do: Nx.log1p(Nx.exp(x))
+  defn silu(x), do: x * Nx.sigmoid(x)
+
+  defn apply_svd_weight(x, u, v) do
+    x |> Nx.dot(u) |> silu() |> Nx.dot(v)
+  end
+
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2) do
+    # unchanged — a is now passed in per-loop rather than shared
+    x_mixed = x_t
+      |> Nx.add(apply_svd_weight(x_p1, mu1, mv1))
+      |> Nx.add(apply_svd_weight(x_p2, mu2, mv2))
+    delta_proj = apply_svd_weight(x_mixed, du, dv)
+    delta      = softplus(delta_proj)
+    a_bar      = Nx.sigmoid(Nx.multiply(delta, a))
+    b_proj     = apply_svd_weight(x_mixed, bu, bv)
+    b_bar      = Nx.multiply(delta, b_proj)
+    h_t        = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    y_ssm      = apply_svd_weight(h_t, cu, cv)
+    y_t        = Nx.add(y_ssm, x_mixed)
+    {y_t, h_t}
+  end
+
+  defn run_ssm_loop(x_seq_first, h_init, a_diag, params) do
+    {_emb, _a1, _a2, b_u, b_v, c_u, c_v, delta_u, delta_v,
+     mx_u1, mx_v1, mx_u2, mx_v2, _lm_w, _lm_b} = params
+
+    {seq_len, batch_size, embed_dim} = Nx.shape(x_seq_first)
+    y_init    = Nx.broadcast(Nx.tensor(0.0, type: :f32), {seq_len, batch_size, embed_dim})
+    zero_frame = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+
+    result_tuple =
+      while {i = 0, y_acc = y_init, h_p = h_init,
+             x_prev1 = zero_frame,
+             x_prev2 = zero_frame,
+             xs = x_seq_first,
+             a = a_diag, bu = b_u, bv = b_v, cu = c_u, cv = c_v,
+             du = delta_u, dv = delta_v,
+             mu1 = mx_u1, mv1 = mx_v1, mu2 = mx_u2, mv2 = mx_v2},
+            Nx.less(i, seq_len) do
+
+        x_t = xs[i]
+        {y_t, h_new} = ssm_recurrence(
+          x_t, x_prev1, x_prev2, h_p,
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+        )
+        y_acc_new = Nx.put_slice(y_acc, [i, 0, 0], Nx.new_axis(y_t, 0))
+        {i + 1, y_acc_new, h_new, x_t, x_prev1,
+         xs, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2}
+      end
+
+    elem(result_tuple, 1)
+  end
+
+  defn forward(indices, params, pos_emb) do
+    {embed, a_diag1, a_diag2, _bu, _bv, _cu, _cv, _du, _dv,
+     _mu1, _mv1, _mu2, _mv2, lm_w, lm_b} = params
+
+    x_input = Nx.take(embed, indices) + pos_emb
+    x_norm  = rms_norm(x_input)
+
+    {batch_size, _seq_len, embed_dim} = Nx.shape(x_norm)
+    h_init = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+    x_seq_first = Nx.transpose(x_norm, axes: [1, 0, 2])
+
+    # Each loop now gets its own independent a_diag
+    y1_seq = run_ssm_loop(x_seq_first, h_init, a_diag1, params)
+    y2_seq = run_ssm_loop(y1_seq,      h_init, a_diag2, params)
+
+    y_out   = Nx.transpose(y2_seq, axes: [1, 0, 2])
+    y_final = rms_norm(y_out)
+    Nx.dot(y_final, lm_w) + lm_b
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.UniversalSSM, <<70, 79, 82, 49, 0, 0, 49, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  # --- The Muon Newton-Schulz Engine ---
+  defn newton_schulz(g, iters \\ 5) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) + 1.0e-7
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, iters) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_update(grad, lr) do
+    Nx.subtract(0.0, Nx.multiply(lr, newton_schulz(grad)))
+  end
+
+  # --- Standard Adam Component ---
+  defn adam_update(param, grad, m, v, step, lr) do
+    # ⚡ THE FIX: Adam internally ensures the step is at least 1.0 to prevent division by zero
+    safe_step = step + 1.0
+
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  # --- The Hybrid Step ---
+  defn step(params, grads, ms, vs, step_count, lr) do
+    {p_emb, p_a1, p_a2, p_bu, p_bv, p_cu, p_cv, p_du, p_dv,
+      p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = params
+  
+    {g_emb, g_a1, g_a2, g_bu, g_bv, g_cu, g_cv, g_du, g_dv,
+      g_mu1, g_mv1, g_mu2, g_mv2, g_lmw, g_lmb} = grads
+  
+    {m_emb, m_a1, m_a2, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+      m_mu1, m_mv1, m_mu2, m_mv2, m_lmw, m_lmb} = ms
+  
+    {v_emb, v_a1, v_a2, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+      v_mu1, v_mv1, v_mu2, v_mv2, v_lmw, v_lmb} = vs
+  
+    # Adam for scalars and vocab tensors — now two a_diag entries
+    {up_emb, nm_emb, nv_emb} = adam_update(p_emb, g_emb, m_emb, v_emb, step_count, lr)
+    {up_a1,  nm_a1,  nv_a1}  = adam_update(p_a1,  g_a1,  m_a1,  v_a1,  step_count, lr)
+    {up_a2,  nm_a2,  nv_a2}  = adam_update(p_a2,  g_a2,  m_a2,  v_a2,  step_count, lr)
+    {up_lmw, nm_lmw, nv_lmw} = adam_update(p_lmw, g_lmw, m_lmw, v_lmw, step_count, lr)
+    {up_lmb, nm_lmb, nv_lmb} = adam_update(p_lmb, g_lmb, m_lmb, v_lmb, step_count, lr)
+  
+    # Muon for all SVD matrices — unchanged
+    up_bu  = p_bu  + muon_update(g_bu,  lr)
+    up_bv  = p_bv  + muon_update(g_bv,  lr)
+    up_cu  = p_cu  + muon_update(g_cu,  lr)
+    up_cv  = p_cv  + muon_update(g_cv,  lr)
+    up_du  = p_du  + muon_update(g_du,  lr)
+    up_dv  = p_dv  + muon_update(g_dv,  lr)
+    up_mu1 = p_mu1 + muon_update(g_mu1, lr)
+    up_mv1 = p_mv1 + muon_update(g_mv1, lr)
+    up_mu2 = p_mu2 + muon_update(g_mu2, lr)
+    up_mv2 = p_mv2 + muon_update(g_mv2, lr)
+  
+    new_params = {up_emb, up_a1, up_a2, up_bu, up_bv, up_cu, up_cv, up_du, up_dv,
+                  up_mu1, up_mv1, up_mu2, up_mv2, up_lmw, up_lmb}
+  
+    new_ms = {nm_emb, nm_a1, nm_a2, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+              m_mu1, m_mv1, m_mu2, m_mv2, nm_lmw, nm_lmb}
+  
+    new_vs = {nv_emb, nv_a1, nv_a2, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+              v_mu1, v_mv1, v_mu2, v_mv2, nv_lmw, nv_lmb}
+  
+    {new_params, new_ms, new_vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.MuonHybrid, <<70, 79, 82, 49, 0, 0, 42, ...>>, true}
+```
+
+```elixir
+defmodule DLM.V21_7Genesis do
+  @vocab_size 128
+  @dim 256
+  @rank 32
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    {embed,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@vocab_size, @dim})
+    # Two independent a_diag parameters — one per SSM loop
+    {a_diag1, key} = Nx.Random.normal(key, 0.0, 1.0,  shape: {@dim})
+    {a_diag2, key} = Nx.Random.normal(key, 0.0, 1.0,  shape: {@dim})
+    {b_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {b_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {c_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {c_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {d_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {d_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {lm_w,   key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @vocab_size})
+    {lm_b,  _key} = Nx.Random.normal(key, 0.0, 0.0,  shape: {@vocab_size})
+
+    {embed, a_diag1, a_diag2, b_u, b_v, c_u, c_v, d_u, d_v,
+     mx_u1, mx_v1, mx_u2, mx_v2, lm_w, lm_b}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    vs = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    {ms, vs, 1}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.V21_7Genesis, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inference
+
+```elixir
+defmodule DLM.InferenceV21 do
+  import Nx.Defn
+
+  @allowed_chars ~c" abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,:;-'\"()[]"
+
+  def build_muzzle(vocab_size \\ 128, allowed \\ @allowed_chars) do
+    muzzle = Nx.broadcast(Nx.tensor(-1.0e10, type: :f32), {vocab_size})
+    Enum.reduce(allowed, muzzle, fn char, acc ->
+      Nx.indexed_put(acc, Nx.tensor([[char]]), Nx.tensor([0.0]))
+    end)
+  end
+
+  defn get_next_logits(ins_padded, actual_len_tensor, params, pos_emb, muzzle) do
+    logits = DLM.UniversalSSM.forward(ins_padded, params, pos_emb)
+    target_idx = actual_len_tensor - 1
+    logits[0][target_idx] + muzzle
+  end
+
+  defn apply_rep_penalty(logits, recent_tokens, penalty_weight) do
+    vocab_size = elem(Nx.shape(logits), 0)
+    mask =
+      recent_tokens
+      |> Nx.new_axis(-1)
+      |> Nx.equal(Nx.iota({vocab_size}))
+      |> Nx.any(axes: [0])
+    penalized = Nx.select(logits > 0.0, logits / penalty_weight, logits * penalty_weight)
+    Nx.select(mask, penalized, logits)
+  end
+
+  def top_k(params, pos_emb, prompt, max_new_chars \\ 120, k \\ 3, temp \\ 0.4, muzzle \\ nil) do
+    gpu = {EXLA.Backend, client: :rocm}
+    muzzle = (muzzle || build_muzzle()) |> Nx.backend_copy(gpu)
+    prompt_chars = String.to_charlist(prompt)
+    max_seq = elem(Nx.shape(pos_emb), 0)
+    penalty_weight = Nx.tensor(1.2, type: :f32) |> Nx.backend_copy(gpu)
+
+    Enum.reduce(1..max_new_chars, {prompt_chars, Nx.Random.key(42)}, fn step, {chars, key} ->
+      window_chars = Enum.take(chars, -max_seq)
+      actual_len = length(window_chars)
+      pad_len = max_seq - actual_len
+      padded_chars = window_chars ++ List.duplicate(0, pad_len)
+
+      ins_padded = Nx.tensor([padded_chars], type: :s32) |> Nx.backend_copy(gpu)
+      len_tensor = Nx.tensor(actual_len, type: :s32)     |> Nx.backend_copy(gpu)
+
+      logits = get_next_logits(ins_padded, len_tensor, params, pos_emb, muzzle)
+
+      recent_tensor = chars |> Enum.take(-50) |> Nx.tensor(type: :s32) |> Nx.backend_copy(gpu)
+      penalized = apply_rep_penalty(logits, recent_tensor, penalty_weight)
+
+      {next_token, next_key} = sample_top_k_logits(penalized, temp, key, k: k)
+      if rem(step, 10) == 0, do: :erlang.garbage_collect(self())
+      {chars ++ [Nx.to_number(next_token)], next_key}
+    end)
+    |> elem(0)
+    |> List.to_string()
+  end
+
+  defn sample_top_k_logits(logits, temp, key, opts \\ []) do
+    k = opts[:k]
+    scaled = logits / temp
+    {values, indices} = Nx.top_k(scaled, k: k)
+    probs = Nx.exp(values) / Nx.sum(Nx.exp(values))
+    {sample_val, next_key} = Nx.Random.uniform(key)
+    cumulative = probs |> Nx.window_sum({k}, padding: :valid) |> Nx.squeeze()
+    selected_idx = Nx.argmax(cumulative > sample_val)
+    {indices[selected_idx], next_key}
+  end
+
+  def greedy(params, pos_emb, prompt, max_new_chars) do
+    gpu = {EXLA.Backend, client: :rocm}
+    # Build muzzle so it doesn't output illegal characters
+    muzzle = build_muzzle() |> Nx.backend_copy(gpu)
+    prompt_chars = String.to_charlist(prompt)
+    max_seq = elem(Nx.shape(pos_emb), 0)
+
+    # The Autoregressive Loop
+    final_tokens = Enum.reduce(1..max_new_chars, prompt_chars, fn step, chars ->
+      # Windowing and padding to keep shapes perfectly stable at [1, 256]
+      window_chars = Enum.take(chars, -max_seq)
+      actual_len = length(window_chars)
+      pad_len = max_seq - actual_len
+      padded_chars = window_chars ++ List.duplicate(0, pad_len)
+
+      ins_padded = Nx.tensor([padded_chars], type: :s32) |> Nx.backend_copy(gpu)
+      len_tensor = Nx.tensor(actual_len, type: :s32) |> Nx.backend_copy(gpu)
+
+      # 🧠 Forward pass utilizing the exact same highly-optimized defn as top_k
+      logits = get_next_logits(ins_padded, len_tensor, params, pos_emb, muzzle)
+
+      # 🎯 GREEDY MATH: Just grab the absolute highest probability index
+      next_token = Nx.argmax(logits) |> Nx.to_number()
+
+      if rem(step, 10) == 0, do: :erlang.garbage_collect(self())
+
+      chars ++ [next_token]
+    end)
+
+    # NATIVELY convert the integer list back to a viewable string
+    final_tokens
+    |> Enum.map(&max(0, min(&1, 127)))
+    |> List.to_string()
+  end
+end
+
+IO.puts("✅ DLM.InferenceV21 loaded")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+✅ DLM.InferenceV21 loaded
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# 🔍 DYNAMIC CHECKPOINT FINDER
+latest_checkpoint = 
+  Path.wildcard("v21_7_*.bin")
+  |> Enum.reject(&String.contains?(&1, "data.bin"))
+  |> Enum.max_by(fn path -> File.stat!(path).mtime end, fn -> nil end)
+
+IO.puts("🧠 Loading Weights from: #{latest_checkpoint}")
+checkpoint = File.read!(latest_checkpoint) |> :erlang.binary_to_term()
+
+gpu = {EXLA.Backend, client: :rocm}
+params = checkpoint.params |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy(gpu)
+
+# 🧪 THE PROMPT SUITE
+prompts = [
+  {"Standard Definition", "[W]Algorithm[T]n.[D]"},
+  {"Phonetic Invention", "[W]Chronoflux[T]n.[D]"},
+  {"Conversational Semantic", "Good morning BigBrain! How are you today?"},
+  {"Jeopardy Style (Reverse)", "[D]A mathematical process for solving a problem.[W]"}
+]
+
+IO.puts("\n✨ IGNITING INFERENCE ENGINE...\n")
+
+Enum.each(prompts, fn {test_name, text} ->
+  IO.puts(String.duplicate("=", 60))
+  IO.puts("🧪 TEST: #{test_name}")
+  IO.puts("📝 PROMPT: #{text}\n")
+  
+  # 🎯 1. GREEDY DECODING
+  greedy_out = DLM.InferenceV21.greedy(params, pos_emb, text, 120)
+  IO.puts("🎯 GREEDY (Highest Confidence):\n#{greedy_out}\n")
+
+  # 🎲 2. TOP-K DECODING
+  top_k_out = DLM.InferenceV21.top_k(params, pos_emb, text, 120, 3, 0.5)
+  IO.puts("🎲 TOP-K (Creative, k=3, t=0.5):\n#{top_k_out}\n")
+end)
+
+IO.puts(String.duplicate("=", 60))
+IO.puts("🏁 INFERENCE SUITE COMPLETE.")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Loading Weights from: v21_5_auto_step36000.bin
+
+✨ IGNITING INFERENCE ENGINE...
+
+============================================================
+🧪 TEST: Standard Definition
+📝 PROMPT: [W]Algorithm[T]n.[D]
+
+
+23:16:27.892 [warning] No reference output found even though buffer checking was requested while autotuning
+🎯 GREEDY (Highest Confidence):
+[W]Algorithm[T]n.[D] of a the seres a per the ses a the serer the the seres and and the the peres of a peres an and the the seres and and an
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+[W]Algorithm[T]n.[D] and and the per and the ses a the serer the ser the serer of a ser and the the the sice of a the st the seres and and t
+
+============================================================
+🧪 TEST: Phonetic Invention
+📝 PROMPT: [W]Chronoflux[T]n.[D]
+
+🎯 GREEDY (Highest Confidence):
+[W]Chronoflux[T]n.[D] of a the seres a the ses a s and and and and a the serer of a ser an and the the seres an and the the seres and and and
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+[W]Chronoflux[T]n.[D] and the sing and and a per an of the the seand the serer of a ser an and the the sic and and the the seres and and and 
+
+============================================================
+🧪 TEST: Conversational Semantic
+📝 PROMPT: Good morning BigBrain! How are you today?
+
+🎯 GREEDY (Highest Confidence):
+Good morning BigBrain! How are you today?"; "the sere the ser and and the serer an an a the peres of a peres an and the the seres and and and an and the the of t
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+Good morning BigBrain! How are you today?"; "he pere the seres and a the serer of a ser an and the the sic and and the the seres and and and to the per the peric
+
+============================================================
+🧪 TEST: Jeopardy Style (Reverse)
+📝 PROMPT: [D]A mathematical process for solving a problem.[W]
+
+🎯 GREEDY (Highest Confidence):
+[D]A mathematical process for solving a problem.[W] whe serer the the seres and and the the peres of a peres an and the the seres and and and an and the the of the s a s o
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+[D]A mathematical process for solving a problem.[W] whe serer the the seres and and the the poresting a s a peric to the the seres and and the the per the pering and a s o
+
+============================================================
+🏁 INFERENCE SUITE COMPLETE.
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Stream
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 13, ...>>, {:stream, 3}}
+```
+
+```elixir
+defmodule DLM.DataBuilder do
+  @rank 32
+  @dim 256
+  @seq_len 256
+  @pad_token 0
+  @eos_token 3        # ASCII ETX — signals clean end of entry
+  @min_content_chars 64   # discard chunks that are mostly padding
+
+  @doc """
+  Takes a list of file paths, combines them, shuffles the lines 
+  to prevent overfitting, and builds the static training tensors.
+  """
+  def build_combined_tensors(file_paths) when is_list(file_paths) do
+    raw_lines =
+      Enum.flat_map(file_paths, fn path ->
+        File.stream!(path)
+        |> Stream.map(&String.trim/1)
+        |> Stream.reject(&String.starts_with?(&1, "  "))
+        |> Enum.to_list()
+      end)
+  
+    shuffled_lines = Enum.shuffle(raw_lines)
+  
+    shuffled_lines
+    |> Enum.flat_map(&parse_synset/1)   # flat_map since each line now yields 1..N chunks
+    |> Enum.reject(&is_nil/1)
+    |> Nx.tensor(type: :s32)
+  end
+
+  defp parse_synset(line) do
+    case String.split(line, " | ") do
+      [data_chunk, gloss] ->
+        tokens = String.split(data_chunk, " ", trim: true)
+        w_cnt  = String.to_integer(Enum.at(tokens, 3), 16)
+  
+        words =
+          Enum.reduce(0..(w_cnt - 1), [], fn i, acc ->
+            word_index = 4 + (i * 2)
+            raw_word   = Enum.at(tokens, word_index)
+            [String.replace(raw_word, "_", " ") | acc]
+          end)
+          |> Enum.reverse()
+  
+        [main_word | synonyms] = words
+  
+        base_entry =
+          if Enum.empty?(synonyms) do
+            "#{main_word} = #{gloss}"
+          else
+            "#{main_word} = #{gloss} | #{Enum.join(synonyms, ", ")}"
+          end
+  
+        # No more synonym cross-reference entries — just chunk the main entry
+        chunk_entry(base_entry)
+  
+      _ -> []
+    end
+  end
+  
+  
+
+  defp chunk_entry(str) do
+    chars = String.to_charlist(str <> <<@eos_token>>)
+    total = length(chars)
+  
+    if total <= @seq_len do
+      padded = chars ++ List.duplicate(@pad_token, @seq_len - total)
+      # Only keep if there's enough real content
+      if total >= @min_content_chars, do: [padded], else: []
+    else
+      overlap = 64  # increased from 32 to reduce boundary artifacts
+      step    = @seq_len - overlap
+  
+      0
+      |> Stream.iterate(&(&1 + step))
+      |> Stream.take_while(&(&1 < total))
+      |> Enum.map(fn offset ->
+        raw_window = Enum.slice(chars, offset, @seq_len)
+  
+        # Snap to nearest space so we don't cut mid-word
+        snapped_window =
+          if length(raw_window) == @seq_len do
+            # Find last space in window and trim there
+            last_space =
+              raw_window
+              |> Enum.with_index()
+              |> Enum.filter(fn {c, _} -> c == ?\s end)
+              |> List.last()
+  
+            case last_space do
+              {_, idx} -> Enum.take(raw_window, idx + 1)
+              nil      -> raw_window  # no space found, keep as-is
+            end
+          else
+            raw_window
+          end
+  
+        content_len = length(snapped_window)
+        # Discard near-empty tail chunks
+        if content_len >= @min_content_chars do
+          pad_len = @seq_len - content_len
+          snapped_window ++ List.duplicate(@pad_token, pad_len)
+        else
+          nil
+        end
+      end)
+      |> Enum.reject(&is_nil/1)
+    end
+  end
+
+  defp format_to_tensor(raw_str) do
+    chars = String.to_charlist(raw_str)
+    actual_len = length(chars)
+
+    cond do
+      actual_len == @seq_len -> 
+        chars
+      actual_len > @seq_len -> 
+        Enum.take(chars, @seq_len)
+      actual_len < @seq_len -> 
+        chars ++ List.duplicate(@pad_token, @seq_len - actual_len)
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+warning: function format_to_tensor/1 is unused
+└─ 21_7.livemd#cell:txpbbqibc3zd2mkg:93: DLM.DataBuilder (module)
+
+warning: module attribute @dim was set but never used
+└─ 21_7.livemd#cell:txpbbqibc3zd2mkg:3: DLM.DataBuilder (module)
+
+warning: module attribute @rank was set but never used
+└─ 21_7.livemd#cell:txpbbqibc3zd2mkg:2: DLM.DataBuilder (module)
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataBuilder, <<70, 79, 82, 49, 0, 0, 26, ...>>, {:format_to_tensor, 1}}
+```
+
+```elixir
+# In your Init cell, BEFORE building tensors
+Nx.global_default_backend(Nx.BinaryBackend)  # ← force CPU for dataset creation
+
+files = ["data.noun", "data.verb", "data.adj", "data.adv"]
+IO.puts("Parsing WordNet and shuffling dataset...")
+training_tensors = DLM.DataBuilder.build_combined_tensors(files)
+
+# Verify it's on CPU before saving
+# IO.puts("Backend: #{inspect(Nx.backend(training_tensors))}")  # should show BinaryBackend
+
+binary_data = :erlang.term_to_binary(training_tensors)
+File.write!("bigbrain_phase1_data.bin", binary_data)
+IO.puts("Done!")
+
+# Restore GPU as default after saving
+Nx.global_default_backend({EXLA.Backend, client: :rocm})
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Parsing WordNet and shuffling dataset...
+Done!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{Nx.BinaryBackend, []}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.V21_7Trainer do
+  import Nx.Defn
+
+  def grad_norms(grads) do
+  names = ~w[embed a_diag1 a_diag2 b_u b_v c_u c_v d_u d_v mx_u1 mx_v1 mx_u2 mx_v2 lm_w lm_b]
+    grads
+    |> Tuple.to_list()
+    |> Enum.zip(names)
+    |> Enum.map(fn {g, name} ->
+      norm = g |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+      {name, Float.round(norm, 4)}
+    end)
+  end
+
+  defn log_softmax(logits) do
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = logits - max_logits
+    sum_exp = Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)
+    safe_logits - Nx.log(sum_exp)
+  end
+
+  defn compute_loss(preds_sliced, targets) do
+    log_probs = log_softmax(preds_sliced)
+    target_probs = Nx.take_along_axis(log_probs, Nx.new_axis(targets, -1), axis: -1)
+    target_probs = Nx.squeeze(target_probs, axes: [-1])
+    mask = Nx.not_equal(targets, 0) |> Nx.as_type(:f32)
+  
+    # Guard against near-empty batches — require at least 10% real content
+    total_tokens = Nx.sum(mask)
+    min_tokens   = Nx.tensor(0.1 * 255.0 * 16.0, type: :f32)  # 10% of batch
+    safe_denom   = Nx.max(total_tokens, min_tokens)
+  
+    masked_loss = -target_probs * mask
+    Nx.sum(masked_loss) / safe_denom
+  end
+
+  defn compute_grad(params, pos_emb, batch) do
+    {loss, grads} = value_and_grad(params, fn p ->
+      batch_s32 = Nx.as_type(batch, :s32)
+      preds = DLM.UniversalSSM.forward(batch_s32, p, pos_emb)
+      preds_sliced = Nx.slice_along_axis(preds, 0, 255, axis: 1)
+      targets = Nx.slice_along_axis(batch_s32, 1, 255, axis: 1)
+      compute_loss(preds_sliced, targets)
+    end)
+  
+    {g0, g1, g2, g3, g4, g5, g6, g7, g8, g9, g10, g11, g12, g13, g14} = grads
+  
+    global_norm =
+      Nx.sum(Nx.pow(g0, 2))
+      |> Nx.add(Nx.sum(Nx.pow(g1, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g2, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g3, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g4, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g5, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g6, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g7, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g8, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g9, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g10, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g11, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g12, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g13, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g14, 2)))
+      |> Nx.sqrt()
+  
+    max_norm = 1.0
+    scale = Nx.min(1.0, max_norm / (global_norm + 1.0e-6))
+  
+    clipped_grads = {
+      g0  * scale, g1  * scale, g2  * scale,
+      g3  * scale, g4  * scale, g5  * scale,
+      g6  * scale, g7  * scale, g8  * scale,
+      g9  * scale, g10 * scale, g11 * scale,
+      g12 * scale, g13 * scale, g14 * scale
+    }
+  
+    {loss, clipped_grads}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.V21_7Trainer, <<70, 79, 82, 49, 0, 0, 32, ...>>, true}
+```
+
+```elixir
+IO.puts("🧠 Loading Dataset into CPU Memory...")
+full_dataset = File.read!("bigbrain_phase1_data.bin") 
+  |> :erlang.binary_to_term()
+  |> Nx.backend_copy(Nx.BinaryBackend)
+
+dataset_size = Nx.axis_size(full_dataset, 0)
+batch_size = 16
+total_steps_per_epoch = div(dataset_size, batch_size)
+
+max_epochs = 10
+save_interval = 1000
+base_lr = 3.0e-4
+warmup_steps = 1000
+gpu = {EXLA.Backend, client: :rocm}
+
+# 🔍 AUTO-RESUME OR GENESIS (V21.7)
+save_prefix = "v21_7_auto"
+latest_checkpoint = 
+  Path.wildcard("#{save_prefix}_*.bin")
+  |> Enum.reject(&String.contains?(&1, "data.bin"))
+  |> Enum.max_by(fn path -> File.stat!(path).mtime end, fn -> nil end)
+
+{params, ms, vs, global_step, current_epoch} = 
+  if latest_checkpoint do
+    IO.puts("💾 Found V21.7 checkpoint: #{latest_checkpoint}")
+    checkpoint = File.read!(latest_checkpoint) |> :erlang.binary_to_term()
+    p = checkpoint.params |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    m = checkpoint.ms |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    v = checkpoint.vs |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    {p, m, v, checkpoint.step, checkpoint.epoch}
+  else
+    IO.puts("✨ No V21.7 checkpoint found. Igniting FRESH Genesis state...")
+    raw_p = DLM.V21_7Genesis.init_params(42)
+    {raw_m, raw_v, _} = DLM.V21_7Genesis.init_optimizer(raw_p)
+    p = raw_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    m = raw_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    v = raw_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+    {p, m, v, 0, 1}
+  end
+
+words_already_seen = rem(global_step * batch_size, dataset_size)
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy(gpu)
+initial_key = Nx.Random.key(global_step) 
+
+IO.puts("🚀 IGNITION: Starting V21.7 at Epoch #{current_epoch}, Global Step #{global_step}...")
+
+Enum.reduce(current_epoch..max_epochs, {params, ms, vs, global_step, initial_key, words_already_seen}, fn epoch, {p, m, v, current_step, current_key, offset_words} ->
+  IO.puts(String.duplicate("=", 50))
+  
+  target_lr = base_lr * :math.pow(0.9, epoch - 1)
+  IO.puts("🌊 EPOCH #{epoch} / #{max_epochs} | Target LR: #{target_lr}")
+  
+  IO.puts("🔀 Shuffling dataset...")
+  {shuffled_raw, next_key} = Nx.Random.shuffle(Nx.Random.key(999), full_dataset, axis: 0)
+  shuffled_dataset = Nx.backend_copy(shuffled_raw, Nx.BinaryBackend)
+
+  epoch_batches = Stream.unfold(offset_words, fn offset ->
+    if offset + batch_size > dataset_size, do: nil, else: {Nx.slice_along_axis(shuffled_dataset, offset, batch_size, axis: 0), offset + batch_size}
+  end)
+
+  # 🚀 INNER BATCH LOOP
+  {new_p, new_m, new_v, next_epoch_step, _final_skips} =
+    epoch_batches
+    |> Stream.with_index(1)
+    |> Enum.reduce({p, m, v, current_step, 0}, fn {batch, step_in_epoch}, {cp, cm, cv, cs, s_count} ->
+      gpu_batch = Nx.backend_copy(batch, gpu)
+
+      # 1. Compute Gradients
+      {loss_tensor, grads} = DLM.V21_7Trainer.compute_grad(cp, pos_emb, gpu_batch)
+      loss_val = Nx.to_number(loss_tensor)
+      if loss_val == :nan or loss_val > 6.0 do
+        cpu_batch = Nx.backend_copy(gpu_batch, Nx.BinaryBackend)
+        sequences = Nx.to_list(cpu_batch)
+        IO.puts("🔥 PATHOLOGICAL BATCH at global step #{cs}:")
+        Enum.each(sequences, fn seq ->
+          readable = seq |> Enum.reject(&(&1 == 0)) |> List.to_string()
+          IO.puts("   > #{readable}")
+        end)
+      end
+
+      # 2. Safety Gate
+      if loss_val == :nan or loss_val > 20.0 do
+        if rem(step_in_epoch, 10) == 0, do: IO.puts("⚠️ Step #{cs}: NaN/Spike detected. Skipping batch.")
+        {cp, cm, cv, cs + 1, s_count + 1}
+      else
+        # 3. Dynamic Learning Rate Warmup
+        current_lr = 
+          if cs < warmup_steps do
+            target_lr * (cs / warmup_steps)
+          else
+            target_lr
+          end
+
+        lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+        step_tensor = Nx.tensor(cs, type: :f32) |> Nx.backend_copy(gpu)
+        
+        # 4. Update Weights
+        {up_p, up_m, up_v} = DLM.MuonHybrid.step(cp, grads, cm, cv, step_tensor, lr_tensor)
+
+        # After {up_p, up_m, up_v} = DLM.MuonHybrid.step(...)
+        # Unpack, rescale d_u and d_v if their combined norm has collapsed
+        {p_emb, p_a1, p_a2, p_bu, p_bv, p_cu, p_cv, p_du, p_dv, 
+         p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = up_p
+        
+        du_norm = p_du |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+        
+        up_p = if du_norm < 0.01 do
+          IO.puts("   🔧 Rescuing dead delta gate (d_u norm=#{Float.round(du_norm, 5)})")
+          rescaled_du = Nx.multiply(p_du, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+          rescaled_dv = Nx.multiply(p_dv, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+          {p_emb, p_a1, p_a2, p_bu, p_bv, p_cu, p_cv, rescaled_du, rescaled_dv,
+           p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb}
+        else
+          up_p
+        end
+        
+        # 5. Logging (Every 50 steps)
+        if rem(step_in_epoch, 50) == 0 do
+          bpc = loss_val / :math.log(2)
+          mem = :erlang.memory(:total) |> div(1024 * 1024)
+          
+          # Pull grads back to CPU for norm inspection
+          cpu_grads = grads |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple()
+          norms = DLM.V21_7Trainer.grad_norms(cpu_grads)
+          
+          # Find the max so it jumps out visually
+          {max_name, max_norm} = Enum.max_by(norms, fn {_name, n} -> n end)
+          
+          norm_str = norms |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.join(" | ")
+          
+          IO.puts("➡️  Step #{step_in_epoch} | Global: #{cs} | Loss: #{Float.round(loss_val, 4)} | BPC: #{Float.round(bpc, 3)} | LR: #{Float.round(current_lr, 6)} | RAM: #{mem}MB")
+          IO.puts("   📐 GRAD NORMS | MAX: #{max_name}=#{max_norm}")
+          IO.puts("   #{norm_str}")
+        end
+
+        # 6. Checkpointing (Every 1000 steps)
+        if rem(cs, save_interval) == 0 and cs > 0 do
+          IO.puts("💾 Auto-Saving Checkpoint to #{save_prefix}_step#{cs}.bin...")
+          state = %{
+            params: up_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            ms: up_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            vs: up_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            step: cs, epoch: epoch
+          }
+          File.write!("#{save_prefix}_step#{cs}.bin", :erlang.term_to_binary(state))
+        end
+
+        if rem(step_in_epoch, 100) == 0, do: :erlang.garbage_collect(self())
+
+        {up_p, up_m, up_v, cs + 1, s_count}
+      end
+    end)
+
+  IO.puts("💾 Saving Completed Epoch #{epoch} State...")
+  final_state = %{
+    params: new_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    ms: new_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    vs: new_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    step: next_epoch_step, epoch: epoch
+  }
+  File.write!("#{save_prefix}_epoch#{epoch}_COMPLETE.bin", :erlang.term_to_binary(final_state))
+
+  {new_p, new_m, new_v, next_epoch_step, next_key, 0}
+end)
+
+IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+warning: variable "current_key" is unused (if the variable is not meant to be used, prefix it with an underscore)
+└─ 21_7.livemd#cell:boc5oxw7pivvb3qf:47
+
+🧠 Loading Dataset into CPU Memory...
+💾 Found V21.7 checkpoint: v21_7_auto_step18000.bin
+
+15:24:47.572 [info] XLA service 0x7c1a00266d30 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+15:24:47.573 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+15:24:47.573 [info] Using BFC allocator.
+
+15:24:47.573 [info] XLA backend allocating 7715841638 bytes on device 0 for BFCAllocator.
+
+15:24:47.573 [info] XLA backend will use up to 857315737 bytes on device 0 for CollectiveBFCAllocator.
+🚀 IGNITION: Starting V21.7 at Epoch 2, Global Step 18000...
+==================================================
+🌊 EPOCH 2 / 10 | Target LR: 2.7e-4
+🔀 Shuffling dataset...
+
+15:24:48.550 [info] Merging Dots in computation: region_1.2
+
+15:24:48.550 [info] Merging Dots in computation: region_3.4
+
+15:24:48.550 [info] Merging Dots in computation: region_15.18.clone
+
+15:24:48.550 [info] Merging Dots in computation: region_18.21.clone
+
+15:24:48.551 [info] Merging Dots in computation: main.41
+
+15:24:48.708 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:24:53.607 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:24:54.530 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:24:55.514 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:24:55.590 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:24:55.647 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:24:55.775 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:00.480 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:02.089 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:02.096 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+15:25:07.059 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:08.148 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:08.219 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:08.276 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:09.153 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:09.159 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+15:25:13.806 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:16.161 [info] Merging Dots in computation: region_1.2
+
+15:25:16.161 [info] Merging Dots in computation: region_4.5
+
+15:25:16.161 [info] Merging Dots in computation: region_7.8
+
+15:25:16.161 [info] Merging Dots in computation: region_10.11
+
+15:25:16.161 [info] Merging Dots in computation: region_13.14
+
+15:25:16.162 [info] Merging Dots in computation: region_16.17
+
+15:25:16.162 [info] Merging Dots in computation: region_19.20
+
+15:25:16.162 [info] Merging Dots in computation: region_22.23
+
+15:25:16.162 [info] Merging Dots in computation: region_25.26
+
+15:25:16.162 [info] Merging Dots in computation: region_28.29
+
+15:25:16.281 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+15:25:20.810 [warning] No reference output found even though buffer checking was requested while autotuning
+
+15:25:20.946 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+15:25:25.431 [warning] No reference output found even though buffer checking was requested while autotuning
+💾 Auto-Saving Checkpoint to v21_7_auto_step18000.bin...
+➡️  Step 50 | Global: 18049 | Loss: 2.3452 | BPC: 3.383 | LR: 2.7e-4 | RAM: 469MB
+   📐 GRAD NORMS | MAX: c_v=0.5162
+   embed=0.0918 | a_diag1=0.0007 | a_diag2=0.0005 | b_u=0.2054 | b_v=0.2131 | c_u=0.2294 | c_v=0.5162 | d_u=0.0071 | d_v=0.0174 | mx_u1=0.3717 | mx_v1=0.4762 | mx_u2=0.2278 | mx_v2=0.2414 | lm_w=0.33 | lm_b=0.0229
+➡️  Step 100 | Global: 18099 | Loss: 2.3329 | BPC: 3.366 | LR: 2.7e-4 | RAM: 470MB
+   📐 GRAD NORMS | MAX: c_v=0.5982
+   embed=0.0879 | a_diag1=0.0007 | a_diag2=0.0007 | b_u=0.2272 | b_v=0.2519 | c_u=0.2907 | c_v=0.5982 | d_u=0.0087 | d_v=0.0191 | mx_u1=0.3463 | mx_v1=0.3703 | mx_u2=0.1999 | mx_v2=0.1858 | lm_w=0.3201 | lm_b=0.0219
+➡️  Step 150 | Global: 18149 | Loss: 2.2606 | BPC: 3.261 | LR: 2.7e-4 | RAM: 470MB
+   📐 GRAD NORMS | MAX: c_v=0.4873
+   embed=0.0781 | a_diag1=0.0009 | a_diag2=0.0006 | b_u=0.2334 | b_v=0.2252 | c_u=0.2194 | c_v=0.4873 | d_u=0.0072 | d_v=0.017 | mx_u1=0.4109 | mx_v1=0.4527 | mx_u2=0.2204 | mx_v2=0.2663 | lm_w=0.3302 | lm_b=0.0214
+➡️  Step 200 | Global: 18199 | Loss: 2.2586 | BPC: 3.259 | LR: 2.7e-4 | RAM: 471MB
+   📐 GRAD NORMS | MAX: c_v=0.584
+   embed=0.0876 | a_diag1=0.0008 | a_diag2=0.0007 | b_u=0.1532 | b_v=0.1804 | c_u=0.2178 | c_v=0.584 | d_u=0.0064 | d_v=0.0193 | mx_u1=0.3631 | mx_v1=0.4245 | mx_u2=0.2218 | mx_v2=0.2399 | lm_w=0.3576 | lm_b=0.0257
+➡️  Step 250 | Global: 18249 | Loss: 2.329 | BPC: 3.36 | LR: 2.7e-4 | RAM: 472MB
+   📐 GRAD NORMS | MAX: c_v=0.5201
+   embed=0.0825 | a_diag1=0.0008 | a_diag2=0.0004 | b_u=0.2441 | b_v=0.2858 | c_u=0.253 | c_v=0.5201 | d_u=0.0063 | d_v=0.0178 | mx_u1=0.333 | mx_v1=0.4281 | mx_u2=0.2409 | mx_v2=0.2479 | lm_w=0.3205 | lm_b=0.0246
+➡️  Step 300 | Global: 18299 | Loss: 2.3493 | BPC: 3.389 | LR: 2.7e-4 | RAM: 474MB
+   📐 GRAD NORMS | MAX: c_v=0.4565
+   embed=0.0843 | a_diag1=0.0007 | a_diag2=0.0009 | b_u=0.256 | b_v=0.2576 | c_u=0.2327 | c_v=0.4565 | d_u=0.0085 | d_v=0.0194 | mx_u1=0.4057 | mx_v1=0.3915 | mx_u2=0.2703 | mx_v2=0.2859 | lm_w=0.3532 | lm_b=0.0253
+➡️  Step 350 | Global: 18349 | Loss: 2.293 | BPC: 3.308 | LR: 2.7e-4 | RAM: 474MB
+   📐 GRAD NORMS | MAX: c_v=0.4836
+   embed=0.0967 | a_diag1=0.0011 | a_diag2=0.0007 | b_u=0.2742 | b_v=0.2896 | c_u=0.2844 | c_v=0.4836 | d_u=0.0082 | d_v=0.0209 | mx_u1=0.3557 | mx_v1=0.4114 | mx_u2=0.2529 | mx_v2=0.2327 | lm_w=0.3193 | lm_b=0.0235
+➡️  Step 400 | Global: 18399 | Loss: 2.3891 | BPC: 3.447 | LR: 2.7e-4 | RAM: 475MB
+   📐 GRAD NORMS | MAX: c_v=0.5378
+   embed=0.0813 | a_diag1=0.0009 | a_diag2=0.0008 | b_u=0.2016 | b_v=0.2559 | c_u=0.251 | c_v=0.5378 | d_u=0.0084 | d_v=0.0206 | mx_u1=0.3388 | mx_v1=0.4278 | mx_u2=0.2439 | mx_v2=0.2416 | lm_w=0.3437 | lm_b=0.0257
+➡️  Step 450 | Global: 18449 | Loss: 2.3653 | BPC: 3.412 | LR: 2.7e-4 | RAM: 476MB
+   📐 GRAD NORMS | MAX: c_v=0.5025
+   embed=0.0832 | a_diag1=0.001 | a_diag2=0.0007 | b_u=0.2492 | b_v=0.2411 | c_u=0.2499 | c_v=0.5025 | d_u=0.0098 | d_v=0.0208 | mx_u1=0.401 | mx_v1=0.4274 | mx_u2=0.2084 | mx_v2=0.2522 | lm_w=0.326 | lm_b=0.0226
+➡️  Step 500 | Global: 18499 | Loss: 2.3717 | BPC: 3.422 | LR: 2.7e-4 | RAM: 477MB
+   📐 GRAD NORMS | MAX: c_v=0.4523
+   embed=0.092 | a_diag1=0.0008 | a_diag2=0.0008 | b_u=0.2612 | b_v=0.246 | c_u=0.2112 | c_v=0.4523 | d_u=0.0109 | d_v=0.0217 | mx_u1=0.404 | mx_v1=0.432 | mx_u2=0.253 | mx_v2=0.2765 | lm_w=0.3495 | lm_b=0.022
+➡️  Step 550 | Global: 18549 | Loss: 2.3726 | BPC: 3.423 | LR: 2.7e-4 | RAM: 478MB
+   📐 GRAD NORMS | MAX: c_v=0.4926
+   embed=0.0851 | a_diag1=0.0007 | a_diag2=0.0005 | b_u=0.2165 | b_v=0.2314 | c_u=0.258 | c_v=0.4926 | d_u=0.0084 | d_v=0.0203 | mx_u1=0.3525 | mx_v1=0.4479 | mx_u2=0.2424 | mx_v2=0.2895 | lm_w=0.3388 | lm_b=0.0213
+➡️  Step 600 | Global: 18599 | Loss: 2.2571 | BPC: 3.256 | LR: 2.7e-4 | RAM: 479MB
+   📐 GRAD NORMS | MAX: c_v=0.4777
+   embed=0.0905 | a_diag1=0.0008 | a_diag2=0.0009 | b_u=0.268 | b_v=0.2672 | c_u=0.2389 | c_v=0.4777 | d_u=0.0072 | d_v=0.0192 | mx_u1=0.4158 | mx_v1=0.3893 | mx_u2=0.2373 | mx_v2=0.2759 | lm_w=0.325 | lm_b=0.0197
+➡️  Step 650 | Global: 18649 | Loss: 2.2979 | BPC: 3.315 | LR: 2.7e-4 | RAM: 479MB
+   📐 GRAD NORMS | MAX: c_v=0.4569
+   embed=0.088 | a_diag1=0.0008 | a_diag2=0.0007 | b_u=0.2724 | b_v=0.2858 | c_u=0.2302 | c_v=0.4569 | d_u=0.0078 | d_v=0.0224 | mx_u1=0.4282 | mx_v1=0.4163 | mx_u2=0.215 | mx_v2=0.2543 | lm_w=0.3256 | lm_b=0.021
+➡️  Step 700 | Global: 18699 | Loss: 2.2412 | BPC: 3.233 | LR: 2.7e-4 | RAM: 480MB
+   📐 GRAD NORMS | MAX: c_v=0.5684
+   embed=0.075 | a_diag1=0.0006 | a_diag2=0.0009 | b_u=0.2095 | b_v=0.2408 | c_u=0.2953 | c_v=0.5684 | d_u=0.0061 | d_v=0.0177 | mx_u1=0.4106 | mx_v1=0.3935 | mx_u2=0.1827 | mx_v2=0.2379 | lm_w=0.2611 | lm_b=0.0176
+➡️  Step 750 | Global: 18749 | Loss: 2.2931 | BPC: 3.308 | LR: 2.7e-4 | RAM: 481MB
+   📐 GRAD NORMS | MAX: c_v=0.4791
+   embed=0.092 | a_diag1=0.001 | a_diag2=0.0008 | b_u=0.2283 | b_v=0.2841 | c_u=0.2504 | c_v=0.4791 | d_u=0.0061 | d_v=0.0213 | mx_u1=0.3712 | mx_v1=0.4339 | mx_u2=0.2257 | mx_v2=0.2919 | lm_w=0.3214 | lm_b=0.0214
+🔥 PATHOLOGICAL BATCH at global step 18790:
+   > played out = see exhausted
+   > aurochs = large recently extinct long-horned European wild ox; considered one of the ancestors of domestic cattle | urus, Bos primigenius
+   > sedative = see ataractic
+   > storey = see floor
+   > wicket-keeper = stands behind the wicket to catch balls
+   > captain = see master
+   > rhea = larger of two tall fast-running flightless birds similar to ostriches but three-toed; found from Brazil to Patagonia | Rhea americana
+   > Exaeretodon = a genus of reptiles of the division Cynodontia | genus Exaeretodon
+   > Crataegus laevigata = see whitethorn
+   > Ulmus campestris sarniensis = see Jersey elm
+   > Johann Gottfried von Herder = see Herder
+   > break down = see fail
+   > plan = scale drawing of a structure; "the plans for City Hall were on file" | architectural plan
+   > Geum rivale = see water avens
+   > animate = see inspire
+   > formality = a manner that strictly observes all forms and ceremonies; "the formality of his voice made the others pay him close attention" | formalness
+🔥 PATHOLOGICAL BATCH at global step 18791:
+   > dishonorableness = the quality of not deserving honor or respect | dishonourableness
+   > Brezhnev = Soviet statesman who became president of the Soviet Union (1906-1982) | Leonid Brezhnev, Leonid Ilyich Brezhnev
+   > inversion = the act of turning inside out | eversion, everting
+   > fast = firmly or closely; "held fast to the rope"; "her foot was stuck fast"; "held tight" | tight
+   > idle = lacking a sense of restraint or responsibility; "idle talk"; "a loose tongue" | loose
+   > family Schistosomatidae = see Schistosomatidae
+   > reflectometer = a meter that measures the reflectance of a surface
+   > Orthoptera = grasshoppers and locusts; crickets | order Orthoptera
+   > assimilate = become similar in sound; "The nasal assimilates to the following consonant"
+   > white fairy lantern = see white globe lily
+   > average = see modal(a)
+   > Cichlidae = cichlids | family Cichlidae
+   > whip-round = (British) solicitation of money usually for a benevolent purpose
+   > taco = a tortilla rolled cupped around a filling
+   > Peritrate = see pentaerythritol
+   > mephitis = see malodor
+🔥 PATHOLOGICAL BATCH at global step 18792:
+   > de rigueur = required by etiquette or usage or fashion; "instruction as to when and where a silk hat is de rigueur"
+   > cathartic = emotionally purging | psychotherapeutic
+   > guffaw = laugh boisterously | laugh loudly
+   > bandage = see bind
+   > Park Ave. = see Park Avenue
+   > magnetic induction = see magnetization
+   > yashmac = see yashmak
+   > unresolvable = see insolvable
+   > swamp hickory = see bitternut
+   > canon = a collection of books accepted as holy scripture especially the books of the Bible recognized by any Christian church as genuine and inspired
+   > Epistle to Titus = see Epistle of Paul the Apostle to Titus
+   > golden-yellow = of yellow tinged with gold
+   > power loading = the ratio of the weight of an airplane to its engine power
+   > Gulf of Carpentaria = a wide shallow inlet of the Arafura Sea in northern Australia | Carpentaria
+   > genus Weigela = east Asian flowering shrubs
+   > natal = of or relating to the buttocks
+🔥 PATHOLOGICAL BATCH at global step 18793:
+   > spreading = see spread
+   > speed limit" | cognizant, cognisant
+   > biological agent = any bacterium or virus or toxin that could be used in biological warfare | biohazard
+   > Nigroporus vinosus = a woody pore fungus with a dark brown to red brown cap and spore surface and small pores
+   > hydraulic press = press in which a force applied by a piston to a small area is transmitted through water to another piston having a large area
+   > Benny Hill = see Hill
+   > statin drug = see lipid-lowering medicine
+   > Tyndale = English translator and Protestant martyr; his translation of the Bible into English (which later formed the basis for the King James Version) aroused ecclesiastical opposition; he left England in 1524 and was burned at the stake in Antwerp as a h
+   > fall off = come off; "This button had fallen off"
+   > macadamia tree = see macadamia
+   > ovular = of or relating to an ovum
+   > saute = fry briefly over high heat; "saute the onions"
+   > distally = far from the center; "the bronchus is situated distally"
+   > people in power = see ruling class
+   > musth = an annual phase of heightened sexual excitement in the males of certain large mammals (especially elephants); is associated with discharge from a gland between the eye and ear; "the frenzied elephant was in musth"
+   > disposal = the power to use something or someone; "used all the resources at his disposal"
+🔥 PATHOLOGICAL BATCH at global step 18794:
+   > osmium = a hard brittle blue-grey or blue-black metallic element that is one of the platinum metals; the heaviest metal known | Os, atomic number 76
+   > domestic ass = domestic beast of burden descended from the African wild ass; patient but stubborn | donkey, Equus asinus
+   > Prunus avium = see sweet cherry
+   > pride oneself = see take pride
+   > family Caenolestidae = see Caenolestidae
+   > tennis club = a club of people to play tennis
+   > antheridium = the male sex organ of spore-producing plants; produces antherozoids; equivalent to the anther in flowers
+   > disconnect = see gulf
+   > flea = any wingless bloodsucking parasitic insect noted for ability to leap
+   > luxurious = see deluxe
+   > entrepreneurial = willing to take risks in order to make a profit
+   > oil colour = see oil
+   > sanction = formal and explicit approval; "a Democrat usually gets the union's endorsement" | countenance, endorsement, indorsement, warrant, imprimatur
+   > lead = (sports) the score by which a team or individual is winning
+   > artist's loft = a factory loft that has been converted into an artist's workroom and living area
+   > intermezzo = see interlude
+🔥 PATHOLOGICAL BATCH at global step 18795:
+   > spigot = see faucet
+   > play it by ear = decide on one's actions as one goes along, depending on the situation; "She didn't know what to expect from her new job, so she played it by ear"
+   > keep up = maintain a required pace or level; "He could not keep up and dropped out of the race"
+   > capitulate = surrender under agreed conditions
+   > diversified = having variety of character or form or components; or having increased variety; "a diversified musical program ranging from classical to modern"; "diversified farming"; "diversified manufacturing"; "diversified scenery"; "diversified investme
+   > vascularization = the organic process whereby body tissue becomes vascular and develops capillaries | vascularisation
+   > sixteenth = see one-sixteenth
+   > almond-eyed = having almond-shaped eyes
+   > rumour = see rumor
+   > swagger stick = a short cane or stick covered with leather and carried by army officers
+   > slouch hat = see cavalier hat
+   > Crataegus oxycantha = see whitethorn
+   > antipersonnel = designed to inflict death or personal injury rather than material destruction
+   > luminesce = be or become luminescent; exhibit luminescence
+   > genus Callitris = see Callitris
+   > sweat equity = interest in a building that a tenant earns by contributing to its renovation or maintenance
+🔥 PATHOLOGICAL BATCH at global step 18796:
+   > tomato plant = see tomato
+   > polyurethan = see polyurethane
+   > dictate = see order
+   > absentmindedness = preoccupation so great that the ordinary demands on attention are ignored
+   > steward = an attendant on an airplane | flight attendant
+   > Elaeis guineensis = see African oil palm
+   > Hylocichla guttata = see hermit thrush
+   > act as = see act
+   > barbette carriage = a gun carriage elevated so that the gun can be fired over the parapet
+   > Anglo-Saxon = of or relating to the Anglo-Saxons or their language; "Anglo-Saxon poetry"; "The Anglo-Saxon population of Scotland"
+   > green turtle = large tropical turtle with greenish flesh used for turtle soup | Chelonia mydas
+   > liner = a large commercial ship (especially one that carries passengers on a regular schedule) | ocean liner
+   > Osage = a member of the Siouan people formerly living in Missouri in the valleys of the Missouri and Osage rivers; oil was found on Osage lands early in the 20th century
+   > reading desk = see lectern
+   > oil-rich seed = see oilseed
+   > annual salt-marsh aster = a variety of aster
+🔥 PATHOLOGICAL BATCH at global step 18797:
+   > hang = be suspended or poised; "Heavy fog hung over the valley"
+   > indefeasible = not liable to being annulled or voided or undone; "an indefeasible right to freedom"; "an indefeasible claim to the title"
+   > trammel = see shackle
+   > synthesiser = see synthesist
+   > self-conscious = aware of yourself as an individual or of your own being and actions and thoughts; "self-conscious awareness"; "self-conscious about their roles as guardians of the social values"- D.M.Potter | self-aware
+   > jade = see tire
+   > aquilegia = see columbine
+   > cloture = see closure
+   > Omdurman = a city of Sudan; located in the central Sudan on the White Nile opposite Khartoum
+   > camcorder = a portable television camera and videocassette recorder
+   > unmarried man = see bachelor
+   > plot = a small area of ground covered by specific vegetation; "a bean plot"; "a cabbage patch"; "a briar patch" | plot of land, plot of ground, patch
+   > upset = see swage
+   > cutoff saw = see crosscut saw
+   > forcibly = in a forcible manner; "keep in mind the dangers of imposing our own values and prejudices too forcibly"
+   > pull away = see withdraw
+🔥 PATHOLOGICAL BATCH at global step 18798:
+   > biretta = a stiff cap with ridges across the crown; worn by Roman Catholic clergy | berretta, birretta
+   > labour = see labor
+   > accentuation = see emphasizing
+   > sponger = a workman employed to collect sponges
+   > Artemia salina = see brine shrimp
+   > doily = a small round piece of linen placed under a dish or bowl | doyley, doyly
+   > Frederick North = see North
+   > clog = impede with a clog or as if with a clog; "The market is being clogged by these operations"; "My mind is constipated today" | constipate
+   > blind = make blind by putting the eyes out; "The criminals were punished and blinded"
+   > Monod = French biochemist who (with Francois Jacob) explained how genes are activated and suggested the existence of messenger RNA (1910-1976) | Jacques Monod, Jacques Lucien Monod
+   > monkey nut = see peanut
+   > Psilopsida = whisk ferns; comprising the family Psilotaceae or Psilotatae: vascular plants with no roots, partial if any leaf differentiation, and rudimentary spore sacs | class Psilopsida, Psilotatae, class Psilotatae
+   > political unit = a unit with political responsibilities | political entity
+   > blastoporic = see blastoporal
+   > span = the distance or interval between two points
+   > recreation room = a room equipped for informal entertaining | rec room
+🔥 PATHOLOGICAL BATCH at global step 18799:
+   > miosis = see light reflex
+   > pancreatitis = inflammation of the pancreas; usually marked by abdominal pain
+   > Andrew Huxley = see Huxley
+   > capital of Syria = see Dimash
+   > digitalin = see digitalis
+   > fun = see playfulness
+   > tranquillise = see sedate
+   > stock = see sprout
+   > yield = see return
+   > Perilla frutescens crispa = see beefsteak plant
+   > nol pros = see nolle prosequi
+   > act = perform on a stage or theater; "She acts in this play"; "He acted in `Julius Caesar'"; "I played in `A Christmas Carol'" | play, roleplay, playact
+   > myringa = see eardrum
+   > civil action = legal action to protect a private civil right or to compel a civil remedy (as distinguished from criminal prosecution)
+   > place = assign to (a job or a home)
+   > tamanoir = see ant bear
+⚠️ Step 18799: NaN/Spike detected. Skipping batch.
+🔥 PATHOLOGICAL BATCH at global step 18800:
+   > window screen = screen to keep insects from entering a building through the open window
+   > distributor = see allocator
+   > subjectiveness = see subjectivity
+   > template RNA = see messenger RNA
+   > carbon disulfide = a toxic colorless flammable liquid (CS2); used in the manufacture of rayon and cellophane and carbon tetrachloride and as a solvent for rubber
+   > tireless = see indefatigable
+   > blacktail deer = see black-tailed deer
+   > raptor = see bird of prey
+   > write out = make out and issue; "write out a check"; "cut a ticket"; "Please make the check out to me" | issue, make out, cut
+   > internship = the position of a medical intern
+   > genus Picus = see Picus
+   > Anglophobic = characterized by Anglophobia
+   > stern = see austere
+   > Asmara = the capital of Eritrea | Asmera
+   > corrugation = a ridge on a corrugated surface
+   > untune = see upset
+🔥 PATHOLOGICAL BATCH at global step 18801:
+   > stirrup iron = see stirrup
+   > denomination = a group of religious congregations having its own organization and a distinctive faith
+   > genus Caragana = large genus of Asiatic deciduous shrubs or small trees
+   > green mamba = green phase of the black mamba
+   > sting = see pang
+   > Sir Rex Harrison = see Harrison
+   > steamer clam = see soft-shell clam
+   > captivity = the state of being imprisoned; "he was held in captivity until he died"; "the imprisonment of captured soldiers"; "his ignominious incarceration in the local jail"; "he practiced the immurement of his enemies in the castle dungeon" | imprisonme
+   > logarithmic = of or relating to or using logarithms; "logarithmic function"
+   > Ladino = see Judeo-Spanish
+   > supinator = a muscle (especially in the forearm) that produces or assists in supination
+   > measure up = see qualify
+   > rayons = see nylons
+   > Polemonium reptans = see Greek valerian
+   > poultry = see domestic fowl
+   > thalassaemia major = see Cooley's anemia
+🔥 PATHOLOGICAL BATCH at global step 18802:
+   > decency = the quality of being polite and respectable
+   > midships = see amidships
+   > straight-line method of depreciation = see straight-line method
+   > onshore = on or toward the land; "they were living onshore"
+   > earthball = any of various fungi of the genus Scleroderma having hard-skinned subterranean fruiting bodies resembling truffles | false truffle, puffball, hard-skinned puffball
+   > beach grass = tough grasses with strong roots that can grow on exposed sandy shores
+   > compact = see covenant
+   > Jane Jacobs = see Jacobs
+   > shiga bacillus = a bacillus that causes dysentery | Shigella dysentariae
+   > major = of greater seriousness or danger; "a major earthquake"; "a major hurricane"; "a major illness"
+   > cupric sulphate = see copper sulfate
+   > bewitch = see capture
+   > Red Hand Defenders = a paramilitary group of Protestants in Northern Ireland that tries to prevent any political settlement with the Irish Republic; attacks interests of Catholic civilians in Northern Ireland; responsible for arson and bombing and murder |
+   > Klemens Metternich = see Metternich
+   > martially = in a martial manner
+   > cramp iron = see cramp
+🔥 PATHOLOGICAL BATCH at global step 18803:
+   > hypocapnia = a state in which the level of carbon dioxide in the blood is lower than normal; can result from deep or rapid breathing | acapnia
+   > destroy = destroy completely; damage irreparably; "You have ruined my car by pouring sugar in the tank!"; "The tears ruined her make-up" | ruin
+   > Alnus crispa = see green alder
+   > class Equisetatae = see Sphenopsida
+   > piece = an artistic or literary composition; "he wrote an interesting piece on Iran"; "the children acted out a comic piece to amuse the guests"
+   > solar eclipse = the moon interrupts light from the sun
+   > divorce = see disassociate
+   > intercommunication system = a communication system linking different rooms within a building or ship etc | intercom
+   > Ernest Bloch = see Bloch
+   > oogenesis = development of ova
+   > Georgia bark = see fever tree
+   > rock sea bass = a kind of sea bass | rock bass, Centropristis philadelphica
+   > swerve = the act of turning aside suddenly | swerving, veering
+   > travail = see labor
+   > bitterwood = see Jamaica quassia
+   > Domino = United States rhythm and blues pianist and singer and composer (born in 1928) | Fats Domino, Antoine Domino
+🔥 PATHOLOGICAL BATCH at global step 18804:
+   > hotelkeeper = see hotelier
+   > Hong Kong dollar = the basic unit of money in Hong Kong
+   > ham = an unskilled actor who overacts | ham actor
+   > stall = seating in the forward part of the main level of a theater
+   > metaknowledge = knowledge about knowledge
+   > reduce = see abridge
+   > dentifrice = a substance for cleaning the teeth; applied with a toothbrush
+   > diastolic pressure = the blood pressure (as measured by a sphygmomanometer) after the contraction of the heart while the chambers of the heart refill with blood
+   > bullnecked = having a thick short powerful neck
+   > emitter = the electrode in a transistor where electrons originate
+   > unfastened = see untied
+   > royal = stag with antlers of 12 or more branches | royal stag
+   > family Gonorhynchidae = see Gonorhynchidae
+   > Heart of Dixie = see Alabama
+   > vena intercostalis = see intercostal vein
+   > foul = become soiled and dirty
+🔥 PATHOLOGICAL BATCH at global step 18805:
+   > freelancer = a writer or artist who sells services to different employers without a long-term contract with any of them | freelance, free-lance, free lance, independent, self-employed person
+   > avertable = see evitable
+   > heartleaf = wild ginger having persistent heart-shaped pungent leaves; West Virginia to Alabama | heart-leaf, Asarum shuttleworthii
+   > agricultural agent = see county agent
+   > Amur River = see Amur
+   > Merodach = see Marduk
+   > pectoral sandpiper = American sandpiper that inflates its chest when courting | jacksnipe, Calidris melanotos
+   > rian's Wall (76-138) | Publius Aelius Hadrianus, Adrian
+   > Othello = the hero of William Shakespeare's tragedy who would not trust his wife
+   > perceive = to become aware of through the senses; "I could perceive the ship coming over the horizon" | comprehend
+   > slam dancing = a form of dancing in which dancers slam into one another; normally performed to punk rock | slam dance
+   > Cistus = small to medium-sized evergreen shrubs of southern Europe and North Africa | genus Cistus
+   > Tenrecidae = tenrecs and extinct related forms | family Tenrecidae
+   > detribalisation = see detribalization
+   > repudiation = refusal to acknowledge or pay a debt or honor a contract (especially by public authorities); "the repudiation of the debt by the city"
+   > toowomba canary grass = see hardinggrass
+🔥 PATHOLOGICAL BATCH at global step 18806:
+   > rationalization = the organization of a business according to scientific principles of management in order to increase efficiency | rationalisation
+   > dustman = see garbage man
+   > pick at = see disparage
+   > eversion = the position of being turned outward; "the eversion of the foot"
+   > lush = see juicy
+   > Ctenocephalides = an arthropod genus of fleas | genus Ctenocephalides
+   > thus = in the way indicated; "hold the brush so"; "set up the pieces thus"; (`thusly' is a nonstandard variant) | thusly, so
+   > turnoff = a side road where you can turn off; "I missed the turnoff and went 15 miles out of my way"
+   > glans penis = the conical mass of erectile tissue that forms the head of the penis
+   > cheerlessness = a feeling of dreary or pessimistic sadness | uncheerfulness
+   > Lycopus americanus = see water horehound
+   > chafflike = see chaffy
+   > Manuel de Falla = see Falla
+   > prudence = discretion in practical affairs
+   > snuffler = a person who breathes noisily (as through a nose blocked by mucus)
+   > probabilistically = by the use of probability theory; "we can calculate the position of the particles probabilistically"
+🔥 PATHOLOGICAL BATCH at global step 18807:
+   > Charles = King of England and Scotland and Ireland during the Restoration (1630-1685) | Charles II
+   > temporariness = the property of lasting only a short time
+   > Issachar = (Old Testament) a son of Jacob and a forebear of one of the tribes of Israel
+   > desexualize = see sterilize
+   > Galileo Galilei = see Galileo
+   > moor = come into or dock at a wharf; "the big ship wharfed in the evening" | berth, wharf
+   > deaden = make less lively, intense, or vigorous; impair in vigor, force, activity, or sensation; "Terror blunted her feelings"; "deaden a sound" | blunt
+   > acetate = see acetate rayon
+   > campanula = any of various plants of the genus Campanula having blue or white bell-shaped flowers | bellflower
+   > dramatic irony = (theater) irony that occurs when the meaning of the situation is understood by the audience but not by the characters in the play
+   > administer = direct the taking of; "administer an exam"; "administer an oath"
+   > l composer"; "the effect was achieved by skillful retouching" | expert, good, practiced, proficient, skillful, skilful
+   > requirements contract = a contract in which you agree to purchase all your requirements of a particular sort from one party
+   > right to life = the right to live
+   > cyberpunk = a writer of science fiction set in a lawless subculture of an oppressive society dominated by computer technology
+   > Robert Hutchings Goddard = see Goddard
+🔥 PATHOLOGICAL BATCH at global step 18808:
+   > Rome Beauty = large red apple used primarily for baking
+   > stick with = see stick to
+   > deficiency = see lack
+   > window-dress = see dress up
+   > tie = fasten or secure with a rope, string, or cord; "They tied their victim to the chair" | bind
+   > Urban V = French pope from 1362 to 1370 who tried to reestablish the papacy in Rome but in 1367 returned to Avignon hoping to end the war between France and England; canonized in 1870 (1310-1370) | Guillaume de Grimoard
+   > bloodleaf = any plant of the genus Iresine having colored foliage
+   > tolerance = see permissiveness
+   > downwards = see down
+   > interrogatory = see interrogation
+   > straining = see distortion
+   > school = swim in or form a large group of fish; "A cluster of schooling fish was attracted to the bait"
+   > Muskogean = see Muskhogean
+   > conferva = any of various algae of the genus Tribonema; algae with branching filaments that form scum in still or stagnant fresh water
+   > John Jay = see Jay
+   > circumnavigate = travel around, either by plane or ship; "We compassed the earth" | compass
+🔥 PATHOLOGICAL BATCH at global step 18809:
+   > signal box = a building from which signals are sent to control the movements of railway trains | signal tower
+   > aluminum business = manufacturers of aluminum considered as a group | aluminum industry
+   > turkey stuffing = stuffing for turkey
+   > vacationing = the act of taking a vacation
+   > rock-steady = see dependable
+   > chelonian reptile = see chelonian
+   > screech owl = small North American owl having hornlike tufts of feathers whose call sounds like a quavering whistle | Otus asio
+   > matzo = brittle flat bread eaten at Passover | matzoh, matzah, unleavened bread
+   > embrace = the act of clasping another person in the arms (as in greeting or affection) | embracing, embracement
+   > court = see woo
+   > agate = an impure form of quartz consisting of banded chalcedony; used as a gemstone and for making mortars and pestles
+   > Dekker = English dramatist and pamphleteer (1572-1632) | Decker, Thomas Dekker, Thomas Decker
+   > single-lane = (of roads) having a single lane for traffic in both directions; when vehicles meet one must pull off the road to let the other pass
+   > Ovral = trade name for an oral contraceptive containing estradiol and norgestrel
+   > Bermuda buttercup = South African bulbous wood sorrel with showy yellow flowers | English-weed, Oxalis pes-caprae, Oxalis cernua
+   > rubbery = see cartilaginous
+⚠️ Step 18809: NaN/Spike detected. Skipping batch.
+🔥 PATHOLOGICAL BATCH at global step 18810:
+   > illicitness = the quality of not conforming strictly to law
+   > phrase = see give voice
+   > incompetent = legally not qualified or sufficient; "a wife is usually considered unqualified to testify against her husband"; "incompetent witnesses" | unqualified
+   > sooty = covered with or as if with soot; "a sooty chimney"
+   > pale-faced = having a pale face
+   > sidearm = (of pitches) made with the arm moving parallel to the ground; "a sidearm pitch"
+   > man's clothing = clothing that is designed for men to wear
+   > Michael Gerald Tyson = see Tyson
+   > musculus anconeus = see anconeous muscle
+   > emulate = strive to equal or match, especially by imitating; "He is emulating the skating skills of his older sister"
+   > devil's urn = a common name for a variety of Sarcosomataceae
+   > os longum = see long bone
+   > fecundity = see fertility
+   > corroborant = used of a medicine that is strengthening
+   > genus Geococcyx = see Geococcyx
+   > quiet = characterized by an absence or near absence of agitation or activity; "a quiet life"; "a quiet throng of onlookers"; "quiet peace-loving people"; "the factions remained quiet for almost 10 years"
+```

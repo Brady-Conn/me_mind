@@ -1,0 +1,502 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# V20 - Big Brain
+
+```elixir
+# ===========================================================================
+# V20-BB Setup
+# ===========================================================================
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+System.put_env("XLA_CLIENT_MEM_FRACTION", "0.75")
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")        # ← disables the Merging Dots pass
+System.put_env("XLA_FLAGS", "--xla_gpu_enable_reassociation_for_converted_ar=false")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"}
+])
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+
+
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Transformer, positional, optimizer
+
+```elixir
+defmodule DLM.BigBrainSSM do
+  import Nx.Defn
+
+  @rank 32
+  @vocab_size 128
+  @dim 256
+  @layers 3
+
+  def init_params() do
+    key = Nx.Random.key(42)
+    {emb_w, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@vocab_size, @dim})
+    
+    layers = Enum.map(1..@layers, fn _ ->
+      {conv_w, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {3, @dim, @dim})
+      {proj_w, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @dim})
+      {norm_w, key} = Nx.Random.normal(key, 1.0, 0.0, shape: {@dim})
+      %{conv: conv_w, proj: proj_w, norm: norm_w}
+    end)
+
+    {head_w, _key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @vocab_size})
+    %{emb: emb_w, layers: List.to_tuple(layers), head: head_w}
+  end
+
+  deftransform rms_norm(x, weight, eps \\ 1.0e-5) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    normed = Nx.multiply(x, Nx.rsqrt(Nx.add(variance, eps)))
+    Nx.multiply(normed, weight)
+  end
+
+  deftransform apply_layers(x, layers) do
+    Enum.reduce(Tuple.to_list(layers), x, fn layer, acc ->
+      normed = rms_norm(acc, layer.norm)
+      padded = Nx.pad(normed, 0.0, [{0, 0, 0}, {2, 0, 0}, {0, 0, 0}])
+  
+      conved = Nx.conv(padded, layer.conv,
+        padding: :valid,
+        input_permutation: [0, 2, 1],
+        kernel_permutation: [2, 1, 0],   # ← fixed
+        output_permutation: [0, 2, 1]
+      )
+  
+      activated = Nx.multiply(conved, Nx.sigmoid(conved))  # ← Nx.multiply, not *
+      projected = Nx.dot(activated, [2], layer.proj, [0])
+      Nx.add(acc, projected)                               # ← Nx.add, not +
+    end)
+  end
+
+  defn forward(ins, params, pos_emb) do
+    x = Nx.take(params.emb, ins) + pos_emb
+    x = apply_layers(x, params.layers)
+    Nx.dot(x, [2], params.head, [0])
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+warning: variable "key" is unused (there is a variable with the same name in the context, use the pin operator (^) to match on it or prefix this variable with underscore if it is not meant to be used)
+└─ big_brain.livemd#cell:726jq5qq3tlkfgf7:15: DLM.BigBrainSSM.init_params/0
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.BigBrainSSM, <<70, 79, 82, 49, 0, 0, 28, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  def init_state(params) do
+    gpu = {EXLA.Backend, client: :rocm}
+    zero_like = fn t -> Nx.broadcast(0.0, t) |> Nx.backend_copy(gpu) end
+
+    %{
+      step: Nx.tensor(1, type: :s32) |> Nx.backend_copy(gpu),
+      m_emb: zero_like.(params.emb),
+      v_emb: zero_like.(params.emb),
+      m_head: zero_like.(params.head),
+      v_head: zero_like.(params.head),
+      layers: params.layers
+      |> Tuple.to_list()
+      |> Enum.map(fn layer ->
+        %{
+          m_conv: zero_like.(layer.conv),
+          v_conv: zero_like.(layer.conv),
+          m_norm: zero_like.(layer.norm),
+          v_norm: zero_like.(layer.norm)
+        }
+      end)
+      |> List.to_tuple()
+    }
+  end
+
+  # ⚡ Unrolled Newton-Schulz (Prevents ROCm dynamic buffer crashes)
+  deftransform newton_schulz(g) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) |> Nx.add(1.0e-7)
+    x = Nx.divide(g, frobenius_norm)
+  
+    final_x =
+      Enum.reduce(1..5, x, fn _, curr_x ->
+        x_t_x = Nx.dot(Nx.transpose(curr_x), [1], curr_x, [0])
+        x_x_t_x = Nx.dot(curr_x, [1], x_t_x, [0])
+        Nx.subtract(Nx.multiply(curr_x, 1.5), Nx.multiply(x_x_t_x, 0.5))
+      end)
+  
+    Nx.multiply(final_x, frobenius_norm)
+  end
+
+  deftransform adam_update(param, grad, m, v, step, lr) do
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+  
+    new_m = Nx.add(Nx.multiply(beta1, m), Nx.multiply(1.0 - beta1, grad))
+    new_v = Nx.add(Nx.multiply(beta2, v), Nx.multiply(1.0 - beta2, Nx.pow(grad, 2)))
+  
+    m_hat = Nx.divide(new_m, Nx.subtract(1.0, Nx.pow(beta1, step)))
+    v_hat = Nx.divide(new_v, Nx.subtract(1.0, Nx.pow(beta2, step)))
+  
+    param_update = Nx.subtract(param, Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), eps))))
+    {param_update, new_m, new_v}
+  end
+
+  deftransform update_layers(params, grads, state, step_count, lr) do
+    Enum.zip([
+      Tuple.to_list(params.layers),
+      Tuple.to_list(grads.layers),
+      Tuple.to_list(state.layers)
+    ])
+    |> Enum.map(fn {l_param, l_grad, l_state} ->
+      {up_conv, nm_conv, nv_conv} = adam_update(l_param.conv, l_grad.conv, l_state.m_conv, l_state.v_conv, step_count, lr)
+      {up_norm, nm_norm, nv_norm} = adam_update(l_param.norm, l_grad.norm, l_state.m_norm, l_state.v_norm, step_count, lr)
+      schulz_grad = newton_schulz(l_grad.proj)
+      up_proj = Nx.subtract(l_param.proj, Nx.multiply(lr, schulz_grad))
+  
+      {%{conv: up_conv, norm: up_norm, proj: up_proj},
+       %{m_conv: nm_conv, v_conv: nv_conv, m_norm: nm_norm, v_norm: nv_norm}}
+    end)
+    |> Enum.unzip()
+    |> then(fn {lp, ls} -> {List.to_tuple(lp), List.to_tuple(ls)} end)
+  end
+
+  defn step(params, grads, state, lr) do
+    step_count = state.step
+  
+    {up_emb, nm_emb, nv_emb}   = adam_update(params.emb, grads.emb, state.m_emb, state.v_emb, step_count, lr)
+    {up_head, nm_head, nv_head} = adam_update(params.head, grads.head, state.m_head, state.v_head, step_count, lr)
+  
+    {new_layer_params, new_layer_states} = update_layers(params, grads, state, step_count, lr)
+  
+    new_params = %{emb: up_emb, layers: new_layer_params, head: up_head}
+    new_state  = %{step: step_count + 1,
+                   m_emb: nm_emb, v_emb: nv_emb,
+                   m_head: nm_head, v_head: nv_head,
+                   layers: new_layer_states}
+    {new_params, new_state}
+
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.MuonHybrid, <<70, 79, 82, 49, 0, 0, 47, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Trainer
+
+```elixir
+defmodule DLM.BigBrainTrainer do
+  import Nx.Defn
+
+  defn log_softmax(logits) do
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = logits - max_logits
+    sum_exp = Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)
+    safe_logits - Nx.log(sum_exp)
+  end
+
+  defn compute_loss(preds_sliced, targets) do
+    log_probs = log_softmax(preds_sliced)
+    
+    target_probs = Nx.take_along_axis(log_probs, Nx.new_axis(targets, -1), axis: -1)
+    target_probs = Nx.squeeze(target_probs, axes: [-1])
+    
+    # ⚡ THE FIX: Cast the mask to f32 to prevent division-by-zero overflow!
+    mask = Nx.not_equal(targets, 0) |> Nx.as_type(:f32)
+    masked_loss = -target_probs * mask
+    
+    Nx.sum(masked_loss) / Nx.sum(mask)
+  end
+
+  # Just forward + grad — compiled as one graph
+  defn compute_grad(params, pos_emb, batch) do
+    value_and_grad(params, fn p ->
+      batch_s32 = Nx.as_type(batch, :s32)
+      preds = DLM.BigBrainSSM.forward(batch_s32, p, pos_emb)
+      preds_sliced = Nx.slice_along_axis(preds, 0, 255, axis: 1)
+      targets = Nx.slice_along_axis(batch_s32, 1, 255, axis: 1)
+      compute_loss(preds_sliced, targets)
+    end)
+  end
+
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.BigBrainTrainer, <<70, 79, 82, 49, 0, 0, 21, ...>>, true}
+```
+
+```elixir
+# 1. Load the Cached Data (1 millisecond!)
+IO.puts("🧠 Loading BigBrain Dataset...")
+full_dataset = File.read!("bigbrain_phase1_data.bin") 
+  |> :erlang.binary_to_term()
+  |> Nx.backend_copy(Nx.BinaryBackend)  # ← force onto CPU before anything else
+# IO.puts("Dataset backend: #{inspect(Nx.backend(full_dataset))}")
+
+# 2. Setup Hyperparameters
+batch_size = 1
+epochs = 2
+save_interval = 1000
+lr = 3.0e-4
+gpu = {EXLA.Backend, client: :rocm}
+
+# Chunk the massive dataset into GPU-sized batches
+batches = Nx.to_batched(full_dataset, batch_size)
+total_steps_per_epoch = Nx.axis_size(full_dataset, 0) |> div(batch_size)
+
+# 3. Initialize Model, Positional Embeddings, and Optimizer
+IO.puts("🏗️ Initializing Rank 64 Architecture...")
+params = DLM.BigBrainSSM.init_params() |> Nx.backend_copy(gpu)
+pos_emb = DLM.Positional.build(256, 64) |> Nx.backend_copy(gpu) # Note: Dim 64 now!
+
+opt_state = DLM.MuonHybrid.init_state(params)
+
+# 4. The Outer Training Loop
+IO.puts("🚀 IGNITION: Starting Epoch 1...")
+
+Enum.reduce(1..epochs, {params, opt_state}, fn epoch, {current_params, current_opt_state} ->
+  IO.puts("🌊 EPOCH #{epoch} / #{epochs}")
+
+  # ✅ Recreate stream fresh each epoch, lazily sliced on CPU
+  epoch_batches = Stream.unfold(0, fn offset ->
+    if offset >= Nx.axis_size(full_dataset, 0) do
+      nil
+    else
+      actual_size = min(batch_size, Nx.axis_size(full_dataset, 0) - offset)
+      batch = Nx.slice_along_axis(full_dataset, offset, actual_size, axis: 0)
+      {batch, offset + batch_size}
+    end
+  end)
+
+  epoch_batches
+  |> Stream.with_index(1)
+  |> Enum.reduce({current_params, current_opt_state}, fn {batch, step}, {p, opt} ->
+    IO.puts("🔬 Step #{step}")
+    # Move the current batch to the GPU
+    gpu_batch = Nx.backend_copy(batch, gpu)
+
+    IO.puts("🔬 Testing single step... batch on gpu")
+
+    {loss_tensor, grads} = DLM.BigBrainTrainer.compute_grad(p, pos_emb, gpu_batch)
+    IO.puts("🔬 Testing single step... grads computed")
+    {new_p, new_opt} = DLM.MuonHybrid.step(p, grads, opt, lr)
+    IO.puts("🔬 Testing single step... new p and opt calculated")
+
+    loss_val = Nx.to_number(loss_tensor)  # pulls to CPU and frees GPU buffer
+    # Logging
+    if rem(step, 10) == 0 do
+      mem = :erlang.memory(:total) |> div(1024 * 1024)
+      IO.puts("➡️ Epoch #{epoch} | Step #{step}/#{total_steps_per_epoch} | Loss: #{loss_val} | RAM: #{mem}MB")
+    end
+
+    if rem(step, save_interval) == 0 do
+      IO.puts("💾 Checkpointing...")
+      state_to_save = %{
+        params: Nx.backend_copy(new_p, Nx.BinaryBackend),    # ← copy, not transfer
+        opt_state: Nx.backend_copy(new_opt, Nx.BinaryBackend),
+        step: step
+      }
+      File.write!("bigbrain_epoch#{epoch}_step#{step}.bin", :erlang.term_to_binary(state_to_save))
+    end
+
+    # Garbage Collect to keep Elixir RAM low
+    if rem(step, 50) == 0, do: :erlang.garbage_collect(self())
+
+    {new_p, new_opt}
+  end)
+end)
+
+IO.puts("🎉 BIG BRAIN PRE-TRAINING COMPLETE!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Loading BigBrain Dataset...
+🏗️ Initializing Rank 64 Architecture...
+
+00:22:37.674 [info] XLA service 0x7483ac33e300 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+00:22:37.676 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+00:22:37.676 [info] Using BFC allocator.
+
+00:22:37.676 [info] XLA backend allocating 7715841638 bytes on device 0 for BFCAllocator.
+
+00:22:37.676 [info] XLA backend will use up to 857315737 bytes on device 0 for CollectiveBFCAllocator.
+🚀 IGNITION: Starting Epoch 1...
+🌊 EPOCH 1 / 2
+🔬 Step 1
+🔬 Testing single step... batch on gpu
+
+00:22:38.589 [info] Merging Dots in computation: main.20
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Init
+
+```elixir
+defmodule DLM.DataBuilder do
+  @seq_len 256
+  @pad_token 0
+
+  @doc """
+  Takes a list of file paths, combines them, shuffles the lines 
+  to prevent overfitting, and builds the static training tensors.
+  """
+  def build_combined_tensors(file_paths) when is_list(file_paths) do
+    # 1. Read and combine all files into one massive list of lines
+    raw_lines = 
+      Enum.flat_map(file_paths, fn path ->
+        File.stream!(path)
+        |> Stream.map(&String.trim/1)
+        # Skip the copyright and license headers at the top of the file
+        |> Stream.reject(fn line -> String.starts_with?(line, "  ") end)
+        # We must convert the stream to a list here so flat_map can merge them
+        |> Enum.to_list()
+      end)
+
+    # 2. 🔀 THE CRITICAL SHUFFLE
+    # We do this in standard Elixir memory before it hits the GPU
+    shuffled_lines = Enum.shuffle(raw_lines)
+
+    # 3. Format, Pad, and Tensorize
+    shuffled_lines
+    |> Enum.map(&parse_synset/1)
+    |> Enum.reject(&is_nil/1)
+    |> Nx.tensor(type: :s32)
+  end
+
+  defp parse_synset(line) do
+    case String.split(line, " | ") do
+      [data_chunk, gloss] ->
+        tokens = String.split(data_chunk, " ", trim: true)
+        
+        # Token index 3 is the hex count of words in this synset
+        w_cnt = String.to_integer(Enum.at(tokens, 3), 16)
+        
+        # Words start at index 4 and alternate with their lex_ids
+        words = 
+          Enum.reduce(0..(w_cnt - 1), [], fn i, acc ->
+            word_index = 4 + (i * 2)
+            raw_word = Enum.at(tokens, word_index)
+            # WordNet uses underscores for spaces (e.g., "fountain_pen")
+            clean_word = String.replace(raw_word, "_", " ")
+            [clean_word | acc]
+          end)
+          |> Enum.reverse()
+
+        [main_word | synonyms] = words
+        
+        # Build the minimalist anchor string
+        raw_str = 
+          if Enum.empty?(synonyms) do
+            "#{main_word} = #{gloss}"
+          else
+            "#{main_word} = #{gloss} | #{Enum.join(synonyms, ", ")}"
+          end
+
+        format_to_tensor(raw_str)
+
+      _ -> nil
+    end
+  end
+
+  defp format_to_tensor(raw_str) do
+    chars = String.to_charlist(raw_str)
+    actual_len = length(chars)
+
+    cond do
+      actual_len == @seq_len -> 
+        chars
+      actual_len > @seq_len -> 
+        Enum.take(chars, @seq_len)
+      actual_len < @seq_len -> 
+        chars ++ List.duplicate(@pad_token, @seq_len - actual_len)
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataBuilder, <<70, 79, 82, 49, 0, 0, 21, ...>>, {:format_to_tensor, 1}}
+```
+
+```elixir
+# In your Init cell, BEFORE building tensors
+Nx.global_default_backend(Nx.BinaryBackend)  # ← force CPU for dataset creation
+
+files = ["data.noun", "data.verb", "data.adj", "data.adv"]
+IO.puts("Parsing WordNet and shuffling dataset...")
+training_tensors = DLM.DataBuilder.build_combined_tensors(files)
+
+# Verify it's on CPU before saving
+# IO.puts("Backend: #{inspect(Nx.backend(training_tensors))}")  # should show BinaryBackend
+
+binary_data = :erlang.term_to_binary(training_tensors)
+File.write!("bigbrain_phase1_data.bin", binary_data)
+IO.puts("Done!")
+
+# Restore GPU as default after saving
+Nx.global_default_backend({EXLA.Backend, client: :rocm})
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Parsing WordNet and shuffling dataset...
+Done!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{Nx.BinaryBackend, []}
+```
