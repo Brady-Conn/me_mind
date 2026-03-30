@@ -1,0 +1,1625 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# V21_10
+
+```elixir
+# ===========================================================================
+# V20-BB Setup
+# ===========================================================================
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+System.put_env("XLA_CLIENT_MEM_FRACTION", "0.75")
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")        # ← disables the Merging Dots pass
+System.put_env("XLA_FLAGS", "--xla_gpu_enable_reassociation_for_converted_ar=false")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"}
+])
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+
+
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## USSM, Positional, Muon_Optimizer
+
+```elixir
+defmodule DLM.UniversalSSM do
+  import Nx.Defn
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  # ⚡ The Unbreakable Softplus
+  defn softplus(x) do
+    # ⚡ STABLE SOFTPLUS: Prevents Nx.exp() from blowing up to Infinity on huge activations
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+  
+  defn silu(x), do: x * Nx.sigmoid(x)
+
+  defn apply_svd_weight(x, u, v) do
+    x |> Nx.dot(u) |> silu() |> Nx.dot(v)
+  end
+
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2) do
+    # unchanged — a is now passed in per-loop rather than shared
+    x_mixed = x_t
+      |> Nx.add(apply_svd_weight(x_p1, mu1, mv1))
+      |> Nx.add(apply_svd_weight(x_p2, mu2, mv2))
+    delta_proj = apply_svd_weight(x_mixed, du, dv)
+    delta      = softplus(delta_proj)
+    a_bar      = Nx.sigmoid(Nx.multiply(delta, a))
+    b_proj     = apply_svd_weight(x_mixed, bu, bv)
+    b_bar      = Nx.multiply(delta, b_proj)
+    h_t        = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    y_ssm      = apply_svd_weight(h_t, cu, cv)
+    y_t        = Nx.add(y_ssm, x_mixed)
+    {y_t, h_t}
+  end
+
+  defn run_ssm_loop(x_seq_first, h_init, a_diag, params) do
+    {_emb, _a1, _a2, b_u, b_v, c_u, c_v, delta_u, delta_v,
+     mx_u1, mx_v1, mx_u2, mx_v2, _lm_w, _lm_b} = params
+
+    {seq_len, batch_size, embed_dim} = Nx.shape(x_seq_first)
+    y_init    = Nx.broadcast(Nx.tensor(0.0, type: :f32), {seq_len, batch_size, embed_dim})
+    zero_frame = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+
+
+    result_tuple =
+      while {i = 0, y_acc = y_init, h_p = h_init,
+             x_prev1 = zero_frame,
+             x_prev2 = zero_frame,
+             xs = x_seq_first,
+             a = a_diag, bu = b_u, bv = b_v, cu = c_u, cv = c_v, # ⚡ Use safe_a here!
+             du = delta_u, dv = delta_v,
+             mu1 = mx_u1, mv1 = mx_v1, mu2 = mx_u2, mv2 = mx_v2},
+            Nx.less(i, seq_len) do
+
+        x_t = xs[i]
+        {y_t, h_new} = ssm_recurrence(
+          x_t, x_prev1, x_prev2, h_p,
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+        )
+        y_acc_new = Nx.put_slice(y_acc, [i, 0, 0], Nx.new_axis(y_t, 0))
+        {i + 1, y_acc_new, h_new, x_t, x_prev1,
+         xs, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2}
+      end
+
+    elem(result_tuple, 1)
+  end
+
+  defn forward(indices, params, pos_emb) do
+    {embed, a_diag1, a_diag2, _bu, _bv, _cu, _cv, _du, _dv,
+     _mu1, _mv1, _mu2, _mv2, lm_w, lm_b} = params
+
+    x_input = Nx.take(embed, indices) + pos_emb
+    x_norm  = rms_norm(x_input)
+
+    {batch_size, _seq_len, embed_dim} = Nx.shape(x_norm)
+    h_init = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+    x_seq_first = Nx.transpose(x_norm, axes: [1, 0, 2])
+
+    # Each loop now gets its own independent a_diag
+    y1_seq = run_ssm_loop(x_seq_first, h_init, a_diag1, params)
+    y2_seq = run_ssm_loop(y1_seq,      h_init, a_diag2, params)
+
+    y_out   = Nx.transpose(y2_seq, axes: [1, 0, 2])
+    y_final = rms_norm(y_out)
+    Nx.dot(y_final, lm_w) + lm_b
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.UniversalSSM, <<70, 79, 82, 49, 0, 0, 49, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  # --- The Muon Newton-Schulz Engine ---
+  defn newton_schulz(g, iters \\ 5) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) + 1.0e-7
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, iters) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_update(grad, lr) do
+    Nx.subtract(0.0, Nx.multiply(lr, newton_schulz(grad)))
+  end
+
+  # --- Standard Adam Component ---
+  defn adam_update(param, grad, m, v, step, lr) do
+    # ⚡ THE FIX: Adam internally ensures the step is at least 1.0 to prevent division by zero
+    safe_step = step + 1.0
+
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  # --- The Hybrid Step ---
+  defn step(params, grads, ms, vs, step_count, lr) do
+    {p_emb, p_a1, p_a2, p_bu, p_bv, p_cu, p_cv, p_du, p_dv,
+      p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = params
+  
+    {g_emb, g_a1, g_a2, g_bu, g_bv, g_cu, g_cv, g_du, g_dv,
+      g_mu1, g_mv1, g_mu2, g_mv2, g_lmw, g_lmb} = grads
+  
+    {m_emb, m_a1, m_a2, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+      m_mu1, m_mv1, m_mu2, m_mv2, m_lmw, m_lmb} = ms
+  
+    {v_emb, v_a1, v_a2, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+      v_mu1, v_mv1, v_mu2, v_mv2, v_lmw, v_lmb} = vs
+  
+    # Adam for scalars and vocab tensors — now two a_diag entries
+    {up_emb, nm_emb, nv_emb} = adam_update(p_emb, g_emb, m_emb, v_emb, step_count, lr)
+    {up_a1,  nm_a1,  nv_a1}  = adam_update(p_a1,  g_a1,  m_a1,  v_a1,  step_count, lr)
+    {up_a2,  nm_a2,  nv_a2}  = adam_update(p_a2,  g_a2,  m_a2,  v_a2,  step_count, lr)
+    {up_lmw, nm_lmw, nv_lmw} = adam_update(p_lmw, g_lmw, m_lmw, v_lmw, step_count, lr)
+    {up_lmb, nm_lmb, nv_lmb} = adam_update(p_lmb, g_lmb, m_lmb, v_lmb, step_count, lr)
+  
+    # Muon for all SVD matrices — unchanged
+    up_bu  = p_bu  + muon_update(g_bu,  lr)
+    up_bv  = p_bv  + muon_update(g_bv,  lr)
+    up_cu  = p_cu  + muon_update(g_cu,  lr)
+    up_cv  = p_cv  + muon_update(g_cv,  lr)
+    up_du  = p_du  + muon_update(g_du,  lr)
+    up_dv  = p_dv  + muon_update(g_dv,  lr)
+    up_mu1 = p_mu1 + muon_update(g_mu1, lr)
+    up_mv1 = p_mv1 + muon_update(g_mv1, lr)
+    up_mu2 = p_mu2 + muon_update(g_mu2, lr)
+    up_mv2 = p_mv2 + muon_update(g_mv2, lr)
+  
+    new_params = {up_emb, up_a1, up_a2, up_bu, up_bv, up_cu, up_cv, up_du, up_dv,
+                  up_mu1, up_mv1, up_mu2, up_mv2, up_lmw, up_lmb}
+  
+    new_ms = {nm_emb, nm_a1, nm_a2, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+              m_mu1, m_mv1, m_mu2, m_mv2, nm_lmw, nm_lmb}
+  
+    new_vs = {nv_emb, nv_a1, nv_a2, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+              v_mu1, v_mv1, v_mu2, v_mv2, nv_lmw, nv_lmb}
+  
+    {new_params, new_ms, new_vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.MuonHybrid, <<70, 79, 82, 49, 0, 0, 42, ...>>, true}
+```
+
+```elixir
+defmodule DLM.V21_10Genesis do
+  @vocab_size 128
+  @dim 256
+  @rank 32
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    {embed,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@vocab_size, @dim})
+    # Two independent a_diag parameters — one per SSM loop
+    {a_diag1, key} = Nx.Random.normal(key, -2.0, 0.1, shape: {@dim})
+    {a_diag2, key} = Nx.Random.normal(key, -2.0, 0.1, shape: {@dim})
+    {b_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {b_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {c_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {c_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {d_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {d_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {lm_w,   key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @vocab_size})
+    {lm_b,  _key} = Nx.Random.normal(key, 0.0, 0.0,  shape: {@vocab_size})
+
+    {embed, a_diag1, a_diag2, b_u, b_v, c_u, c_v, d_u, d_v,
+     mx_u1, mx_v1, mx_u2, mx_v2, lm_w, lm_b}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    vs = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    {ms, vs, 1}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.V21_10Genesis, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inference
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+# ===========================================================================
+# 🐑 V21.10 INFERENCE PROBE: The Electric Sheep
+# ===========================================================================
+
+# defmodule DLM.Tree do
+#   def map(tuple, func) when is_tuple(tuple) do
+#     tuple |> Tuple.to_list() |> Enum.map(&map(&1, func)) |> List.to_tuple()
+#   end
+#   def map(tensor, func), do: func.(tensor)
+# end
+
+defmodule DLM.Sampler do
+  import Nx.Defn
+
+  # ⚡ The Gumbel-Max Trick: Using Nx's native Gumbel generator
+  defn sample(logits, temperature, key) do
+    # 1. Scale the raw logits to control the "creativity"
+    scaled_logits = logits / temperature
+    
+    # 2. Ask Nx to natively generate Gumbel noise in the exact shape of our logits
+    {gumbel_noise, next_key} = Nx.Random.gumbel(key, shape: Nx.shape(logits))
+    
+    # 3. Add the noise and pick the max!
+    sampled_index = Nx.argmax(scaled_logits + gumbel_noise, axis: -1)
+    
+    {sampled_index, next_key}
+  end
+end
+
+checkpoint_path = "v21_10_mixed_epoch3_COMPLETE.bin" # Update to your latest!
+IO.puts("🧠 Awakening V21.10 from #{checkpoint_path}...")
+
+checkpoint = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+params = DLM.Tree.map(checkpoint.params, &Nx.backend_transfer(&1, gpu))
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_transfer(gpu)
+
+prompt = "Do state space models dream of recursive sheep?"
+IO.puts("\nPrompt: \"#{prompt}\"\n")
+IO.write("V21.10:  ")
+
+prompt_tokens = prompt |> String.to_charlist() |> Enum.map(fn c -> if c < 128, do: c, else: 63 end)
+
+# Setup the Random Key for the categorical sampler
+key = Nx.Random.key(42)
+
+max_new_tokens = 150
+temperature = 0.65 # ⚡ 0.65 is the sweet spot for early character models
+
+{_final_key, _final_tokens} = 
+  Enum.reduce(1..max_new_tokens, {key, prompt_tokens}, fn _step, {current_key, current_tokens} ->
+    
+    window_tokens = Enum.take(current_tokens, -255)
+    current_len = length(window_tokens)
+    
+    pad_len = 256 - current_len
+    padded_list = window_tokens ++ List.duplicate(0, pad_len)
+    
+    input_tensor = Nx.tensor([padded_list], type: :s32) |> Nx.backend_transfer(gpu)
+    
+    logits = DLM.UniversalSSM.forward(input_tensor, params, pos_emb)
+    last_token_logits = logits[0][current_len - 1]
+    
+    # ⚡ Use the new sampler
+    {next_token_tensor, next_key} = DLM.Sampler.sample(last_token_logits, temperature, current_key) 
+    next_token = Nx.to_number(next_token_tensor)
+    
+    IO.write(<<next_token::utf8>>)
+    
+    {next_key, current_tokens ++ [next_token]}
+  end)
+
+IO.puts("\n\n🐑 Dream Complete.")
+
+# 🧠 Awakening V21.10 from v21_10_mixed_step15000.bin...
+# Prompt: "Do state space models dream of recursive sheep?"
+# V21.10:  
+#  *CHI: whie pid. *MOT: what the an Corsting the ald he of om chemend an the sand bbed poromushe tire my so soe rer rer on I way the sorrelor sean she 
+# 🐑 Dream Complete.
+
+# 🧠 Awakening V21.10 from v21_10_mixed_step20000.bin...
+# Prompt: "Do state space models dream of recursive sheep?"
+# V21.10:   *CHI: whit pid. *MOT: what the an that his the ald haio to pre. *CHI: whan sa cher fon, of shat ing my trosee rer rer on. Oh the dou han or se ces.. 
+# 🐑 Dream Complete.
+
+# 🧠 Awakening V21.10 from v21_10_mixed_step25000.bin...
+# Prompt: "Do state space models dream of recursive sheep?"
+# V21.10:   *CHI: 's and burk wour hat the an that his the ald heione mple onnd and my sand cand por aushe  ire my to ster ther thon. I my the sor of rascones.. 
+# 🐑 Dream Complete.
+
+# 🧠 Awakening V21.10 from v21_10_mixed_step30000.bin...
+# Prompt: "Do state space models dream of recursive sheep?"
+# V21.10:   *CHI: 's and burk wour hat the an that his the aldo tione mple onnd a when sa d cand por aushe aire my to see rer rer on. I my the sorr bort cones.. 
+# 🐑 Dream Complete.
+
+# 🧠 Awakening V21.10 from v21_10_mixed_step35000.bin...
+# Prompt: "Do state space models dream of recursive sheep?"
+# V21.10:   *CHI: 's and burk wour hat the an that his the aldo nion the hamend a whall a d cand por aushe aire my to see rer rer on. I my the sor of rascones.. 
+# 🐑 Dream Complete.
+
+
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Awakening V21.10 from v21_10_mixed_epoch3_COMPLETE.bin...
+
+Prompt: "Do state space models dream of recursive sheep?"
+
+V21.10:   *CHI: 's and burk wour hat the an that his the aldo nion the hamend a whall a d cand por aushe aire my to see rer rer on. I my the sor of rascones.. 
+
+🐑 Dream Complete.
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+defmodule DLM.InferenceV21 do
+  import Nx.Defn
+
+  @allowed_chars ~c" abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,:;-'\"()[]"
+
+  def build_muzzle(vocab_size \\ 128, allowed \\ @allowed_chars) do
+    muzzle = Nx.broadcast(Nx.tensor(-1.0e10, type: :f32), {vocab_size})
+    Enum.reduce(allowed, muzzle, fn char, acc ->
+      Nx.indexed_put(acc, Nx.tensor([[char]]), Nx.tensor([0.0]))
+    end)
+  end
+
+  defn get_next_logits(ins_padded, actual_len_tensor, params, pos_emb, muzzle) do
+    logits = DLM.UniversalSSM.forward(ins_padded, params, pos_emb)
+    target_idx = actual_len_tensor - 1
+    logits[0][target_idx] + muzzle
+  end
+
+  defn apply_rep_penalty(logits, recent_tokens, penalty_weight) do
+    vocab_size = elem(Nx.shape(logits), 0)
+    mask =
+      recent_tokens
+      |> Nx.new_axis(-1)
+      |> Nx.equal(Nx.iota({vocab_size}))
+      |> Nx.any(axes: [0])
+    penalized = Nx.select(logits > 0.0, logits / penalty_weight, logits * penalty_weight)
+    Nx.select(mask, penalized, logits)
+  end
+
+  def top_k(params, pos_emb, prompt, max_new_chars \\ 120, k \\ 3, temp \\ 0.4, muzzle \\ nil) do
+    gpu = {EXLA.Backend, client: :rocm}
+    muzzle = (muzzle || build_muzzle()) |> Nx.backend_copy(gpu)
+    prompt_chars = String.to_charlist(prompt)
+    max_seq = elem(Nx.shape(pos_emb), 0)
+    penalty_weight = Nx.tensor(1.2, type: :f32) |> Nx.backend_copy(gpu)
+
+    Enum.reduce(1..max_new_chars, {prompt_chars, Nx.Random.key(42)}, fn step, {chars, key} ->
+      window_chars = Enum.take(chars, -max_seq)
+      actual_len = length(window_chars)
+      pad_len = max_seq - actual_len
+      padded_chars = window_chars ++ List.duplicate(0, pad_len)
+
+      ins_padded = Nx.tensor([padded_chars], type: :s32) |> Nx.backend_copy(gpu)
+      len_tensor = Nx.tensor(actual_len, type: :s32)     |> Nx.backend_copy(gpu)
+
+      logits = get_next_logits(ins_padded, len_tensor, params, pos_emb, muzzle)
+
+      recent_tensor = chars |> Enum.take(-50) |> Nx.tensor(type: :s32) |> Nx.backend_copy(gpu)
+      penalized = apply_rep_penalty(logits, recent_tensor, penalty_weight)
+
+      {next_token, next_key} = sample_top_k_logits(penalized, temp, key, k: k)
+      if rem(step, 10) == 0, do: :erlang.garbage_collect(self())
+      {chars ++ [Nx.to_number(next_token)], next_key}
+    end)
+    |> elem(0)
+    |> List.to_string()
+  end
+
+  defn sample_top_k_logits(logits, temp, key, opts \\ []) do
+    k = opts[:k]
+    scaled = logits / temp
+    {values, indices} = Nx.top_k(scaled, k: k)
+    probs = Nx.exp(values) / Nx.sum(Nx.exp(values))
+    {sample_val, next_key} = Nx.Random.uniform(key)
+    cumulative = probs |> Nx.window_sum({k}, padding: :valid) |> Nx.squeeze()
+    selected_idx = Nx.argmax(cumulative > sample_val)
+    {indices[selected_idx], next_key}
+  end
+
+  def greedy(params, pos_emb, prompt, max_new_chars) do
+    gpu = {EXLA.Backend, client: :rocm}
+    # Build muzzle so it doesn't output illegal characters
+    muzzle = build_muzzle() |> Nx.backend_copy(gpu)
+    prompt_chars = String.to_charlist(prompt)
+    max_seq = elem(Nx.shape(pos_emb), 0)
+
+    # The Autoregressive Loop
+    final_tokens = Enum.reduce(1..max_new_chars, prompt_chars, fn step, chars ->
+      # Windowing and padding to keep shapes perfectly stable at [1, 256]
+      window_chars = Enum.take(chars, -max_seq)
+      actual_len = length(window_chars)
+      pad_len = max_seq - actual_len
+      padded_chars = window_chars ++ List.duplicate(0, pad_len)
+
+      ins_padded = Nx.tensor([padded_chars], type: :s32) |> Nx.backend_copy(gpu)
+      len_tensor = Nx.tensor(actual_len, type: :s32) |> Nx.backend_copy(gpu)
+
+      # 🧠 Forward pass utilizing the exact same highly-optimized defn as top_k
+      logits = get_next_logits(ins_padded, len_tensor, params, pos_emb, muzzle)
+
+      # 🎯 GREEDY MATH: Just grab the absolute highest probability index
+      next_token = Nx.argmax(logits) |> Nx.to_number()
+
+      if rem(step, 10) == 0, do: :erlang.garbage_collect(self())
+
+      chars ++ [next_token]
+    end)
+
+    # NATIVELY convert the integer list back to a viewable string
+    final_tokens
+    |> Enum.map(&max(0, min(&1, 127)))
+    |> List.to_string()
+  end
+end
+
+IO.puts("✅ DLM.InferenceV21 loaded")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+✅ DLM.InferenceV21 loaded
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# 🔍 DYNAMIC CHECKPOINT FINDER
+latest_checkpoint = "v21_10_mixed_epoch3_COMPLETE.bin"
+
+IO.puts("🧠 Loading Weights from: #{latest_checkpoint}")
+checkpoint = File.read!(latest_checkpoint) |> :erlang.binary_to_term()
+
+gpu = {EXLA.Backend, client: :rocm}
+params = checkpoint.params |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy(gpu)
+
+# 🧪 THE PROMPT SUITE
+prompts = [
+  {"Standard Definition", "[W]Algorithm[T]n.[D]"},
+  {"Phonetic Invention", "[W]Chronoflux[T]n.[D]"},
+  {"PKD Easter Egg", "Do state space models dream of recursive sheep?"},
+  {"Conversational Semantic", "Good morning BigBrain! How are you today?"},
+  {"Jeopardy Style (Reverse)", "[D]A mathematical process for solving a problem.[W]"}
+]
+
+IO.puts("\n✨ IGNITING INFERENCE ENGINE...\n")
+
+Enum.each(prompts, fn {test_name, text} ->
+  IO.puts(String.duplicate("=", 60))
+  IO.puts("🧪 TEST: #{test_name}")
+  IO.puts("📝 PROMPT: #{text}\n")
+  
+  # 🎯 1. GREEDY DECODING
+  greedy_out = DLM.InferenceV21.greedy(params, pos_emb, text, 120)
+  IO.puts("🎯 GREEDY (Highest Confidence):\n#{greedy_out}\n")
+
+  # 🎲 2. TOP-K DECODING
+  top_k_out = DLM.InferenceV21.top_k(params, pos_emb, text, 120, 3, 0.5)
+  IO.puts("🎲 TOP-K (Creative, k=3, t=0.5):\n#{top_k_out}\n")
+end)
+
+IO.puts(String.duplicate("=", 60))
+IO.puts("🏁 INFERENCE SUITE COMPLETE.")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Loading Weights from: v21_10_mixed_epoch3_COMPLETE.bin
+
+✨ IGNITING INFERENCE ENGINE...
+
+============================================================
+🧪 TEST: Standard Definition
+📝 PROMPT: [W]Algorithm[T]n.[D]
+
+🎯 GREEDY (Highest Confidence):
+[W]Algorithm[T]n.[D] with and the the the the the the the the the the the the the the the the the the the the the the the the the the the th
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+[W]Algorithm[T]n.[D] was and the the the the the the the the the the the the the the the the the the ther and the the the to the sing the th
+
+============================================================
+🧪 TEST: Phonetic Invention
+📝 PROMPT: [W]Chronoflux[T]n.[D]
+
+🎯 GREEDY (Highest Confidence):
+[W]Chronoflux[T]n.[D] [s and the the the the the the the the the the the the the the the the the the the the the the the the the the the the 
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+[W]Chronoflux[T]n.[D] with a ded the the the sting the the to the the the the the the the the the the ther and the the the the the sould the 
+
+============================================================
+🧪 TEST: PKD Easter Egg
+📝 PROMPT: Do state space models dream of recursive sheep?
+
+🎯 GREEDY (Highest Confidence):
+Do state space models dream of recursive sheep? the the the the the the the the the the the the the the the the the the the the the the the the sore the the the the th
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+Do state space models dream of recursive sheep? [s and the the the the the the to the the the the the ther and the the the the the sould the the sore the the the the t
+
+============================================================
+🧪 TEST: Conversational Semantic
+📝 PROMPT: Good morning BigBrain! How are you today?
+
+🎯 GREEDY (Highest Confidence):
+Good morning BigBrain! How are you today? and the the the the the the the the the the the the the the the the the the the the the the the the the the the the the
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+Good morning BigBrain! How are you today? and the the the some the the the the the the the the the the the the sord the the the the the the the sand the the the 
+
+============================================================
+🧪 TEST: Jeopardy Style (Reverse)
+📝 PROMPT: [D]A mathematical process for solving a problem.[W]
+
+🎯 GREEDY (Highest Confidence):
+[D]A mathematical process for solving a problem.[W] [lly and the the the the the the the the the the the the the the the the the the the the the sore the the the the the t
+
+🎲 TOP-K (Creative, k=3, t=0.5):
+[D]A mathematical process for solving a problem.[W] [lly and the the the the the the the the the the ther and the the the to the sing the the the the the the the the the t
+
+============================================================
+🏁 INFERENCE SUITE COMPLETE.
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Stream
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 13, ...>>, {:stream, 3}}
+```
+
+```elixir
+defmodule BabyLM.ScholarParser do
+  @sequence_length 256 
+
+  @datasets %{
+    childes: ["childes.train.txt"], 
+    bnc: ["bnc_spoken.train.txt"],
+    switchboard: ["switchboard.train.txt"],
+    subtitles: ["open_subtitles.train.txt"], 
+    wiki: ["simple_wiki.train.txt"],
+    gutenberg: ["gutenberg.train.txt"]
+  }
+
+  def build_scholar_curriculum(directory_path) do
+    childes_chunks = load_and_chunk(directory_path, @datasets.childes)
+    bnc_chunks = load_and_chunk(directory_path, @datasets.bnc)
+    switchboard_chunks = load_and_chunk(directory_path, @datasets.switchboard)
+    subtitles_chunks = load_and_chunk(directory_path, @datasets.subtitles)
+    wiki_chunks = load_and_chunk(directory_path, @datasets.wiki)
+    gutenberg_chunks = load_and_chunk(directory_path, @datasets.gutenberg)
+
+
+    # A fully shuffled mix: 49% scholar, 50% child, 1% subtitle/switchboard
+    IO.puts("\n🧬 Mixing FULL Dataset Timeline...")
+
+    # Smash all the chunks together into one massive list, then shuffle
+    master_timeline = 
+      (wiki_chunks ++ gutenberg_chunks ++ subtitles_chunks ++ 
+       switchboard_chunks ++ childes_chunks ++ bnc_chunks)
+      |> Enum.shuffle()
+
+    IO.puts("📦 Packing #{length(master_timeline)} sequences into Nx Tensor...")
+    dataset_tensor = 
+      Nx.tensor(master_timeline, type: :u8)
+      |> Nx.backend_transfer(Nx.BinaryBackend) 
+    
+    File.write!("scholar_full_mixed.bin", :erlang.term_to_binary(dataset_tensor))
+    IO.puts("🎉 scholar_full_mixed.bin successfully generated!")
+  end
+
+  defp normalize_char(c) do
+    cond do
+      c < 128 -> c              # ASCII passthrough
+      
+      # Common accented Latin — map to base character
+      c in 0xC0..0xC5 -> ?A     # À Á Â Ã Ä Å
+      c in 0xC8..0xCB -> ?E     # È É Ê Ë
+      c in 0xCC..0xCF -> ?I     # Ì Í Î Ï
+      c in 0xD2..0xD6 -> ?O     # Ò Ó Ô Õ Ö
+      c in 0xD9..0xDC -> ?U     # Ù Ú Û Ü
+      c in 0xE0..0xE5 -> ?a     # à á â ã ä å
+      c in 0xE8..0xEB -> ?e     # è é ê ë
+      c in 0xEC..0xEF -> ?i     # ì í î ï
+      c in 0xF2..0xF6 -> ?o     # ò ó ô õ ö
+      c in 0xF9..0xFC -> ?u     # ù ú û ü
+      c == 0xD1 -> ?N           # Ñ
+      c == 0xF1 -> ?n           # ñ
+      c == 0xC7 -> ?C           # Ç
+      c == 0xE7 -> ?c           # ç
+      c == 0xDF -> ?s           # ß -> ss would be ideal but single char is fine
+      c == 0xD8 -> ?O           # Ø
+      c == 0xF8 -> ?o           # ø
+      c == 0xC6 -> ?A           # Æ
+      c == 0xE6 -> ?a           # æ
+  
+      # Smart quotes -> straight quotes
+      c in [0x2018, 0x2019] -> ?'
+      c in [0x201C, 0x201D] -> ?"
+      
+      # Dashes
+      c in [0x2013, 0x2014] -> ?-   # en-dash, em-dash
+      
+      # Ellipsis
+      c == 0x2026 -> ?.
+      
+      # Everything else — use a dedicated replacement token
+      # Use ASCII 1 (SOH) which never appears naturally in text
+      true -> 1
+    end
+  end
+
+  defp load_and_chunk(dir, files) do
+    raw_text =
+      files
+      |> Enum.map(fn file ->
+        path = Path.join(dir, file)
+        if File.exists?(path) do
+          IO.puts("  ✅ Loaded #{file}")
+          File.read!(path) |> String.replace(~r/\s+/, " ")
+        else
+          IO.puts("  ❌ Missing #{file} (Skipping...)")
+          ""
+        end
+      end)
+      |> Enum.join(" ")
+  
+    raw_text
+    |> String.to_charlist()
+    |> Enum.map(&normalize_char/1)
+    # Filter out chunks with too many replacement tokens (token 1)
+    # rather than too many 63s
+    |> Enum.chunk_every(@sequence_length, @sequence_length, :discard)
+    |> Enum.filter(fn chunk -> 
+      replacement_count = Enum.count(chunk, &(&1 == 1))
+      replacement_count < 8   # stricter than before — less than 3% replacements
+    end)
+  end
+
+  defp sample_chunks(chunks, percentage, _base_amount) do
+    take_amount = round(length(chunks) * percentage)
+    chunks |> Enum.shuffle() |> Enum.take(take_amount)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+warning: function sample_chunks/3 is unused
+└─ v21_10.livemd#cell:6tcqkioudwubq2bx:108: BabyLM.ScholarParser (module)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, BabyLM.ScholarParser, <<70, 79, 82, 49, 0, 0, 30, ...>>, {:sample_chunks, 3}}
+```
+
+```elixir
+# === RUN THE PARSER ===
+# Point this to the folder containing your new BabyLM text files.
+# It will ignore everything else in the folder.
+data_dir = "./" 
+
+BabyLM.ScholarParser.build_scholar_curriculum(data_dir)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+  ✅ Loaded childes.train.txt
+  ✅ Loaded bnc_spoken.train.txt
+  ✅ Loaded switchboard.train.txt
+  ✅ Loaded open_subtitles.train.txt
+  ✅ Loaded simple_wiki.train.txt
+  ✅ Loaded gutenberg.train.txt
+
+🧬 Mixing FULL Dataset Timeline...
+📦 Packing 211048 sequences into Nx Tensor...
+
+13:38:51.576 [info] XLA service 0x741e9404a140 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+13:38:51.587 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+13:38:51.587 [info] Using BFC allocator.
+
+13:38:51.587 [info] XLA backend allocating 7715841638 bytes on device 0 for BFCAllocator.
+
+13:38:51.587 [info] XLA backend will use up to 857315737 bytes on device 0 for CollectiveBFCAllocator.
+🎉 scholar_full_mixed.bin successfully generated!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.V21_10Trainer do
+  import Nx.Defn
+
+  def grad_norms(grads) do
+  names = ~w[embed a_diag1 a_diag2 b_u b_v c_u c_v d_u d_v mx_u1 mx_v1 mx_u2 mx_v2 lm_w lm_b]
+    grads
+    |> Tuple.to_list()
+    |> Enum.zip(names)
+    |> Enum.map(fn {g, name} ->
+      norm = g |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+      {name, Float.round(norm, 4)}
+    end)
+  end
+
+  defn log_softmax(logits) do
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = logits - max_logits
+    sum_exp = Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)
+    safe_logits - Nx.log(sum_exp)
+  end
+
+  defn compute_loss(preds_sliced, targets) do
+    log_probs = log_softmax(preds_sliced)
+    target_probs = Nx.take_along_axis(log_probs, Nx.new_axis(targets, -1), axis: -1)
+    target_probs = Nx.squeeze(target_probs, axes: [-1])
+    mask = Nx.not_equal(targets, 0) |> Nx.as_type(:f32)
+  
+    # Guard against near-empty batches — require at least 10% real content
+    total_tokens = Nx.sum(mask)
+    min_tokens   = Nx.tensor(408.0, type: :f32)  # 10% of batch
+    safe_denom   = Nx.max(total_tokens, min_tokens)
+  
+    masked_loss = -target_probs * mask
+    Nx.sum(masked_loss) / safe_denom
+  end
+
+  # ⚡ THE FIREWALL: Only zeroes out NaNs/Infinities. Leaves clipping to the global norm.
+  defn sanitize_tensor(g) do
+    bad_mask = Nx.logical_or(Nx.is_nan(g), Nx.is_infinity(g))
+    Nx.select(bad_mask, 0.0, g)
+  end
+  
+  # ⚡ Explicitly unpack and sanitize V21.10's 15 parameters
+  defn clip_grads(grads) do
+    {g_emb, g_a1, g_a2, g_bu, g_bv, g_cu, g_cv, g_du, g_dv, g_mu1, g_mv1, g_mu2, g_mv2, g_lmw, g_lmb} = grads
+    {
+      sanitize_tensor(g_emb),
+      sanitize_tensor(g_a1),
+      sanitize_tensor(g_a2),
+      sanitize_tensor(g_bu),
+      sanitize_tensor(g_bv),
+      sanitize_tensor(g_cu),
+      sanitize_tensor(g_cv),
+      sanitize_tensor(g_du),
+      sanitize_tensor(g_dv),
+      sanitize_tensor(g_mu1),
+      sanitize_tensor(g_mv1),
+      sanitize_tensor(g_mu2),
+      sanitize_tensor(g_mv2),
+      sanitize_tensor(g_lmw),
+      sanitize_tensor(g_lmb)
+    }
+  end
+
+  defn compute_grad(params, pos_emb, batch) do
+    {loss, raw_grads} = value_and_grad(params, fn p ->
+      batch_s32 = Nx.as_type(batch, :s32)
+      preds = DLM.UniversalSSM.forward(batch_s32, p, pos_emb)
+      preds_sliced = Nx.slice_along_axis(preds, 0, 255, axis: 1)
+      targets = Nx.slice_along_axis(batch_s32, 1, 255, axis: 1)
+      compute_loss(preds_sliced, targets)
+    end)
+
+    {rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7, rg8, rg9, rg10, rg11, rg12, rg13, rg14} = raw_grads
+
+    # ⚡ 1. Pass everything through the firewall FIRST
+    g0 = sanitize_tensor(rg0)
+    g1 = sanitize_tensor(rg1)
+    g2 = sanitize_tensor(rg2)
+    g3 = sanitize_tensor(rg3)
+    g4 = sanitize_tensor(rg4)
+    g5 = sanitize_tensor(rg5)
+    g6 = sanitize_tensor(rg6)
+    g7 = sanitize_tensor(rg7)
+    g8 = sanitize_tensor(rg8)
+    g9 = sanitize_tensor(rg9)
+    g10 = sanitize_tensor(rg10)
+    g11 = sanitize_tensor(rg11)
+    g12 = sanitize_tensor(rg12)
+    g13 = sanitize_tensor(rg13)
+    g14 = sanitize_tensor(rg14)
+
+    # ⚡ 2. Calculate Global Norm on the 100% clean gradients
+    global_norm =
+      Nx.sum(Nx.pow(g0, 2))
+      |> Nx.add(Nx.sum(Nx.pow(g1, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g2, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g3, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g4, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g5, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g6, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g7, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g8, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g9, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g10, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g11, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g12, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g13, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g14, 2)))
+      |> Nx.sqrt()
+
+    max_norm = 0.33
+    scale = Nx.min(1.0, max_norm / (global_norm + 1.0e-6))
+
+    # ⚡ 3. Apply the scale
+    clipped_grads = {
+      g0  * scale, g1  * scale, g2  * scale,
+      g3  * scale, g4  * scale, g5  * scale,
+      g6  * scale, g7  * scale, g8  * scale,
+      g9  * scale, g10 * scale, g11 * scale,
+      g12 * scale, g13 * scale, g14 * scale
+    }
+
+    {loss, clipped_grads}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.V21_10Trainer, <<70, 79, 82, 49, 0, 0, 44, ...>>, true}
+```
+
+```elixir
+save_interval = 1000
+gpu = {EXLA.Backend, client: :rocm}
+
+IO.puts("🧠 Loading v21_10 Curriculum into CPU Memory...")
+full_dataset = File.read!("scholar_full_mixed.bin") |> :erlang.binary_to_term()
+dataset_size = Nx.axis_size(full_dataset, 0)
+batch_size = 16
+
+total_steps_per_epoch = div(dataset_size, batch_size)
+max_epochs = 3
+total_steps = total_steps_per_epoch * max_epochs
+
+save_prefix = "v21_10_mixed"
+
+latest_scholar =
+  Path.wildcard("#{save_prefix}_*.bin")
+  |> Enum.reject(&String.contains?(&1, "data.bin"))
+  |> Enum.max_by(fn path -> File.stat!(path).mtime end, fn -> nil end)
+
+{params, ms, vs, global_step, current_epoch, saved_key} =
+  cond do
+    latest_scholar != nil ->
+      IO.puts("💾 Resuming from checkpoint: #{latest_scholar}")
+      checkpoint = File.read!(latest_scholar) |> :erlang.binary_to_term()
+      p = DLM.Tree.map(checkpoint.params, &Nx.backend_copy(&1, gpu))
+      m = DLM.Tree.map(checkpoint.ms, &Nx.backend_copy(&1, gpu))
+      v = DLM.Tree.map(checkpoint.vs, &Nx.backend_copy(&1, gpu))
+      saved_key = Map.get(checkpoint, :shuffle_key, Nx.Random.key(42))
+        |> Nx.backend_copy(gpu)
+      {p, m, v, checkpoint.step, checkpoint.epoch, saved_key}
+
+    true ->
+      IO.puts("✨ No checkpoint found. Igniting FRESH Genesis state...")
+      raw_p = DLM.V21_10Genesis.init_params(42)
+      {raw_m, raw_v, _} = DLM.V21_10Genesis.init_optimizer(raw_p)
+      p = raw_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+      m = raw_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+      v = raw_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+      saved_key = Nx.Random.key(42) |> Nx.backend_copy(gpu)
+      {p, m, v, 0, 1, saved_key}
+  end
+
+base_lr = 3.0e-4
+min_lr  = 1.0e-6
+warmup_steps = 500
+
+pos_emb = DLM.Positional.build(256, 256) |> Nx.backend_copy(gpu)
+IO.puts("🚀 IGNITION: Starting V21.10 at Epoch #{current_epoch}, Global Step #{global_step}...")
+
+Enum.reduce(current_epoch..max_epochs, {params, ms, vs, global_step, saved_key},
+  fn epoch, {p, m, v, current_step, shuffle_key} ->
+  IO.puts(String.duplicate("=", 50))
+  IO.puts("🌊 EPOCH #{epoch} / #{max_epochs}")
+  IO.puts("🔀 Shuffling dataset...")
+
+  {shuffled_raw, next_shuffle_key} = Nx.Random.shuffle(shuffle_key, full_dataset, axis: 0)
+  shuffled_dataset = Nx.backend_copy(shuffled_raw, Nx.BinaryBackend)
+
+  start_offset = 
+    if epoch == current_epoch do
+      rem(current_step, total_steps_per_epoch) * batch_size
+    else
+      0
+    end
+
+  epoch_batches = Stream.unfold(start_offset, fn offset ->
+    if offset + batch_size > dataset_size do
+      nil
+    else
+      batch_2d = Nx.slice_along_axis(shuffled_dataset, offset, batch_size, axis: 0)
+      {batch_2d, offset + batch_size}
+    end
+  end)
+
+  {new_p, new_m, new_v, next_epoch_step, _final_skips} =
+    epoch_batches
+    |> Stream.with_index(1)
+    |> Enum.reduce({p, m, v, current_step, 0}, fn {batch, step_in_epoch}, {cp, cm, cv, cs, s_count} ->
+      gpu_batch = Nx.backend_copy(batch, gpu)
+
+      {loss_tensor, grads} = DLM.V21_10Trainer.compute_grad(cp, pos_emb, gpu_batch)
+      loss_val = Nx.to_number(loss_tensor)
+
+      if loss_val == :nan or loss_val > 4.0 do
+        cpu_batch = Nx.backend_copy(gpu_batch, Nx.BinaryBackend)
+        sequences = Nx.to_list(cpu_batch)
+        IO.puts("🔥 PATHOLOGICAL BATCH at global step #{cs}:")
+        Enum.each(sequences, fn seq ->
+          readable = seq |> Enum.reject(&(&1 == 0)) |> List.to_string()
+          IO.puts("   > #{readable}")
+        end)
+      end
+
+      if loss_val == :nan or loss_val > 4.0 do
+        if rem(step_in_epoch, 10) == 0,
+          do: IO.puts("⚠️ Step #{cs}: NaN/Spike detected. Skipping batch.")
+        {cp, cm, cv, cs + 1, s_count + 1}
+      else
+        # Calculate LR strictly using the Current Global Step (cs)
+        current_lr = 
+          if cs < warmup_steps do
+            # Linear Warmup
+            base_lr * (cs / warmup_steps)
+          else
+            # Cosine Decay
+            progress = (cs - warmup_steps) / (total_steps - warmup_steps)
+            clamped_progress = min(max(progress, 0.0), 1.0)
+            min_lr + 0.5 * (base_lr - min_lr) * (1.0 + :math.cos(:math.pi() * clamped_progress))
+          end
+
+          lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+          step_tensor = Nx.tensor(cs, type: :f32) |> Nx.backend_copy(gpu)
+  
+          {up_p, up_m, up_v} = DLM.MuonHybrid.step(cp, grads, cm, cv, step_tensor, lr_tensor)
+  
+          {p_emb, p_a1, p_a2, p_bu, p_bv, p_cu, p_cv, p_du, p_dv,
+           p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = up_p
+  
+          du_norm = p_du |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+  
+          up_p = if du_norm < 0.01 do
+            IO.puts("   🔧 Rescuing dead delta gate (d_u norm=#{Float.round(du_norm, 5)})")
+            rescaled_du = Nx.multiply(p_du, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+            rescaled_dv = Nx.multiply(p_dv, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+            {p_emb, p_a1, p_a2, p_bu, p_bv, p_cu, p_cv, rescaled_du, rescaled_dv,
+             p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb}
+          else
+            up_p
+        end
+
+        if rem(step_in_epoch, 50) == 0 do
+          bpc = loss_val / :math.log(2)
+          mem = :erlang.memory(:total) |> div(1024 * 1024)
+          cpu_grads = grads |> Tuple.to_list()
+            |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple()
+          norms = DLM.V21_10Trainer.grad_norms(cpu_grads)
+          {max_name, max_norm} = Enum.max_by(norms, fn {_name, n} -> n end)
+          norm_str = norms |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.join(" | ")
+          IO.puts("➡️  Step #{step_in_epoch} | Global: #{cs} | Loss: #{Float.round(loss_val, 4)} | BPC: #{Float.round(bpc, 3)} | LR: #{Float.round(current_lr, 6)} | RAM: #{mem}MB")
+          IO.puts("   📐 GRAD NORMS | MAX: #{max_name}=#{max_norm}")
+          IO.puts("   #{norm_str}")
+        end
+
+        if rem(cs, save_interval) == 0 and cs > 0 do
+          IO.puts("💾 Auto-Saving Checkpoint to #{save_prefix}_step#{cs}.bin...")
+          state = %{
+            params: up_p |> Tuple.to_list()
+              |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            ms: up_m |> Tuple.to_list()
+              |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            vs: up_v |> Tuple.to_list()
+              |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            step: cs, epoch: epoch,
+            shuffle_key: next_shuffle_key |> Nx.backend_copy(Nx.BinaryBackend)
+          }
+          File.write!("#{save_prefix}_step#{cs}.bin", :erlang.term_to_binary(state))
+        end
+
+        if rem(step_in_epoch, 100) == 0, do: :erlang.garbage_collect(self())
+
+        {up_p, up_m, up_v, cs + 1, s_count}
+      end
+    end)
+
+  IO.puts("💾 Saving Completed Epoch #{epoch} State...")
+  final_state = %{
+    params: new_p |> Tuple.to_list()
+      |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    ms: new_m |> Tuple.to_list()
+      |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    vs: new_v |> Tuple.to_list()
+      |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    step: next_epoch_step, epoch: epoch,
+    shuffle_key: next_shuffle_key |> Nx.backend_copy(Nx.BinaryBackend)
+  }
+  File.write!("#{save_prefix}_epoch#{epoch}_COMPLETE.bin", :erlang.term_to_binary(final_state))
+
+  {new_p, new_m, new_v, next_epoch_step, next_shuffle_key}
+end)
+
+IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Loading v21_10 Curriculum into CPU Memory...
+💾 Resuming from checkpoint: v21_10_mixed_step35000.bin
+
+14:30:57.993 [info] XLA service 0x7848bc0abc60 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+14:30:57.995 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+14:30:57.995 [info] Using BFC allocator.
+
+14:30:57.995 [info] XLA backend allocating 7715841638 bytes on device 0 for BFCAllocator.
+
+14:30:57.995 [info] XLA backend will use up to 857315737 bytes on device 0 for CollectiveBFCAllocator.
+🚀 IGNITION: Starting V21.10 at Epoch 3, Global Step 35000...
+==================================================
+🌊 EPOCH 3 / 3
+🔀 Shuffling dataset...
+
+14:30:58.740 [info] Merging Dots in computation: region_1.2
+
+14:30:58.740 [info] Merging Dots in computation: region_3.4
+
+14:30:58.740 [info] Merging Dots in computation: region_15.18.clone
+
+14:30:58.740 [info] Merging Dots in computation: region_18.21.clone
+
+14:30:58.740 [info] Merging Dots in computation: main.41
+
+14:30:58.900 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:03.969 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:04.882 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:05.845 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:05.947 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:05.950 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+14:31:10.683 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:12.299 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:12.308 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+14:31:17.114 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:18.193 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:23.033 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:24.058 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:25.411 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:25.469 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:25.525 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:25.649 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:28.419 [info] Merging Dots in computation: region_1.2
+
+14:31:28.419 [info] Merging Dots in computation: region_4.5
+
+14:31:28.419 [info] Merging Dots in computation: region_7.8
+
+14:31:28.419 [info] Merging Dots in computation: region_10.11
+
+14:31:28.419 [info] Merging Dots in computation: region_13.14
+
+14:31:28.419 [info] Merging Dots in computation: region_16.17
+
+14:31:28.419 [info] Merging Dots in computation: region_19.20
+
+14:31:28.419 [info] Merging Dots in computation: region_22.23
+
+14:31:28.419 [info] Merging Dots in computation: region_25.26
+
+14:31:28.419 [info] Merging Dots in computation: region_28.29
+
+14:31:28.542 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+14:31:33.139 [warning] No reference output found even though buffer checking was requested while autotuning
+
+14:31:35.380 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+14:31:40.026 [warning] No reference output found even though buffer checking was requested while autotuning
+💾 Auto-Saving Checkpoint to v21_10_mixed_step35000.bin...
+➡️  Step 50 | Global: 35049 | Loss: 2.2564 | BPC: 3.255 | LR: 1.1e-5 | RAM: 164MB
+   📐 GRAD NORMS | MAX: lm_w=0.252
+   embed=0.0117 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.252 | lm_b=0.0162
+➡️  Step 100 | Global: 35099 | Loss: 2.107 | BPC: 3.04 | LR: 1.1e-5 | RAM: 165MB
+   📐 GRAD NORMS | MAX: lm_w=0.2435
+   embed=0.0079 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2435 | lm_b=0.0149
+➡️  Step 150 | Global: 35149 | Loss: 2.2267 | BPC: 3.212 | LR: 1.0e-5 | RAM: 165MB
+   📐 GRAD NORMS | MAX: lm_w=0.2564
+   embed=0.0106 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2564 | lm_b=0.0164
+➡️  Step 200 | Global: 35199 | Loss: 2.1952 | BPC: 3.167 | LR: 1.0e-5 | RAM: 166MB
+   📐 GRAD NORMS | MAX: lm_w=0.2522
+   embed=0.0084 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2522 | lm_b=0.0177
+➡️  Step 250 | Global: 35249 | Loss: 2.0706 | BPC: 2.987 | LR: 1.0e-5 | RAM: 167MB
+   📐 GRAD NORMS | MAX: lm_w=0.2309
+   embed=0.0063 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2309 | lm_b=0.0144
+➡️  Step 300 | Global: 35299 | Loss: 2.2204 | BPC: 3.203 | LR: 1.0e-5 | RAM: 169MB
+   📐 GRAD NORMS | MAX: lm_w=0.256
+   embed=0.0109 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.256 | lm_b=0.0166
+➡️  Step 350 | Global: 35349 | Loss: 2.1517 | BPC: 3.104 | LR: 1.0e-5 | RAM: 169MB
+   📐 GRAD NORMS | MAX: lm_w=0.2742
+   embed=0.0086 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2742 | lm_b=0.0176
+➡️  Step 400 | Global: 35399 | Loss: 2.0973 | BPC: 3.026 | LR: 9.0e-6 | RAM: 170MB
+   📐 GRAD NORMS | MAX: lm_w=0.2663
+   embed=0.0046 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2663 | lm_b=0.0156
+➡️  Step 450 | Global: 35449 | Loss: 2.1293 | BPC: 3.072 | LR: 9.0e-6 | RAM: 171MB
+   📐 GRAD NORMS | MAX: lm_w=0.237
+   embed=0.0089 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.237 | lm_b=0.0133
+➡️  Step 500 | Global: 35499 | Loss: 2.0522 | BPC: 2.961 | LR: 9.0e-6 | RAM: 172MB
+   📐 GRAD NORMS | MAX: lm_w=0.2694
+   embed=0.0039 | a_diag1=0.0 | a_diag2=0.001 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2694 | lm_b=0.0188
+➡️  Step 550 | Global: 35549 | Loss: 2.1627 | BPC: 3.12 | LR: 9.0e-6 | RAM: 172MB
+   📐 GRAD NORMS | MAX: lm_w=0.2669
+   embed=0.0096 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2669 | lm_b=0.0155
+➡️  Step 600 | Global: 35599 | Loss: 2.2117 | BPC: 3.191 | LR: 9.0e-6 | RAM: 173MB
+   📐 GRAD NORMS | MAX: lm_w=0.2263
+   embed=0.0053 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2263 | lm_b=0.0125
+➡️  Step 650 | Global: 35649 | Loss: 2.1772 | BPC: 3.141 | LR: 8.0e-6 | RAM: 174MB
+   📐 GRAD NORMS | MAX: lm_w=0.237
+   embed=0.0027 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.237 | lm_b=0.014
+➡️  Step 700 | Global: 35699 | Loss: 2.1618 | BPC: 3.119 | LR: 8.0e-6 | RAM: 177MB
+   📐 GRAD NORMS | MAX: lm_w=0.2372
+   embed=0.0071 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2372 | lm_b=0.0177
+➡️  Step 750 | Global: 35749 | Loss: 2.1318 | BPC: 3.076 | LR: 8.0e-6 | RAM: 178MB
+   📐 GRAD NORMS | MAX: lm_w=0.2409
+   embed=0.0044 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2409 | lm_b=0.0153
+➡️  Step 800 | Global: 35799 | Loss: 2.1092 | BPC: 3.043 | LR: 8.0e-6 | RAM: 179MB
+   📐 GRAD NORMS | MAX: lm_w=0.2614
+   embed=0.0034 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2614 | lm_b=0.0196
+➡️  Step 850 | Global: 35849 | Loss: 2.1956 | BPC: 3.168 | LR: 8.0e-6 | RAM: 179MB
+   📐 GRAD NORMS | MAX: lm_w=0.2593
+   embed=0.0089 | a_diag1=0.0 | a_diag2=0.001 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2593 | lm_b=0.016
+➡️  Step 900 | Global: 35899 | Loss: 2.2295 | BPC: 3.216 | LR: 7.0e-6 | RAM: 180MB
+   📐 GRAD NORMS | MAX: lm_w=0.2465
+   embed=0.0118 | a_diag1=0.0 | a_diag2=0.0009 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2465 | lm_b=0.0167
+➡️  Step 950 | Global: 35949 | Loss: 2.0315 | BPC: 2.931 | LR: 7.0e-6 | RAM: 181MB
+   📐 GRAD NORMS | MAX: lm_w=0.2563
+   embed=0.0082 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2563 | lm_b=0.0181
+➡️  Step 1000 | Global: 35999 | Loss: 2.126 | BPC: 3.067 | LR: 7.0e-6 | RAM: 182MB
+   📐 GRAD NORMS | MAX: mx_v1=0.1722
+   embed=0.0152 | a_diag1=0.0003 | a_diag2=0.0001 | b_u=0.1407 | b_v=0.1011 | c_u=0.0474 | c_v=0.1656 | d_u=0.0027 | d_v=0.0053 | mx_u1=0.0849 | mx_v1=0.1722 | mx_u2=0.0537 | mx_v2=0.0593 | lm_w=0.0755 | lm_b=0.0049
+💾 Auto-Saving Checkpoint to v21_10_mixed_step36000.bin...
+➡️  Step 1050 | Global: 36049 | Loss: 2.0887 | BPC: 3.013 | LR: 7.0e-6 | RAM: 183MB
+   📐 GRAD NORMS | MAX: lm_w=0.2522
+   embed=0.0098 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2522 | lm_b=0.012
+➡️  Step 1100 | Global: 36099 | Loss: 2.1819 | BPC: 3.148 | LR: 7.0e-6 | RAM: 183MB
+   📐 GRAD NORMS | MAX: lm_w=0.2547
+   embed=0.0089 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2547 | lm_b=0.0201
+➡️  Step 1150 | Global: 36149 | Loss: 2.0889 | BPC: 3.014 | LR: 7.0e-6 | RAM: 184MB
+   📐 GRAD NORMS | MAX: lm_w=0.2534
+   embed=0.0047 | a_diag1=0.0 | a_diag2=0.001 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2534 | lm_b=0.017
+➡️  Step 1200 | Global: 36199 | Loss: 2.2067 | BPC: 3.184 | LR: 6.0e-6 | RAM: 185MB
+   📐 GRAD NORMS | MAX: c_v=0.1641
+   embed=0.0198 | a_diag1=0.0002 | a_diag2=0.0002 | b_u=0.1385 | b_v=0.1122 | c_u=0.0457 | c_v=0.1641 | d_u=0.0036 | d_v=0.006 | mx_u1=0.093 | mx_v1=0.163 | mx_u2=0.0597 | mx_v2=0.0638 | lm_w=0.0693 | lm_b=0.0041
+➡️  Step 1250 | Global: 36249 | Loss: 2.2675 | BPC: 3.271 | LR: 6.0e-6 | RAM: 186MB
+   📐 GRAD NORMS | MAX: lm_w=0.2437
+   embed=0.0089 | a_diag1=0.0 | a_diag2=0.0011 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2437 | lm_b=0.014
+➡️  Step 1300 | Global: 36299 | Loss: 2.2699 | BPC: 3.275 | LR: 6.0e-6 | RAM: 187MB
+   📐 GRAD NORMS | MAX: lm_w=0.2699
+   embed=0.0133 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2699 | lm_b=0.0194
+➡️  Step 1350 | Global: 36349 | Loss: 2.3027 | BPC: 3.322 | LR: 6.0e-6 | RAM: 187MB
+   📐 GRAD NORMS | MAX: lm_w=0.2673
+   embed=0.0095 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2673 | lm_b=0.0208
+➡️  Step 1400 | Global: 36399 | Loss: 2.1974 | BPC: 3.17 | LR: 6.0e-6 | RAM: 188MB
+   📐 GRAD NORMS | MAX: lm_w=0.237
+   embed=0.006 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.237 | lm_b=0.0176
+➡️  Step 1450 | Global: 36449 | Loss: 2.209 | BPC: 3.187 | LR: 6.0e-6 | RAM: 189MB
+   📐 GRAD NORMS | MAX: lm_w=0.2515
+   embed=0.007 | a_diag1=0.0 | a_diag2=0.001 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2515 | lm_b=0.0138
+➡️  Step 1500 | Global: 36499 | Loss: 2.331 | BPC: 3.363 | LR: 6.0e-6 | RAM: 190MB
+   📐 GRAD NORMS | MAX: lm_w=0.2691
+   embed=0.0106 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2691 | lm_b=0.0191
+➡️  Step 1550 | Global: 36549 | Loss: 2.1861 | BPC: 3.154 | LR: 5.0e-6 | RAM: 190MB
+   📐 GRAD NORMS | MAX: lm_w=0.256
+   embed=0.0098 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.256 | lm_b=0.0154
+➡️  Step 1600 | Global: 36599 | Loss: 2.2168 | BPC: 3.198 | LR: 5.0e-6 | RAM: 191MB
+   📐 GRAD NORMS | MAX: lm_w=0.2526
+   embed=0.005 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2526 | lm_b=0.017
+➡️  Step 1650 | Global: 36649 | Loss: 2.1488 | BPC: 3.1 | LR: 5.0e-6 | RAM: 192MB
+   📐 GRAD NORMS | MAX: lm_w=0.2302
+   embed=0.0056 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2302 | lm_b=0.0165
+➡️  Step 1700 | Global: 36699 | Loss: 2.0341 | BPC: 2.935 | LR: 5.0e-6 | RAM: 193MB
+   📐 GRAD NORMS | MAX: lm_w=0.2911
+   embed=0.0079 | a_diag1=0.0 | a_diag2=0.001 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2911 | lm_b=0.0215
+➡️  Step 1750 | Global: 36749 | Loss: 2.1849 | BPC: 3.152 | LR: 5.0e-6 | RAM: 194MB
+   📐 GRAD NORMS | MAX: lm_w=0.2318
+   embed=0.0088 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2318 | lm_b=0.0141
+➡️  Step 1800 | Global: 36799 | Loss: 2.0889 | BPC: 3.014 | LR: 5.0e-6 | RAM: 195MB
+   📐 GRAD NORMS | MAX: lm_w=0.2342
+   embed=0.0047 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2342 | lm_b=0.017
+➡️  Step 1850 | Global: 36849 | Loss: 2.0853 | BPC: 3.008 | LR: 5.0e-6 | RAM: 195MB
+   📐 GRAD NORMS | MAX: lm_w=0.2746
+   embed=0.016 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2746 | lm_b=0.0158
+➡️  Step 1900 | Global: 36899 | Loss: 2.113 | BPC: 3.048 | LR: 4.0e-6 | RAM: 196MB
+   📐 GRAD NORMS | MAX: lm_w=0.2675
+   embed=0.0131 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2675 | lm_b=0.0173
+➡️  Step 1950 | Global: 36949 | Loss: 2.1174 | BPC: 3.055 | LR: 4.0e-6 | RAM: 197MB
+   📐 GRAD NORMS | MAX: lm_w=0.2711
+   embed=0.0086 | a_diag1=0.0 | a_diag2=0.001 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2711 | lm_b=0.0153
+➡️  Step 2000 | Global: 36999 | Loss: 2.1722 | BPC: 3.134 | LR: 4.0e-6 | RAM: 198MB
+   📐 GRAD NORMS | MAX: lm_w=0.2718
+   embed=0.0066 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2718 | lm_b=0.0246
+💾 Auto-Saving Checkpoint to v21_10_mixed_step37000.bin...
+➡️  Step 2050 | Global: 37049 | Loss: 2.0507 | BPC: 2.959 | LR: 4.0e-6 | RAM: 199MB
+   📐 GRAD NORMS | MAX: lm_w=0.2767
+   embed=0.0071 | a_diag1=0.0 | a_diag2=0.001 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2767 | lm_b=0.0207
+➡️  Step 2100 | Global: 37099 | Loss: 2.1473 | BPC: 3.098 | LR: 4.0e-6 | RAM: 200MB
+   📐 GRAD NORMS | MAX: lm_w=0.2663
+   embed=0.0037 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2663 | lm_b=0.0174
+➡️  Step 2150 | Global: 37149 | Loss: 2.0669 | BPC: 2.982 | LR: 4.0e-6 | RAM: 200MB
+   📐 GRAD NORMS | MAX: lm_w=0.2797
+   embed=0.0054 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2797 | lm_b=0.0208
+➡️  Step 2200 | Global: 37199 | Loss: 2.1647 | BPC: 3.123 | LR: 4.0e-6 | RAM: 201MB
+   📐 GRAD NORMS | MAX: lm_w=0.2801
+   embed=0.0096 | a_diag1=0.0 | a_diag2=0.0013 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2801 | lm_b=0.0256
+➡️  Step 2250 | Global: 37249 | Loss: 2.2884 | BPC: 3.301 | LR: 4.0e-6 | RAM: 202MB
+   📐 GRAD NORMS | MAX: lm_w=0.249
+   embed=0.0077 | a_diag1=0.0 | a_diag2=0.0012 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.249 | lm_b=0.0144
+➡️  Step 2300 | Global: 37299 | Loss: 2.1578 | BPC: 3.113 | LR: 3.0e-6 | RAM: 203MB
+   📐 GRAD NORMS | MAX: lm_w=0.2272
+   embed=0.0071 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2272 | lm_b=0.0139
+➡️  Step 2350 | Global: 37349 | Loss: 2.0929 | BPC: 3.019 | LR: 3.0e-6 | RAM: 203MB
+   📐 GRAD NORMS | MAX: lm_w=0.2721
+   embed=0.0162 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2721 | lm_b=0.019
+➡️  Step 2400 | Global: 37399 | Loss: 2.1761 | BPC: 3.139 | LR: 3.0e-6 | RAM: 205MB
+   📐 GRAD NORMS | MAX: lm_w=0.2456
+   embed=0.0054 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2456 | lm_b=0.0144
+➡️  Step 2450 | Global: 37449 | Loss: 2.0682 | BPC: 2.984 | LR: 3.0e-6 | RAM: 205MB
+   📐 GRAD NORMS | MAX: lm_w=0.2415
+   embed=0.0066 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2415 | lm_b=0.0154
+➡️  Step 2500 | Global: 37499 | Loss: 2.1258 | BPC: 3.067 | LR: 3.0e-6 | RAM: 207MB
+   📐 GRAD NORMS | MAX: lm_w=0.2544
+   embed=0.0079 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2544 | lm_b=0.013
+➡️  Step 2550 | Global: 37549 | Loss: 2.2318 | BPC: 3.22 | LR: 3.0e-6 | RAM: 208MB
+   📐 GRAD NORMS | MAX: lm_w=0.2692
+   embed=0.0149 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2692 | lm_b=0.0205
+➡️  Step 2600 | Global: 37599 | Loss: 2.107 | BPC: 3.04 | LR: 3.0e-6 | RAM: 209MB
+   📐 GRAD NORMS | MAX: lm_w=0.2217
+   embed=0.0037 | a_diag1=0.0 | a_diag2=0.0003 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2217 | lm_b=0.0142
+➡️  Step 2650 | Global: 37649 | Loss: 2.1892 | BPC: 3.158 | LR: 3.0e-6 | RAM: 209MB
+   📐 GRAD NORMS | MAX: lm_w=0.2278
+   embed=0.0061 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2278 | lm_b=0.0166
+➡️  Step 2700 | Global: 37699 | Loss: 2.0903 | BPC: 3.016 | LR: 3.0e-6 | RAM: 214MB
+   📐 GRAD NORMS | MAX: lm_w=0.2424
+   embed=0.0084 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2424 | lm_b=0.0162
+➡️  Step 2750 | Global: 37749 | Loss: 2.2229 | BPC: 3.207 | LR: 3.0e-6 | RAM: 214MB
+   📐 GRAD NORMS | MAX: lm_w=0.2667
+   embed=0.0061 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2667 | lm_b=0.0162
+➡️  Step 2800 | Global: 37799 | Loss: 2.1887 | BPC: 3.158 | LR: 3.0e-6 | RAM: 215MB
+   📐 GRAD NORMS | MAX: lm_w=0.251
+   embed=0.0057 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.251 | lm_b=0.0171
+➡️  Step 2850 | Global: 37849 | Loss: 2.062 | BPC: 2.975 | LR: 2.0e-6 | RAM: 216MB
+   📐 GRAD NORMS | MAX: lm_w=0.2306
+   embed=0.0081 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2306 | lm_b=0.014
+➡️  Step 2900 | Global: 37899 | Loss: 2.176 | BPC: 3.139 | LR: 2.0e-6 | RAM: 217MB
+   📐 GRAD NORMS | MAX: lm_w=0.267
+   embed=0.0075 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.267 | lm_b=0.0184
+➡️  Step 2950 | Global: 37949 | Loss: 2.2085 | BPC: 3.186 | LR: 2.0e-6 | RAM: 217MB
+   📐 GRAD NORMS | MAX: lm_w=0.2772
+   embed=0.0053 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2772 | lm_b=0.0174
+➡️  Step 3000 | Global: 37999 | Loss: 2.2708 | BPC: 3.276 | LR: 2.0e-6 | RAM: 219MB
+   📐 GRAD NORMS | MAX: lm_w=0.2459
+   embed=0.0068 | a_diag1=0.0 | a_diag2=0.0011 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2459 | lm_b=0.0155
+💾 Auto-Saving Checkpoint to v21_10_mixed_step38000.bin...
+➡️  Step 3050 | Global: 38049 | Loss: 2.1001 | BPC: 3.03 | LR: 2.0e-6 | RAM: 219MB
+   📐 GRAD NORMS | MAX: lm_w=0.2504
+   embed=0.0054 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2504 | lm_b=0.0186
+➡️  Step 3100 | Global: 38099 | Loss: 2.113 | BPC: 3.048 | LR: 2.0e-6 | RAM: 220MB
+   📐 GRAD NORMS | MAX: lm_w=0.2592
+   embed=0.0052 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2592 | lm_b=0.0174
+➡️  Step 3150 | Global: 38149 | Loss: 2.1198 | BPC: 3.058 | LR: 2.0e-6 | RAM: 221MB
+   📐 GRAD NORMS | MAX: lm_w=0.2302
+   embed=0.0049 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2302 | lm_b=0.0173
+➡️  Step 3200 | Global: 38199 | Loss: 2.1819 | BPC: 3.148 | LR: 2.0e-6 | RAM: 222MB
+   📐 GRAD NORMS | MAX: lm_w=0.2635
+   embed=0.0045 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2635 | lm_b=0.0184
+➡️  Step 3250 | Global: 38249 | Loss: 2.1155 | BPC: 3.052 | LR: 2.0e-6 | RAM: 222MB
+   📐 GRAD NORMS | MAX: lm_w=0.2587
+   embed=0.0077 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2587 | lm_b=0.0125
+➡️  Step 3300 | Global: 38299 | Loss: 2.2762 | BPC: 3.284 | LR: 2.0e-6 | RAM: 224MB
+   📐 GRAD NORMS | MAX: lm_w=0.3152
+   embed=0.0158 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.3152 | lm_b=0.0262
+➡️  Step 3350 | Global: 38349 | Loss: 2.0438 | BPC: 2.949 | LR: 2.0e-6 | RAM: 225MB
+   📐 GRAD NORMS | MAX: mx_v1=0.1747
+   embed=0.0164 | a_diag1=0.0003 | a_diag2=0.0002 | b_u=0.1205 | b_v=0.1043 | c_u=0.0456 | c_v=0.1711 | d_u=0.0025 | d_v=0.0055 | mx_u1=0.0971 | mx_v1=0.1747 | mx_u2=0.0568 | mx_v2=0.0584 | lm_w=0.0725 | lm_b=0.0055
+➡️  Step 3400 | Global: 38399 | Loss: 2.086 | BPC: 3.009 | LR: 2.0e-6 | RAM: 225MB
+   📐 GRAD NORMS | MAX: lm_w=0.259
+   embed=0.0051 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.259 | lm_b=0.0223
+➡️  Step 3450 | Global: 38449 | Loss: 2.1263 | BPC: 3.068 | LR: 2.0e-6 | RAM: 226MB
+   📐 GRAD NORMS | MAX: lm_w=0.23
+   embed=0.0072 | a_diag1=0.0 | a_diag2=0.0003 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.23 | lm_b=0.0107
+➡️  Step 3500 | Global: 38499 | Loss: 2.0967 | BPC: 3.025 | LR: 2.0e-6 | RAM: 227MB
+   📐 GRAD NORMS | MAX: lm_w=0.2608
+   embed=0.002 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2608 | lm_b=0.0192
+➡️  Step 3550 | Global: 38549 | Loss: 2.0886 | BPC: 3.013 | LR: 2.0e-6 | RAM: 227MB
+   📐 GRAD NORMS | MAX: lm_w=0.2066
+   embed=0.0046 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2066 | lm_b=0.0113
+➡️  Step 3600 | Global: 38599 | Loss: 2.3537 | BPC: 3.396 | LR: 1.0e-6 | RAM: 228MB
+   📐 GRAD NORMS | MAX: lm_w=0.2819
+   embed=0.0249 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2819 | lm_b=0.0161
+➡️  Step 3650 | Global: 38649 | Loss: 2.1937 | BPC: 3.165 | LR: 1.0e-6 | RAM: 229MB
+   📐 GRAD NORMS | MAX: lm_w=0.241
+   embed=0.0052 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.241 | lm_b=0.0148
+➡️  Step 3700 | Global: 38699 | Loss: 2.3317 | BPC: 3.364 | LR: 1.0e-6 | RAM: 230MB
+   📐 GRAD NORMS | MAX: lm_w=0.2921
+   embed=0.0199 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2921 | lm_b=0.0215
+➡️  Step 3750 | Global: 38749 | Loss: 2.1321 | BPC: 3.076 | LR: 1.0e-6 | RAM: 230MB
+   📐 GRAD NORMS | MAX: lm_w=0.234
+   embed=0.0071 | a_diag1=0.0 | a_diag2=0.0006 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.234 | lm_b=0.0127
+➡️  Step 3800 | Global: 38799 | Loss: 2.2665 | BPC: 3.27 | LR: 1.0e-6 | RAM: 231MB
+   📐 GRAD NORMS | MAX: lm_w=0.2548
+   embed=0.0117 | a_diag1=0.0 | a_diag2=0.0012 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2548 | lm_b=0.0207
+➡️  Step 3850 | Global: 38849 | Loss: 2.1409 | BPC: 3.089 | LR: 1.0e-6 | RAM: 232MB
+   📐 GRAD NORMS | MAX: lm_w=0.2396
+   embed=0.0081 | a_diag1=0.0 | a_diag2=0.0013 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2396 | lm_b=0.016
+➡️  Step 3900 | Global: 38899 | Loss: 2.1757 | BPC: 3.139 | LR: 1.0e-6 | RAM: 233MB
+   📐 GRAD NORMS | MAX: lm_w=0.2834
+   embed=0.0045 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2834 | lm_b=0.0215
+➡️  Step 3950 | Global: 38949 | Loss: 2.0616 | BPC: 2.974 | LR: 1.0e-6 | RAM: 234MB
+   📐 GRAD NORMS | MAX: lm_w=0.2638
+   embed=0.007 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2638 | lm_b=0.0163
+➡️  Step 4000 | Global: 38999 | Loss: 2.1699 | BPC: 3.131 | LR: 1.0e-6 | RAM: 235MB
+   📐 GRAD NORMS | MAX: lm_w=0.2373
+   embed=0.0069 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2373 | lm_b=0.0151
+💾 Auto-Saving Checkpoint to v21_10_mixed_step39000.bin...
+➡️  Step 4050 | Global: 39049 | Loss: 2.2036 | BPC: 3.179 | LR: 1.0e-6 | RAM: 236MB
+   📐 GRAD NORMS | MAX: lm_w=0.2547
+   embed=0.0045 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2547 | lm_b=0.0169
+➡️  Step 4100 | Global: 39099 | Loss: 2.2012 | BPC: 3.176 | LR: 1.0e-6 | RAM: 236MB
+   📐 GRAD NORMS | MAX: lm_w=0.2159
+   embed=0.0077 | a_diag1=0.0 | a_diag2=0.0003 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2159 | lm_b=0.012
+➡️  Step 4150 | Global: 39149 | Loss: 2.1701 | BPC: 3.131 | LR: 1.0e-6 | RAM: 237MB
+   📐 GRAD NORMS | MAX: lm_w=0.2583
+   embed=0.0049 | a_diag1=0.0 | a_diag2=0.0008 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2583 | lm_b=0.0194
+➡️  Step 4200 | Global: 39199 | Loss: 2.1943 | BPC: 3.166 | LR: 1.0e-6 | RAM: 238MB
+   📐 GRAD NORMS | MAX: lm_w=0.2287
+   embed=0.0076 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2287 | lm_b=0.0148
+➡️  Step 4250 | Global: 39249 | Loss: 2.1299 | BPC: 3.073 | LR: 1.0e-6 | RAM: 238MB
+   📐 GRAD NORMS | MAX: lm_w=0.2476
+   embed=0.0048 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2476 | lm_b=0.0166
+➡️  Step 4300 | Global: 39299 | Loss: 2.139 | BPC: 3.086 | LR: 1.0e-6 | RAM: 240MB
+   📐 GRAD NORMS | MAX: lm_w=0.2339
+   embed=0.0095 | a_diag1=0.0 | a_diag2=0.0004 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2339 | lm_b=0.0144
+➡️  Step 4350 | Global: 39349 | Loss: 2.3291 | BPC: 3.36 | LR: 1.0e-6 | RAM: 240MB
+   📐 GRAD NORMS | MAX: lm_w=0.2591
+   embed=0.0083 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2591 | lm_b=0.0164
+➡️  Step 4400 | Global: 39399 | Loss: 2.0667 | BPC: 2.982 | LR: 1.0e-6 | RAM: 241MB
+   📐 GRAD NORMS | MAX: lm_w=0.2738
+   embed=0.007 | a_diag1=0.0 | a_diag2=0.0007 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2738 | lm_b=0.0197
+➡️  Step 4450 | Global: 39449 | Loss: 2.1702 | BPC: 3.131 | LR: 1.0e-6 | RAM: 242MB
+   📐 GRAD NORMS | MAX: lm_w=0.2313
+   embed=0.0063 | a_diag1=0.0 | a_diag2=0.0005 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2313 | lm_b=0.014
+➡️  Step 4500 | Global: 39499 | Loss: 2.1659 | BPC: 3.125 | LR: 1.0e-6 | RAM: 243MB
+   📐 GRAD NORMS | MAX: lm_w=0.2433
+   embed=0.0053 | a_diag1=0.0 | a_diag2=0.0009 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2433 | lm_b=0.0136
+➡️  Step 4550 | Global: 39549 | Loss: 2.1476 | BPC: 3.098 | LR: 1.0e-6 | RAM: 243MB
+   📐 GRAD NORMS | MAX: lm_w=0.2307
+   embed=0.0108 | a_diag1=0.0 | a_diag2=0.001 | b_u=0.0 | b_v=0.0 | c_u=0.0 | c_v=0.0 | d_u=0.0 | d_v=0.0 | mx_u1=0.0 | mx_v1=0.0 | mx_u2=0.0 | mx_v2=0.0 | lm_w=0.2307 | lm_b=0.0128
+💾 Saving Completed Epoch 3 State...
+🎉 THE OVERNIGHT BAKE IS COMPLETE!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+checkpoint = File.read!("v21_10_mixed_epoch3_COMPLETE.bin") |> :erlang.binary_to_term()
+# Run this in a separate cell after loading any checkpoint
+{_emb, a1, a2, _rest} = checkpoint.params |> Tuple.to_list() |> then(fn [e,a1,a2|rest] -> {e,a1,a2,rest} end)
+IO.puts("a_diag1 mean: #{a1 |> Nx.mean() |> Nx.to_number()}")
+IO.puts("a_diag1 std:  #{a1 |> Nx.subtract(Nx.mean(a1)) |> Nx.pow(2) |> Nx.mean() |> Nx.sqrt() |> Nx.to_number()}")
+IO.puts("a_diag2 mean: #{a2 |> Nx.mean() |> Nx.to_number()}")
+IO.puts("a_diag2 std:  #{a2 |> Nx.subtract(Nx.mean(a2)) |> Nx.pow(2) |> Nx.mean() |> Nx.sqrt() |> Nx.to_number()}")
+
+# 15k results:
+# a_diag1 mean: -0.7696573138237
+# a_diag1 std:  1.207396388053894
+# a_diag2 mean: -1.7909481525421143
+# a_diag2 std:  0.9192034006118774
+
+# 20K results
+# a_diag1 mean: -0.7612431049346924
+# a_diag1 std:  1.2948246002197266
+# a_diag2 mean: -1.8457695245742798
+# a_diag2 std:  0.9867194890975952
+
+# 25k results
+# a_diag1 mean: -0.7688566446304321
+# a_diag1 std:  1.3634350299835205
+# a_diag2 mean: -1.9208654165267944
+# a_diag2 std:  1.032122254371643
+
+# 30k results
+# a_diag1 mean: -0.774724543094635
+# a_diag1 std:  1.3764537572860718
+# a_diag2 mean: -1.9731793403625488
+# a_diag2 std:  1.0635429620742798
+
+# 35k results
+# a_diag1 mean: -0.7771900296211243
+# a_diag1 std:  1.3799179792404175
+# a_diag2 mean: -1.9886703491210938
+# a_diag2 std:  1.0736585855484009
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+a_diag1 mean: -0.777516782283783
+a_diag1 std:  1.380380392074585
+a_diag2 mean: -1.9909776449203491
+a_diag2 std:  1.0751863718032837
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```

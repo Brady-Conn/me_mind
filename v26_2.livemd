@@ -1,0 +1,1080 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# V26.2
+
+```elixir
+# ===========================================================================
+# V20-BB Setup
+# ===========================================================================
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+System.put_env("XLA_CLIENT_MEM_FRACTION", "0.75")
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")        # ← disables the Merging Dots pass
+System.put_env("XLA_FLAGS", "--xla_gpu_enable_reassociation_for_converted_ar=false")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"}
+])
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+
+
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## USSM, Positional, Muon_Optimizer
+
+```elixir
+defmodule DLM.DiffusionTensor do
+  import Nx.Defn
+
+  @num_bits 8
+  @dim 512
+
+  defn to_bits(tokens) do
+    shifts = Nx.iota({@num_bits}) 
+             |> Nx.multiply(-1) 
+             |> Nx.add(@num_bits - 1)
+             |> Nx.as_type(:u32)
+    
+    tokens_expanded = Nx.new_axis(tokens, -1)
+    shifted = Nx.right_shift(tokens_expanded, shifts)
+    Nx.bitwise_and(shifted, 1) |> Nx.as_type(:f32)
+  end
+
+  # ⚡ The Rescue Activation
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn project(tokens, diff_w1, diff_w2, key) do
+    bits = to_bits(tokens)
+    
+    condition = Nx.dot(bits, diff_w1)
+    {batch, seq_len, _} = Nx.shape(bits)
+    {noise, next_key} = Nx.Random.normal(key, 0.0, 1.0, shape: {batch, seq_len, @dim})
+    
+    # ⚡ FIX: Softplus prevents the gate from evaluating to 0.0
+    gate = softplus(condition)
+    manifold_shift = Nx.dot(gate, diff_w2)
+    
+    # ⚡ Constant 1% noise floor for the entire run
+    final_tensor = Nx.add(manifold_shift, Nx.multiply(noise, 0.01))
+    
+    {final_tensor, next_key}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DiffusionTensor, <<70, 79, 82, 49, 0, 0, 20, ...>>, true}
+```
+
+```elixir
+defmodule DLM.UniversalSSM do
+  import Nx.Defn
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn apply_svd_weight(x, u, v) do
+    # ⚡ FIX: Replaced silu() with softplus() to keep the local mixers alive
+    x |> Nx.dot(u) |> softplus() |> Nx.dot(v)
+  end
+
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2) do
+    x_mixed = x_t
+      |> Nx.add(apply_svd_weight(x_p1, mu1, mv1))
+      |> Nx.add(apply_svd_weight(x_p2, mu2, mv2))
+      
+    delta_proj = apply_svd_weight(x_mixed, du, dv)
+    delta      = softplus(delta_proj)
+    
+    a_bar      = Nx.sigmoid(Nx.multiply(delta, a))
+    b_proj     = apply_svd_weight(x_mixed, bu, bv)
+    b_bar      = Nx.multiply(delta, b_proj)
+    
+    h_t        = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    y_ssm      = apply_svd_weight(h_t, cu, cv)
+    
+    y_t        = Nx.add(y_ssm, x_mixed)
+    {y_t, h_t}
+  end
+
+  defn run_ssm_loop(x_seq_first, h_init, a_diag, params) do
+    # ⚡ FIX: Cleaned up nested defn, unpacking 15 elements
+    {_diff_w1, _diff_w2, _a, b_u, b_v, c_u, c_v, d_u, d_v,
+     mx_u1, mx_v1, mx_u2, mx_v2, _lm_w, _lm_b} = params
+
+    {seq_len, batch_size, embed_dim} = Nx.shape(x_seq_first)
+    y_init    = Nx.broadcast(Nx.tensor(0.0, type: :f32), {seq_len, batch_size, embed_dim})
+    zero_frame = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+
+    result_tuple =
+      while {i = 0, y_acc = y_init, h_p = h_init,
+             x_prev1 = zero_frame,
+             x_prev2 = zero_frame,
+             xs = x_seq_first,
+             a = a_diag, bu = b_u, bv = b_v, cu = c_u, cv = c_v, 
+             du = d_u, dv = d_v, # ⚡ FIX: delta_u/delta_v swapped to d_u/d_v
+             mu1 = mx_u1, mv1 = mx_v1, mu2 = mx_u2, mv2 = mx_v2},
+            Nx.less(i, seq_len) do
+
+        x_t = xs[i]
+        {y_t, h_new} = ssm_recurrence(
+          x_t, x_prev1, x_prev2, h_p,
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+        )
+        y_acc_new = Nx.put_slice(y_acc, [i, 0, 0], Nx.new_axis(y_t, 0))
+        {i + 1, y_acc_new, h_new, x_t, x_prev1,
+         xs, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2}
+      end
+
+    elem(result_tuple, 1)
+  end
+
+  defn forward(indices, params, pos_emb, key) do
+    # ⚡ FIX: Cleaned up nested defn. Removed underscores from variables we need!
+    {diff_w1, diff_w2, a_diag, _bu, _bv, _cu, _cv, _du, _dv,
+     _mu1, _mv1, _mu2, _mv2, lm_w, lm_b} = params
+
+    # Pass the key to the Diffusion layer
+    {x_projected, _next_key} = DLM.DiffusionTensor.project(indices, diff_w1, diff_w2, key)
+    
+    x_input = x_projected + pos_emb
+    x_norm  = rms_norm(x_input)
+
+    {batch_size, _seq_len, embed_dim} = Nx.shape(x_norm)
+    h_init = Nx.broadcast(Nx.tensor(0.0, type: :f32), {batch_size, embed_dim})
+    x_seq_first = Nx.transpose(x_norm, axes: [1, 0, 2])
+
+    y_seq = run_ssm_loop(x_seq_first, h_init, a_diag, params)
+
+    y_out   = Nx.transpose(y_seq, axes: [1, 0, 2])
+    y_final = rms_norm(y_out)
+    Nx.dot(y_final, lm_w) + lm_b
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.UniversalSSM, <<70, 79, 82, 49, 0, 0, 48, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  defn newton_schulz(g, iters \\ 5) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) + 1.0e-7
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, iters) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_update(grad, lr) do
+    Nx.subtract(0.0, Nx.multiply(lr, newton_schulz(grad)))
+  end
+
+  defn adam_update(param, grad, m, v, step, lr) do
+    safe_step = step + 1.0
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  defn step(params, grads, ms, vs, step_count, lr) do
+    # ⚡ Unpack 15 elements (Replaced p_emb with p_dw1, p_dw2)
+    {p_dw1, p_dw2, p_a, p_bu, p_bv, p_cu, p_cv, p_du, p_dv,
+      p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = params
+  
+    {g_dw1, g_dw2, g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv,
+      g_mu1, g_mv1, g_mu2, g_mv2, g_lmw, g_lmb} = grads
+  
+    {m_dw1, m_dw2, m_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+      m_mu1, m_mv1, m_mu2, m_mv2, m_lmw, m_lmb} = ms
+  
+    {v_dw1, v_dw2, v_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+      v_mu1, v_mv1, v_mu2, v_mv2, v_lmw, v_lmb} = vs
+  
+    # Adam for scalars and linear projections
+    {up_dw1, nm_dw1, nv_dw1} = adam_update(p_dw1, g_dw1, m_dw1, v_dw1, step_count, lr)
+    {up_dw2, nm_dw2, nv_dw2} = adam_update(p_dw2, g_dw2, m_dw2, v_dw2, step_count, lr)
+    {up_a,   nm_a,   nv_a}   = adam_update(p_a,   g_a,   m_a,   v_a,   step_count, lr)
+    {up_lmw, nm_lmw, nv_lmw} = adam_update(p_lmw, g_lmw, m_lmw, v_lmw, step_count, lr)
+    {up_lmb, nm_lmb, nv_lmb} = adam_update(p_lmb, g_lmb, m_lmb, v_lmb, step_count, lr)
+  
+    # Muon for SVD matrices
+    up_bu  = p_bu  + muon_update(g_bu,  lr)
+    up_bv  = p_bv  + muon_update(g_bv,  lr)
+    up_cu  = p_cu  + muon_update(g_cu,  lr)
+    up_cv  = p_cv  + muon_update(g_cv,  lr)
+    up_du  = p_du  + muon_update(g_du,  lr)
+    up_dv  = p_dv  + muon_update(g_dv,  lr)
+    up_mu1 = p_mu1 + muon_update(g_mu1, lr)
+    up_mv1 = p_mv1 + muon_update(g_mv1, lr)
+    up_mu2 = p_mu2 + muon_update(g_mu2, lr)
+    up_mv2 = p_mv2 + muon_update(g_mv2, lr)
+  
+    # Pack 15 elements back up
+    new_params = {up_dw1, up_dw2, up_a, up_bu, up_bv, up_cu, up_cv, up_du, up_dv,
+                  up_mu1, up_mv1, up_mu2, up_mv2, up_lmw, up_lmb}
+  
+    new_ms = {nm_dw1, nm_dw2, nm_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+              m_mu1, m_mv1, m_mu2, m_mv2, nm_lmw, nm_lmb}
+  
+    new_vs = {nv_dw1, nv_dw2, nv_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+              v_mu1, v_mv1, v_mu2, v_mv2, nv_lmw, nv_lmb}
+  
+    {new_params, new_ms, new_vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.MuonHybrid, <<70, 79, 82, 49, 0, 0, 42, ...>>, true}
+```
+
+```elixir
+defmodule DLM.V26_2_Genesis do
+  @vocab_size 128
+  @dim 512
+  @rank 64
+  @num_bits 8
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    
+    # ⚡ The 2-Matrix Micro-Diffusion Base
+    {diff_w1, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@num_bits, 128})
+    {diff_w2, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {128, @dim})
+    
+    {a_diag, key} = Nx.Random.normal(key, -2.0, 0.1, shape: {@dim})
+    {b_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {b_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {c_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {c_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {d_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {d_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {lm_w,   key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @vocab_size})
+    {lm_b,  _key} = Nx.Random.normal(key, 0.0, 0.0,  shape: {@vocab_size})
+
+    # ⚡ 15 Parameters Total
+    {diff_w1, diff_w2, a_diag, b_u, b_v, c_u, c_v, d_u, d_v,
+     mx_u1, mx_v1, mx_u2, mx_v2, lm_w, lm_b}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    vs = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    {ms, vs, 1}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.V26_2_Genesis, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inference
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+# ===========================================================================
+# 🐑 V21.10 INFERENCE PROBE: The Electric Sheep
+# ===========================================================================
+
+defmodule DLM.Sampler do
+  import Nx.Defn
+
+  # ⚡ The Gumbel-Max Trick: Using Nx's native Gumbel generator
+  defn sample(logits, temperature, key) do
+    # 1. Scale the raw logits to control the "creativity"
+    scaled_logits = logits / temperature
+    
+    # 2. Ask Nx to natively generate Gumbel noise in the exact shape of our logits
+    {gumbel_noise, next_key} = Nx.Random.gumbel(key, shape: Nx.shape(logits))
+    
+    # 3. Add the noise and pick the max!
+    sampled_index = Nx.argmax(scaled_logits + gumbel_noise, axis: -1)
+    
+    {sampled_index, next_key}
+  end
+end
+
+checkpoint_path = "v26_2_bitwise_step53000.bin" # Update to your latest!
+IO.puts("🧠 Awakening V26 from #{checkpoint_path}...")
+
+checkpoint = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+params = DLM.Tree.map(checkpoint.params, &Nx.backend_transfer(&1, gpu))
+pos_emb = DLM.Positional.build(128, 512) |> Nx.backend_transfer(gpu)
+
+prompt = "Do state space models dream of recursive sheep?"
+IO.puts("\nPrompt: \"#{prompt}\"\n")
+IO.write("V23:  ")
+
+prompt_tokens = prompt |> String.to_charlist() |> Enum.map(fn c -> if c < 128, do: c, else: 63 end)
+
+# Setup the Random Key for the categorical sampler
+key = Nx.Random.key(42)
+
+max_new_tokens = 127
+temperature = 0.65 # ⚡ 0.65 is the sweet spot for early character models
+
+{_final_key, _final_tokens} = 
+  Enum.reduce(1..max_new_tokens, {key, prompt_tokens}, fn _step, {current_key, current_tokens} ->
+    
+    window_tokens = Enum.take(current_tokens, -127)
+    current_len = length(window_tokens)
+    
+    pad_len = 128 - current_len
+    padded_list = window_tokens ++ List.duplicate(0, pad_len)
+    
+    input_tensor = Nx.tensor([padded_list], type: :s32) |> Nx.backend_transfer(gpu)
+    
+    logits = DLM.UniversalSSM.forward(input_tensor, params, pos_emb, key)
+    last_token_logits = logits[0][current_len - 1]
+    
+    # ⚡ Use the new sampler
+    {next_token_tensor, next_key} = DLM.Sampler.sample(last_token_logits, temperature, current_key) 
+    next_token = Nx.to_number(next_token_tensor)
+    
+    IO.write(<<next_token::utf8>>)
+    
+    {next_key, current_tokens ++ [next_token]}
+  end)
+
+IO.puts("\n\n🐑 Dream Complete.")
+
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Awakening V26 from v26_1_bitwise_step53000.bin...
+
+Prompt: "Do state space models dream of recursive sheep?"
+
+V23:  
+09:28:42.092 [warning] No reference output found even though buffer checking was requested while autotuning
+
+09:28:42.857 [warning] No reference output found even though buffer checking was requested while autotuning
+ *CHI: 's and bur me the Mad and Come the sing that heion the hemend a and and what and, and the in you to ster the what age th
+
+🐑 Dream Complete.
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Stream
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 13, ...>>, {:stream, 3}}
+```
+
+```elixir
+defmodule BabyLM.ScholarParser do
+  @sequence_length 128 
+
+  @datasets %{
+    childes: ["childes.train.txt"], 
+    bnc: ["bnc_spoken.train.txt"],
+    switchboard: ["switchboard.train.txt"],
+    subtitles: ["open_subtitles.train.txt"], 
+    wiki: ["simple_wiki.train.txt"],
+    gutenberg: ["gutenberg.train.txt"]
+  }
+
+  def build_scholar_curriculum(directory_path) do
+    childes_chunks = load_and_chunk(directory_path, @datasets.childes)
+    bnc_chunks = load_and_chunk(directory_path, @datasets.bnc)
+    switchboard_chunks = load_and_chunk(directory_path, @datasets.switchboard)
+    subtitles_chunks = load_and_chunk(directory_path, @datasets.subtitles)
+    wiki_chunks = load_and_chunk(directory_path, @datasets.wiki)
+    gutenberg_chunks = load_and_chunk(directory_path, @datasets.gutenberg)
+
+
+    # A fully shuffled mix: 49% scholar, 50% child, 1% subtitle/switchboard
+    IO.puts("\n🧬 Mixing FULL Dataset Timeline...")
+
+    # Smash all the chunks together into one massive list, then shuffle
+    master_timeline = 
+      (wiki_chunks ++ gutenberg_chunks ++ subtitles_chunks ++ 
+       switchboard_chunks ++ childes_chunks ++ bnc_chunks)
+      |> Enum.shuffle()
+
+    IO.puts("📦 Packing #{length(master_timeline)} sequences into Nx Tensor...")
+    dataset_tensor = 
+      Nx.tensor(master_timeline, type: :u8)
+      |> Nx.backend_transfer(Nx.BinaryBackend) 
+    
+    File.write!("scholar_full_mixed_128.bin", :erlang.term_to_binary(dataset_tensor))
+    IO.puts("🎉 scholar_full_mixed_128.bin successfully generated!")
+  end
+
+  defp normalize_char(c) do
+    cond do
+      c < 128 -> c              # ASCII passthrough
+      
+      # Common accented Latin — map to base character
+      c in 0xC0..0xC5 -> ?A     # À Á Â Ã Ä Å
+      c in 0xC8..0xCB -> ?E     # È É Ê Ë
+      c in 0xCC..0xCF -> ?I     # Ì Í Î Ï
+      c in 0xD2..0xD6 -> ?O     # Ò Ó Ô Õ Ö
+      c in 0xD9..0xDC -> ?U     # Ù Ú Û Ü
+      c in 0xE0..0xE5 -> ?a     # à á â ã ä å
+      c in 0xE8..0xEB -> ?e     # è é ê ë
+      c in 0xEC..0xEF -> ?i     # ì í î ï
+      c in 0xF2..0xF6 -> ?o     # ò ó ô õ ö
+      c in 0xF9..0xFC -> ?u     # ù ú û ü
+      c == 0xD1 -> ?N           # Ñ
+      c == 0xF1 -> ?n           # ñ
+      c == 0xC7 -> ?C           # Ç
+      c == 0xE7 -> ?c           # ç
+      c == 0xDF -> ?s           # ß -> ss would be ideal but single char is fine
+      c == 0xD8 -> ?O           # Ø
+      c == 0xF8 -> ?o           # ø
+      c == 0xC6 -> ?A           # Æ
+      c == 0xE6 -> ?a           # æ
+  
+      # Smart quotes -> straight quotes
+      c in [0x2018, 0x2019] -> ?'
+      c in [0x201C, 0x201D] -> ?"
+      
+      # Dashes
+      c in [0x2013, 0x2014] -> ?-   # en-dash, em-dash
+      
+      # Ellipsis
+      c == 0x2026 -> ?.
+      
+      # Everything else — use a dedicated replacement token
+      # Use ASCII 1 (SOH) which never appears naturally in text
+      true -> 1
+    end
+  end
+
+  defp load_and_chunk(dir, files) do
+    raw_text =
+      files
+      |> Enum.map(fn file ->
+        path = Path.join(dir, file)
+        if File.exists?(path) do
+          IO.puts("  ✅ Loaded #{file}")
+          File.read!(path) |> String.replace(~r/\s+/, " ")
+        else
+          IO.puts("  ❌ Missing #{file} (Skipping...)")
+          ""
+        end
+      end)
+      |> Enum.join(" ")
+  
+    raw_text
+    |> String.to_charlist()
+    |> Enum.map(&normalize_char/1)
+    # Filter out chunks with too many replacement tokens (token 1)
+    # rather than too many 63s
+    |> Enum.chunk_every(@sequence_length, @sequence_length, :discard)
+    |> Enum.filter(fn chunk -> 
+      replacement_count = Enum.count(chunk, &(&1 == 1))
+      replacement_count < 8   # stricter than before — less than 3% replacements
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, BabyLM.ScholarParser, <<70, 79, 82, 49, 0, 0, 29, ...>>, {:load_and_chunk, 2}}
+```
+
+```elixir
+# === RUN THE PARSER ===
+# Point this to the folder containing your new BabyLM text files.
+# It will ignore everything else in the folder.
+data_dir = "./" 
+
+BabyLM.ScholarParser.build_scholar_curriculum(data_dir)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+  ❌ Missing childes.train.txt (Skipping...)
+  ❌ Missing bnc_spoken.train.txt (Skipping...)
+  ❌ Missing switchboard.train.txt (Skipping...)
+  ❌ Missing open_subtitles.train.txt (Skipping...)
+  ❌ Missing simple_wiki.train.txt (Skipping...)
+  ❌ Missing gutenberg.train.txt (Skipping...)
+
+🧬 Mixing FULL Dataset Timeline...
+📦 Packing 0 sequences into Nx Tensor...
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+** (RuntimeError) cannot build empty tensor
+    (nx 0.11.0) lib/nx.ex:871: Nx.tensor/3
+    #cell:vfp73qbcth25bvvv:33: BabyLM.ScholarParser.build_scholar_curriculum/1
+    #cell:pt6mvrhta3abyqfy:6: (file)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.V26_2_Trainer do
+  import Nx.Defn
+
+  def grad_norms(grads) do
+    # ⚡ Updated to 15 names
+    names = ~w[diff_w1 diff_w2 a_diag b_u b_v c_u c_v d_u d_v mx_u1 mx_v1 mx_u2 mx_v2 lm_w lm_b]
+    grads
+    |> Tuple.to_list()
+    |> Enum.zip(names)
+    |> Enum.map(fn {g, name} ->
+      norm = g |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+      {name, Float.round(norm, 4)}
+    end)
+  end
+
+  defn log_softmax(logits) do
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = logits - max_logits
+    sum_exp = Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)
+    safe_logits - Nx.log(sum_exp)
+  end
+
+  defn compute_loss(preds_sliced, targets) do
+    log_probs = log_softmax(preds_sliced)
+    target_probs = Nx.take_along_axis(log_probs, Nx.new_axis(targets, -1), axis: -1)
+    target_probs = Nx.squeeze(target_probs, axes: [-1])
+    mask = Nx.not_equal(targets, 0) |> Nx.as_type(:f32)
+  
+    total_tokens = Nx.sum(mask)
+    min_tokens   = Nx.tensor(204.0, type: :f32)
+    safe_denom   = Nx.max(total_tokens, min_tokens)
+  
+    masked_loss = -target_probs * mask
+    Nx.sum(masked_loss) / safe_denom
+  end
+
+  # ⚡ THE UPGRADE: Stochastic Masking (Variable Ratio Reinforcement)
+  # mask_prob = 0.10 means 10% of gradients are randomly dropped
+  defn sanitize_and_mask(g, key, mask_prob \\ -1.0) do
+    # 1. Catch NaNs (The Titanium Shield)
+    bad_mask = Nx.logical_or(Nx.is_nan(g), Nx.is_infinity(g))
+    safe_g = Nx.select(bad_mask, 0.0, g)
+
+    # 2. Generate random tensor of the exact same shape
+    {rand_tensor, next_key} = Nx.Random.uniform(key, shape: Nx.shape(safe_g))
+    
+    # 3. Create a mask: 1.0 if rand > 0.10, else 0.0
+    keep_mask = Nx.greater(rand_tensor, mask_prob)
+
+    # 4. Apply the mask
+    masked_g = Nx.select(keep_mask, safe_g, 0.0)
+    
+    {masked_g, next_key}
+  end
+  
+  # ⚡ CLEANUP: Renamed bit_proj to pos_emb
+  defn compute_grad(params, pos_emb, batch, key) do
+    # ⚡ FIX: Extract keys from the stacked [2, 2] tensor
+    keys_tensor = Nx.Random.split(key)
+    forward_key = keys_tensor[0]
+    dropout_key = keys_tensor[1]
+
+    {loss, raw_grads} = value_and_grad(params, fn p ->
+      batch_s32 = Nx.as_type(batch, :s32)
+      
+      # ⚡ Pass forward_key into the model
+      preds = DLM.UniversalSSM.forward(batch_s32, p, pos_emb, forward_key)
+      
+      preds_sliced = Nx.slice_along_axis(preds, 0, 127, axis: 1)
+      targets = Nx.slice_along_axis(batch_s32, 1, 127, axis: 1)
+      compute_loss(preds_sliced, targets)
+    end)
+
+    # ⚡ Unpack 15 raw gradients
+    {rg0, rg1, rg2, rg3, rg4, rg5, rg6, rg7, rg8, rg9, rg10, rg11, rg12, rg13, rg14} = raw_grads
+
+    # Thread the PRNG Key through the masking network
+    {g0,  k1}  = sanitize_and_mask(rg0,  dropout_key)
+    {g1,  k2}  = sanitize_and_mask(rg1,  k1)
+    {g2,  k3}  = sanitize_and_mask(rg2,  k2)
+    {g3,  k4}  = sanitize_and_mask(rg3,  k3)
+    {g4,  k5}  = sanitize_and_mask(rg4,  k4)
+    {g5,  k6}  = sanitize_and_mask(rg5,  k5)
+    {g6,  k7}  = sanitize_and_mask(rg6,  k6)
+    {g7,  k8}  = sanitize_and_mask(rg7,  k7)
+    {g8,  k9}  = sanitize_and_mask(rg8,  k8)
+    {g9,  k10} = sanitize_and_mask(rg9,  k9)
+    {g10, k11} = sanitize_and_mask(rg10, k10)
+    {g11, k12} = sanitize_and_mask(rg11, k11)
+    {g12, k13} = sanitize_and_mask(rg12, k12)
+    {g13, k14} = sanitize_and_mask(rg13, k13)
+    {g14, k15} = sanitize_and_mask(rg14, k14) # ⚡ 15th Gradient!
+
+    global_norm =
+      Nx.sum(Nx.pow(g0, 2)) |> Nx.add(Nx.sum(Nx.pow(g1, 2))) |> Nx.add(Nx.sum(Nx.pow(g2, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g3, 2))) |> Nx.add(Nx.sum(Nx.pow(g4, 2))) |> Nx.add(Nx.sum(Nx.pow(g5, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g6, 2))) |> Nx.add(Nx.sum(Nx.pow(g7, 2))) |> Nx.add(Nx.sum(Nx.pow(g8, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g9, 2))) |> Nx.add(Nx.sum(Nx.pow(g10, 2))) |> Nx.add(Nx.sum(Nx.pow(g11, 2)))
+      |> Nx.add(Nx.sum(Nx.pow(g12, 2))) |> Nx.add(Nx.sum(Nx.pow(g13, 2))) |> Nx.add(Nx.sum(Nx.pow(g14, 2)))
+      |> Nx.sqrt()
+
+    max_norm = 0.33
+    scale = Nx.min(1.0, max_norm / (global_norm + 1.0e-6))
+
+    clipped_grads = {
+      g0 * scale, g1 * scale, g2 * scale, g3 * scale, g4 * scale, 
+      g5 * scale, g6 * scale, g7 * scale, g8 * scale, g9 * scale, 
+      g10 * scale, g11 * scale, g12 * scale, g13 * scale, g14 * scale
+    }
+
+    {loss, clipped_grads, k15}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.V26_2_Trainer, <<70, 79, 82, 49, 0, 0, 46, ...>>, true}
+```
+
+```elixir
+save_interval = 1000
+gpu = {EXLA.Backend, client: :rocm}
+
+IO.puts("🧠 Loading v26 Curriculum into CPU Memory...")
+full_dataset = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+dataset_size = Nx.axis_size(full_dataset, 0)
+batch_size = 8
+
+total_steps_per_epoch = div(dataset_size, batch_size)
+max_epochs = 3
+total_steps = total_steps_per_epoch * max_epochs
+
+save_prefix = "v26_2_bitwise"
+
+latest_scholar =
+  Path.wildcard("#{save_prefix}_*.bin")
+  |> Enum.reject(&String.contains?(&1, "data.bin"))
+  |> Enum.max_by(fn path -> File.stat!(path).mtime end, fn -> nil end)
+
+{params, ms, vs, global_step, current_epoch, saved_key} =
+  cond do
+    latest_scholar != nil ->
+      IO.puts("💾 Resuming from checkpoint: #{latest_scholar}")
+      checkpoint = File.read!(latest_scholar) |> :erlang.binary_to_term()
+      p = DLM.Tree.map(checkpoint.params, &Nx.backend_copy(&1, gpu))
+      m = DLM.Tree.map(checkpoint.ms, &Nx.backend_copy(&1, gpu))
+      v = DLM.Tree.map(checkpoint.vs, &Nx.backend_copy(&1, gpu))
+      saved_key = Map.get(checkpoint, :shuffle_key, Nx.Random.key(42))
+        |> Nx.backend_copy(gpu)
+      {p, m, v, checkpoint.step, checkpoint.epoch, saved_key}
+
+    true ->
+      IO.puts("✨ No checkpoint found. Igniting FRESH Genesis state...")
+      raw_p = DLM.V26_2_Genesis.init_params(42)
+      {raw_m, raw_v, _} = DLM.V26_2_Genesis.init_optimizer(raw_p)
+      p = raw_p |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+      m = raw_m |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+      v = raw_v |> Tuple.to_list() |> Enum.map(&Nx.backend_copy(&1, gpu)) |> List.to_tuple()
+      saved_key = Nx.Random.key(42) |> Nx.backend_copy(gpu)
+      {p, m, v, 0, 1, saved_key}
+  end
+
+base_lr = 3.0e-4
+min_lr  = 1.0e-6
+warmup_steps = 500
+
+pos_emb = DLM.Positional.build(128, 512) |> Nx.backend_copy(gpu)
+IO.puts("🚀 IGNITION: Starting V26 at Epoch #{current_epoch}, Global Step #{global_step}...")
+
+Enum.reduce(current_epoch..max_epochs, {params, ms, vs, global_step, saved_key},
+  fn epoch, {p, m, v, current_step, shuffle_key} ->
+  IO.puts(String.duplicate("=", 50))
+  IO.puts("🌊 EPOCH #{epoch} / #{max_epochs}")
+  IO.puts("🔀 Shuffling dataset...")
+
+  {shuffled_raw, next_shuffle_key} = Nx.Random.shuffle(shuffle_key, full_dataset, axis: 0)
+  shuffled_dataset = Nx.backend_copy(shuffled_raw, Nx.BinaryBackend)
+
+  start_offset = 
+    if epoch == current_epoch do
+      rem(current_step, total_steps_per_epoch) * batch_size
+    else
+      0
+    end
+
+  epoch_batches = Stream.unfold(start_offset, fn offset ->
+    if offset + batch_size > dataset_size do
+      nil
+    else
+      batch_2d = Nx.slice_along_axis(shuffled_dataset, offset, batch_size, axis: 0)
+      {batch_2d, offset + batch_size}
+    end
+  end)
+
+  initial_key = Nx.Random.key(System.system_time(:second))
+
+  {new_p, new_m, new_v, next_epoch_step, _final_skips, _final_key} =
+    epoch_batches
+    |> Stream.with_index(1)
+    |> Enum.reduce({p, m, v, current_step, 0, initial_key}, fn {batch, step_in_epoch}, {cp, cm, cv, cs, s_count, cur_key} ->
+      gpu_batch = Nx.backend_copy(batch, gpu)
+
+      {loss_tensor, grads, new_key} = DLM.V26_2_Trainer.compute_grad(cp, pos_emb, gpu_batch, cur_key)
+      loss_val = Nx.to_number(loss_tensor)
+
+      if loss_val == :nan or loss_val > 10.0 do
+        cpu_batch = Nx.backend_copy(gpu_batch, Nx.BinaryBackend)
+        sequences = Nx.to_list(cpu_batch)
+        IO.puts("🔥 PATHOLOGICAL BATCH at global step #{cs}:")
+        Enum.each(sequences, fn seq ->
+          readable = seq |> Enum.reject(&(&1 == 0)) |> List.to_string()
+          IO.puts("   > #{readable}")
+        end)
+      end
+
+      if loss_val == :nan or loss_val > 10.0 do
+        if rem(step_in_epoch, 10) == 0,
+          do: IO.puts("⚠️ Step #{cs}: NaN/Spike detected. Skipping batch.")
+        {cp, cm, cv, cs + 1, s_count + 1, new_key}
+      else
+        # Calculate LR strictly using the Current Global Step (cs)
+        current_lr = 
+          if cs < warmup_steps do
+            # Linear Warmup
+            base_lr * (cs / warmup_steps)
+          else
+            # Cosine Decay
+            progress = (cs - warmup_steps) / (total_steps - warmup_steps)
+            clamped_progress = min(max(progress, 0.0), 1.0)
+            min_lr + 0.5 * (base_lr - min_lr) * (1.0 + :math.cos(:math.pi() * clamped_progress))
+          end
+
+          lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+          step_tensor = Nx.tensor(cs, type: :f32) |> Nx.backend_copy(gpu)
+  
+          {up_p, up_m, up_v} = DLM.MuonHybrid.step(cp, grads, cm, cv, step_tensor, lr_tensor)
+
+          # ⚡ FIX: Unpack 15 elements
+          {p_dw1, p_dw2, p_a, p_bu, p_bv, p_cu, p_cv, p_du, p_dv,
+           p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb} = up_p
+  
+          du_norm = p_du |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+  
+          up_p = if du_norm < 0.01 do
+            IO.puts("   🔧 Rescuing dead delta gate (d_u norm=#{Float.round(du_norm, 5)})")
+            rescaled_du = Nx.multiply(p_du, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+            rescaled_dv = Nx.multiply(p_dv, Nx.tensor(0.02 / max(du_norm, 1.0e-8)))
+            
+            # ⚡ FIX: Repack 15 elements
+            {p_dw1, p_dw2, p_a, p_bu, p_bv, p_cu, p_cv, rescaled_du, rescaled_dv,
+             p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb}
+          else
+            up_p
+        end
+
+        if rem(step_in_epoch, 50) == 0 do
+          bpc = loss_val / :math.log(2)
+          mem = :erlang.memory(:total) |> div(1024 * 1024)
+          cpu_grads = grads |> Tuple.to_list()
+            |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple()
+          norms = DLM.V26_2_Trainer.grad_norms(cpu_grads)
+          {max_name, max_norm} = Enum.max_by(norms, fn {_name, n} -> n end)
+          norm_str = norms |> Enum.map(fn {k, v} -> "#{k}=#{v}" end) |> Enum.join(" | ")
+          IO.puts("➡️  Step #{step_in_epoch} | Global: #{cs} | Loss: #{Float.round(loss_val, 4)} | BPC: #{Float.round(bpc, 3)} | LR: #{Float.round(current_lr, 6)} | RAM: #{mem}MB")
+          IO.puts("   📐 GRAD NORMS | MAX: #{max_name}=#{max_norm}")
+          IO.puts("   #{norm_str}")
+        end
+
+        if rem(cs, save_interval) == 0 and cs > 0 do
+          IO.puts("💾 Auto-Saving Checkpoint to #{save_prefix}_step#{cs}.bin...")
+          state = %{
+            params: up_p |> Tuple.to_list()
+              |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            ms: up_m |> Tuple.to_list()
+              |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            vs: up_v |> Tuple.to_list()
+              |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+            step: cs, epoch: epoch,
+            shuffle_key: next_shuffle_key |> Nx.backend_copy(Nx.BinaryBackend)
+          }
+          File.write!("#{save_prefix}_step#{cs}.bin", :erlang.term_to_binary(state))
+        end
+
+        if rem(step_in_epoch, 100) == 0, do: :erlang.garbage_collect(self())
+
+        {up_p, up_m, up_v, cs + 1, s_count, new_key}
+      end
+    end)
+
+  IO.puts("💾 Saving Completed Epoch #{epoch} State...")
+  final_state = %{
+    params: new_p |> Tuple.to_list()
+      |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    ms: new_m |> Tuple.to_list()
+      |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    vs: new_v |> Tuple.to_list()
+      |> Enum.map(&Nx.backend_copy(&1, Nx.BinaryBackend)) |> List.to_tuple(),
+    step: next_epoch_step, epoch: epoch,
+    shuffle_key: next_shuffle_key |> Nx.backend_copy(Nx.BinaryBackend)
+  }
+  File.write!("#{save_prefix}_epoch#{epoch}_COMPLETE.bin", :erlang.term_to_binary(final_state))
+
+  {new_p, new_m, new_v, next_epoch_step, next_shuffle_key}
+end)
+
+IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Loading v26 Curriculum into CPU Memory...
+💾 Resuming from checkpoint: v26_2_bitwise_step3000.bin
+
+10:19:20.145 [info] XLA service 0x729d3e2a9e40 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+10:19:20.146 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+10:19:20.146 [info] Using BFC allocator.
+
+10:19:20.146 [info] XLA backend allocating 7715841638 bytes on device 0 for BFCAllocator.
+
+10:19:20.146 [info] XLA backend will use up to 857315737 bytes on device 0 for CollectiveBFCAllocator.
+🚀 IGNITION: Starting V26 at Epoch 1, Global Step 3000...
+==================================================
+🌊 EPOCH 1 / 3
+🔀 Shuffling dataset...
+
+10:19:20.793 [info] Merging Dots in computation: region_13.14
+
+10:19:20.793 [info] Merging Dots in computation: region_33.36.clone
+
+10:19:20.793 [info] Merging Dots in computation: main.167
+
+10:19:20.946 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:26.043 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:26.051 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+10:19:30.634 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:35.404 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:35.546 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:35.673 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:36.407 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:36.540 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:37.450 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:37.522 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:37.524 [info] All configs were filtered out because none of them sufficiently match the hints. Maybe the hints set does not contain a good representative set of valid configs? Working around this by using the full hints set instead.
+
+10:19:42.319 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:42.523 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:45.455 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:47.308 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:47.831 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:49.773 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:50.143 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:55.604 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:19:55.674 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:20:00.928 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:20:11.038 [info] Merging Dots in computation: region_1.2
+
+10:20:11.039 [info] Merging Dots in computation: region_4.5
+
+10:20:11.039 [info] Merging Dots in computation: region_7.8
+
+10:20:11.039 [info] Merging Dots in computation: region_10.11
+
+10:20:11.039 [info] Merging Dots in computation: region_13.14
+
+10:20:11.039 [info] Merging Dots in computation: region_16.17
+
+10:20:11.039 [info] Merging Dots in computation: region_19.20
+
+10:20:11.039 [info] Merging Dots in computation: region_22.23
+
+10:20:11.039 [info] Merging Dots in computation: region_25.26
+
+10:20:11.039 [info] Merging Dots in computation: region_28.29
+
+10:20:16.084 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:20:16.405 [warning] No reference output found even though buffer checking was requested while autotuning
+
+10:20:16.470 [warning] No reference output found even though buffer checking was requested while autotuning
+💾 Auto-Saving Checkpoint to v26_2_bitwise_step3000.bin...
+➡️  Step 50 | Global: 3049 | Loss: 2.933 | BPC: 4.231 | LR: 0.0003 | RAM: 172MB
+   📐 GRAD NORMS | MAX: diff_w2=0.2235
+   diff_w1=0.0412 | diff_w2=0.2235 | a_diag=0.0 | b_u=0.0009 | b_v=0.0031 | c_u=0.0032 | c_v=0.0794 | d_u=0.0001 | d_v=0.0002 | mx_u1=0.0311 | mx_v1=0.1029 | mx_u2=0.0234 | mx_v2=0.0909 | lm_w=0.1746 | lm_b=0.0092
+➡️  Step 100 | Global: 3099 | Loss: 2.7988 | BPC: 4.038 | LR: 0.0003 | RAM: 173MB
+   📐 GRAD NORMS | MAX: lm_w=0.2502
+   diff_w1=0.0412 | diff_w2=0.1667 | a_diag=0.0 | b_u=0.0014 | b_v=0.0026 | c_u=0.0026 | c_v=0.0624 | d_u=0.0001 | d_v=0.0003 | mx_u1=0.0403 | mx_v1=0.0738 | mx_u2=0.0209 | mx_v2=0.0725 | lm_w=0.2502 | lm_b=0.0115
+➡️  Step 150 | Global: 3149 | Loss: 2.6204 | BPC: 3.78 | LR: 0.0003 | RAM: 173MB
+   📐 GRAD NORMS | MAX: lm_w=0.2556
+   diff_w1=0.0273 | diff_w2=0.1523 | a_diag=0.0 | b_u=0.0012 | b_v=0.0024 | c_u=0.0023 | c_v=0.0542 | d_u=0.0001 | d_v=0.0003 | mx_u1=0.0536 | mx_v1=0.092 | mx_u2=0.0291 | mx_v2=0.066 | lm_w=0.2556 | lm_b=0.0123
+➡️  Step 200 | Global: 3199 | Loss: 2.6085 | BPC: 3.763 | LR: 0.0003 | RAM: 174MB
+   📐 GRAD NORMS | MAX: lm_w=0.2708
+   diff_w1=0.0306 | diff_w2=0.1381 | a_diag=0.0 | b_u=0.0013 | b_v=0.0025 | c_u=0.0029 | c_v=0.055 | d_u=0.0001 | d_v=0.0003 | mx_u1=0.0494 | mx_v1=0.0719 | mx_u2=0.0235 | mx_v2=0.0654 | lm_w=0.2708 | lm_b=0.01
+➡️  Step 250 | Global: 3249 | Loss: 2.602 | BPC: 3.754 | LR: 0.0003 | RAM: 175MB
+   📐 GRAD NORMS | MAX: lm_w=0.224
+   diff_w1=0.0405 | diff_w2=0.1857 | a_diag=0.0 | b_u=0.0011 | b_v=0.0025 | c_u=0.0029 | c_v=0.0694 | d_u=0.0001 | d_v=0.0003 | mx_u1=0.0392 | mx_v1=0.0883 | mx_u2=0.036 | mx_v2=0.0836 | lm_w=0.224 | lm_b=0.0108
+➡️  Step 300 | Global: 3299 | Loss: 2.5961 | BPC: 3.745 | LR: 0.0003 | RAM: 176MB
+   📐 GRAD NORMS | MAX: lm_w=0.2032
+   diff_w1=0.0361 | diff_w2=0.2017 | a_diag=0.0 | b_u=0.001 | b_v=0.0036 | c_u=0.0037 | c_v=0.0743 | d_u=0.0001 | d_v=0.0003 | mx_u1=0.0355 | mx_v1=0.1018 | mx_u2=0.0276 | mx_v2=0.0867 | lm_w=0.2032 | lm_b=0.0135
+➡️  Step 350 | Global: 3349 | Loss: 2.744 | BPC: 3.959 | LR: 0.0003 | RAM: 177MB
+   📐 GRAD NORMS | MAX: lm_w=0.2596
+   diff_w1=0.0392 | diff_w2=0.154 | a_diag=0.0 | b_u=0.0016 | b_v=0.0024 | c_u=0.0022 | c_v=0.0518 | d_u=0.0002 | d_v=0.0003 | mx_u1=0.0434 | mx_v1=0.0819 | mx_u2=0.0285 | mx_v2=0.0635 | lm_w=0.2596 | lm_b=0.0114
+➡️  Step 400 | Global: 3399 | Loss: 2.6371 | BPC: 3.805 | LR: 0.0003 | RAM: 178MB
+   📐 GRAD NORMS | MAX: lm_w=0.2716
+   diff_w1=0.035 | diff_w2=0.1285 | a_diag=0.0 | b_u=0.0015 | b_v=0.0024 | c_u=0.0025 | c_v=0.0462 | d_u=0.0001 | d_v=0.0003 | mx_u1=0.0639 | mx_v1=0.0756 | mx_u2=0.0374 | mx_v2=0.0632 | lm_w=0.2716 | lm_b=0.0101
+➡️  Step 450 | Global: 3449 | Loss: 2.5684 | BPC: 3.705 | LR: 0.0003 | RAM: 179MB
+   📐 GRAD NORMS | MAX: lm_w=0.2803
+   diff_w1=0.0401 | diff_w2=0.1277 | a_diag=0.0 | b_u=0.0015 | b_v=0.0021 | c_u=0.0024 | c_v=0.0359 | d_u=0.0002 | d_v=0.0003 | mx_u1=0.0575 | mx_v1=0.0637 | mx_u2=0.0333 | mx_v2=0.0498 | lm_w=0.2803 | lm_b=0.0124
+```
