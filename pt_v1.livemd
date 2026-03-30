@@ -1,0 +1,956 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Standalone Probabilistic Tokenizer
+
+```elixir
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+System.put_env("XLA_FLAGS", "--xla_gpu_enable_reassociation_for_converted_ar=false")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"}
+])
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+
+
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Tokenizer
+
+```elixir
+defmodule DLM.LatentTokenizer do
+  import Nx.Defn
+
+  @num_bits 8
+  @dim 512
+  @vocab 128
+
+  defn to_bits(tokens) do
+    shifts = Nx.iota({@num_bits}) 
+             |> Nx.multiply(-1) 
+             |> Nx.add(@num_bits - 1)
+             |> Nx.as_type(:u32)
+    
+    tokens_expanded = Nx.new_axis(tokens, -1)
+    shifted = Nx.right_shift(tokens_expanded, shifts)
+    Nx.bitwise_and(shifted, 1) |> Nx.as_type(:f32)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  @doc """
+  Returns both the logits (for training the decoder) and the latents (for V27 later).
+  """
+  defn forward(tokens, params, key, noise_scale \\ 0.15) do
+    {enc_w1, enc_w2, dec_w1, dec_w2} = params
+
+    # 1. ENCODER: 8-bits -> 128D -> 512D
+    bits = to_bits(tokens)
+    hidden_enc = softplus(Nx.dot(bits, enc_w1))
+    latents = Nx.dot(hidden_enc, enc_w2)
+
+    # 2. DIFFUSION / NOISE: Inject the probability cloud
+    {noise, next_key} = Nx.Random.normal(key, 0.0, 1.0, shape: Nx.shape(latents))
+    noisy_latents = latents + (noise * noise_scale)
+
+    # 3. DECODER: 512D -> 128D -> 128 Vocab Logits
+    hidden_dec = softplus(Nx.dot(noisy_latents, dec_w1))
+    logits = Nx.dot(hidden_dec, dec_w2)
+
+    {logits, noisy_latents, next_key}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+warning: module attribute @vocab was set but never used
+└─ pt_v1.livemd#cell:wgt5laf5kprdjmh4:6: DLM.LatentTokenizer (module)
+
+warning: module attribute @dim was set but never used
+└─ pt_v1.livemd#cell:wgt5laf5kprdjmh4:5: DLM.LatentTokenizer (module)
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.LatentTokenizer, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Data helpers
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 13, ...>>, {:stream, 3}}
+```
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Init
+
+```elixir
+defmodule DLM.TokenizerGenesis do
+  @num_bits 8
+  @dim 512
+  @vocab 128
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    
+    # Encoder
+    {enc_w1, key} = Nx.Random.normal(key, 0.0, 0.05, shape: {@num_bits, 128})
+    {enc_w2, key} = Nx.Random.normal(key, 0.0, 0.05, shape: {128, @dim})
+    
+    # Decoder
+    {dec_w1, key} = Nx.Random.normal(key, 0.0, 0.05, shape: {@dim, 128})
+    {dec_w2, _key} = Nx.Random.normal(key, 0.0, 0.05, shape: {128, @vocab})
+
+    {enc_w1, enc_w2, dec_w1, dec_w2}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    vs = params |> Tuple.to_list() |> Enum.map(zero_like) |> List.to_tuple()
+    {ms, vs} # Just Adam for this, no Muon needed!
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TokenizerGenesis, <<70, 79, 82, 49, 0, 0, 14, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Trainer
+
+```elixir
+defmodule DLM.TokenizerTrainer do
+  import Nx.Defn
+
+  defn log_softmax(logits) do
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = logits - max_logits
+    sum_exp = Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)
+    safe_logits - Nx.log(sum_exp)
+  end
+
+  defn compute_loss(preds_sliced, targets) do
+    log_probs = log_softmax(preds_sliced)
+    target_probs = Nx.take_along_axis(log_probs, Nx.new_axis(targets, -1), axis: -1)
+    target_probs = Nx.squeeze(target_probs, axes: [-1])
+    mask = Nx.not_equal(targets, 0) |> Nx.as_type(:f32)
+  
+    total_tokens = Nx.sum(mask)
+    min_tokens   = Nx.tensor(204.0, type: :f32)
+    safe_denom   = Nx.max(total_tokens, min_tokens)
+  
+    masked_loss = -target_probs * mask
+    Nx.sum(masked_loss) / safe_denom
+  end
+
+  defn adam_step(param, grad, m, v, step, lr) do
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, step + 1.0))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, step + 1.0))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  defn compute_grad_and_step(params, ms, vs, batch, key, step, lr) do
+    batch_s32 = Nx.as_type(batch, :s32)
+
+    {loss, raw_grads} = value_and_grad(params, fn p ->
+      # We use a noise scale of 0.15 during training to force robust manifolds
+      {logits, _latents, _next_key} = DLM.LatentTokenizer.forward(batch_s32, p, key, 0.15)
+      
+      # The target is just the exact same batch! It's an Autoencoder.
+      compute_loss(logits, batch_s32)
+    end)
+
+    # Note: You need to split the key here to return a new one for the next step, 
+    # similar to how you did in V26.1
+    keys_tensor = Nx.Random.split(key)
+    next_key = keys_tensor[0]
+
+    # Unpack
+    {p1, p2, p3, p4} = params
+    {g1, g2, g3, g4} = raw_grads
+    {m1, m2, m3, m4} = ms
+    {v1, v2, v3, v4} = vs
+
+    # Adam Updates
+    {u_p1, u_m1, u_v1} = adam_step(p1, g1, m1, v1, step, lr)
+    {u_p2, u_m2, u_v2} = adam_step(p2, g2, m2, v2, step, lr)
+    {u_p3, u_m3, u_v3} = adam_step(p3, g3, m3, v3, step, lr)
+    {u_p4, u_m4, u_v4} = adam_step(p4, g4, m4, v4, step, lr)
+
+    new_p = {u_p1, u_p2, u_p3, u_p4}
+    new_m = {u_m1, u_m2, u_m3, u_m4}
+    new_v = {u_v1, u_v2, u_v3, u_v4}
+
+    {loss, new_p, new_m, new_v, next_key}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TokenizerTrainer, <<70, 79, 82, 49, 0, 0, 36, ...>>, true}
+```
+
+```elixir
+# Load the saved state
+%{params: saved_p} = File.read!("latent_tokenizer_step3000.bin") |> :erlang.binary_to_term()
+
+# In your TokenizerTrainer, params were packed as: {enc_w1, enc_w2, dec_w1, dec_w2}
+{frozen_enc_w1, frozen_enc_w2, _dec_w1, _dec_w2} = saved_p
+
+# Save JUST the encoder to a new, clean file for V27
+File.write!("v27_frozen_encoder.bin", :erlang.term_to_binary({frozen_enc_w1, frozen_enc_w2}))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+save_interval = 500
+gpu = {EXLA.Backend, client: :rocm}
+batch_size = 2048 # 🔥 Massive batch size because there is no BPTT!
+
+IO.puts("🧠 Loading Scholar Curriculum...")
+full_dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+
+# ⚡ Flatten the dataset into 1D and chunk it by our massive batch size
+dataset_1d = Nx.flatten(full_dataset_2d)
+total_chars = Nx.axis_size(dataset_1d, 0)
+total_steps = div(total_chars, batch_size)
+
+IO.puts("✨ Igniting FRESH Genesis state...")
+raw_p = DLM.TokenizerGenesis.init_params(42)
+{raw_m, raw_v} = DLM.TokenizerGenesis.init_optimizer(raw_p)
+
+# Transfer to GPU
+p = DLM.Tree.map(raw_p, &Nx.backend_copy(&1, gpu))
+m = DLM.Tree.map(raw_m, &Nx.backend_copy(&1, gpu))
+v = DLM.Tree.map(raw_v, &Nx.backend_copy(&1, gpu))
+
+# Setup learning rate and keys
+lr = Nx.tensor(5.0e-4, type: :f32) |> Nx.backend_copy(gpu) # Faster LR for simple models
+initial_key = Nx.Random.key(42) |> Nx.backend_copy(gpu)
+
+IO.puts("🚀 IGNITION: Training Latent Tokenizer for #{total_steps} steps...")
+
+{final_p, _final_m, _final_v, _final_key} = 
+  Enum.reduce(0..(total_steps - 1), {p, m, v, initial_key}, fn step, {cp, cm, cv, cur_key} ->
+    
+    # 1. Grab the next slice of data
+    offset = step * batch_size
+    batch_1d = Nx.slice_along_axis(dataset_1d, offset, batch_size, axis: 0)
+    
+    # Expand to {batch, 1} so it fits the expected matrix multiplication shapes
+    gpu_batch = Nx.new_axis(batch_1d, -1) |> Nx.backend_copy(gpu)
+    step_tensor = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
+
+    # 2. Forward pass and Adam Update
+    {loss_tensor, up_p, up_m, up_v, next_key} = 
+      DLM.TokenizerTrainer.compute_grad_and_step(cp, cm, cv, gpu_batch, cur_key, step_tensor, lr)
+
+    # 3. Telemetry
+    if rem(step, 50) == 0 do
+      loss_val = Nx.to_number(loss_tensor)
+      bpc = loss_val / :math.log(2)
+      IO.puts("➡️  Step #{step} | Loss: #{Float.round(loss_val, 4)} | BPC: #{Float.round(bpc, 3)}")
+    end
+
+    # 4. Save State
+    if rem(step, save_interval) == 0 and step > 0 do
+      IO.puts("💾 Auto-Saving Tokenizer Checkpoint...")
+      # Just saving the params here to keep it simple, since it trains so fast
+      cpu_p = DLM.Tree.map(up_p, &Nx.backend_copy(&1, Nx.BinaryBackend))
+      File.write!("latent_tokenizer_step#{step}.bin", :erlang.term_to_binary(%{params: cpu_p}))
+    end
+
+    if rem(step, 100) == 0, do: :erlang.garbage_collect(self())
+
+    {up_p, up_m, up_v, next_key}
+  end)
+
+IO.puts("🎉 TOKENIZER TRAINING COMPLETE!")
+# Save the final masterpiece
+cpu_final_p = DLM.Tree.map(final_p, &Nx.backend_copy(&1, Nx.BinaryBackend))
+File.write!("latent_tokenizer_COMPLETE.bin", :erlang.term_to_binary(%{params: cpu_final_p}))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Loading Scholar Curriculum...
+✨ Igniting FRESH Genesis state...
+🚀 IGNITION: Training Latent Tokenizer for 26412 steps...
+
+12:24:20.218 [info] Merging Dots in computation: main.22
+
+12:24:30.060 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:30.985 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:31.812 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:32.547 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:37.504 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:38.420 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:43.099 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:43.932 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:48.986 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:54.722 [warning] No reference output found even though buffer checking was requested while autotuning
+
+12:24:55.014 [warning] No reference output found even though buffer checking was requested while autotuning
+➡️  Step 0 | Loss: 5.0673 | BPC: 7.311
+➡️  Step 50 | Loss: 3.2185 | BPC: 4.643
+➡️  Step 100 | Loss: 2.6598 | BPC: 3.837
+➡️  Step 150 | Loss: 1.6344 | BPC: 2.358
+➡️  Step 200 | Loss: 0.7741 | BPC: 1.117
+➡️  Step 250 | Loss: 0.3669 | BPC: 0.529
+➡️  Step 300 | Loss: 0.2302 | BPC: 0.332
+➡️  Step 350 | Loss: 0.189 | BPC: 0.273
+➡️  Step 400 | Loss: 0.1406 | BPC: 0.203
+➡️  Step 450 | Loss: 0.0926 | BPC: 0.134
+➡️  Step 500 | Loss: 0.0515 | BPC: 0.074
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 550 | Loss: 0.0455 | BPC: 0.066
+➡️  Step 600 | Loss: 0.0385 | BPC: 0.056
+➡️  Step 650 | Loss: 0.0287 | BPC: 0.041
+➡️  Step 700 | Loss: 0.0207 | BPC: 0.03
+➡️  Step 750 | Loss: 0.0367 | BPC: 0.053
+➡️  Step 800 | Loss: 0.0115 | BPC: 0.017
+➡️  Step 850 | Loss: 0.0081 | BPC: 0.012
+➡️  Step 900 | Loss: 0.006 | BPC: 0.009
+➡️  Step 950 | Loss: 0.0036 | BPC: 0.005
+➡️  Step 1000 | Loss: 0.0192 | BPC: 0.028
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 1050 | Loss: 0.0048 | BPC: 0.007
+➡️  Step 1100 | Loss: 0.0024 | BPC: 0.004
+➡️  Step 1150 | Loss: 0.0031 | BPC: 0.004
+➡️  Step 1200 | Loss: 0.0019 | BPC: 0.003
+➡️  Step 1250 | Loss: 0.0018 | BPC: 0.003
+➡️  Step 1300 | Loss: 0.0016 | BPC: 0.002
+➡️  Step 1350 | Loss: 0.0014 | BPC: 0.002
+➡️  Step 1400 | Loss: 0.0017 | BPC: 0.002
+➡️  Step 1450 | Loss: 0.0012 | BPC: 0.002
+➡️  Step 1500 | Loss: 0.001 | BPC: 0.001
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 1550 | Loss: 0.0016 | BPC: 0.002
+➡️  Step 1600 | Loss: 0.0013 | BPC: 0.002
+➡️  Step 1650 | Loss: 0.0013 | BPC: 0.002
+➡️  Step 1700 | Loss: 0.0007 | BPC: 0.001
+➡️  Step 1750 | Loss: 0.0014 | BPC: 0.002
+➡️  Step 1800 | Loss: 0.0007 | BPC: 0.001
+➡️  Step 1850 | Loss: 0.0008 | BPC: 0.001
+➡️  Step 1900 | Loss: 0.0049 | BPC: 0.007
+➡️  Step 1950 | Loss: 0.0005 | BPC: 0.001
+➡️  Step 2000 | Loss: 0.0005 | BPC: 0.001
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 2050 | Loss: 0.0005 | BPC: 0.001
+➡️  Step 2100 | Loss: 0.0004 | BPC: 0.001
+➡️  Step 2150 | Loss: 0.0005 | BPC: 0.001
+➡️  Step 2200 | Loss: 0.0004 | BPC: 0.001
+➡️  Step 2250 | Loss: 0.0003 | BPC: 0.0
+➡️  Step 2300 | Loss: 0.0004 | BPC: 0.001
+➡️  Step 2350 | Loss: 0.0003 | BPC: 0.0
+➡️  Step 2400 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 2450 | Loss: 0.0003 | BPC: 0.0
+➡️  Step 2500 | Loss: 0.0003 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 2550 | Loss: 0.0003 | BPC: 0.0
+➡️  Step 2600 | Loss: 0.0003 | BPC: 0.0
+➡️  Step 2650 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 2700 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 2750 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 2800 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 2850 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 2900 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 2950 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3000 | Loss: 0.0002 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 3050 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 3100 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3150 | Loss: 0.0003 | BPC: 0.0
+➡️  Step 3200 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 3250 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 3300 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3350 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3400 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3450 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3500 | Loss: 0.0001 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 3550 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3600 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 3650 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3700 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3750 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3800 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3850 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 3900 | Loss: 0.0723 | BPC: 0.104
+➡️  Step 3950 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 4000 | Loss: 0.0001 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 4050 | Loss: 0.015 | BPC: 0.022
+➡️  Step 4100 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 4150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4250 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 4300 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 4350 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 4400 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 4450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4500 | Loss: 0.0001 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 4550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4650 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 4700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 4950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 5050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5150 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 5200 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 5250 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 5300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5450 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 5500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 5550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5800 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 5850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 5950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6000 | Loss: 0.003 | BPC: 0.004
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 6050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 6550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 6950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 7050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 7550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 7600 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 7650 | Loss: 0.014 | BPC: 0.02
+➡️  Step 7700 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 7750 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 7800 | Loss: 0.0002 | BPC: 0.0
+➡️  Step 7850 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 7900 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 7950 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 8000 | Loss: 0.0001 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 8050 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 8100 | Loss: 0.0061 | BPC: 0.009
+➡️  Step 8150 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 8200 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 8250 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 8300 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 8350 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 8400 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 8450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 8500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 8550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 8600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 8650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 8700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 8750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 8800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 8850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 8900 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 8950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 9050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9350 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 9400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 9550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 9950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 10050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10150 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 10200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10350 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 10400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 10550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 10950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 11050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 11550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11600 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 11650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 11950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 12050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 12550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 12950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 13050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 13550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 13950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 14050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 14550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 14950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 15050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 15550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 15950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 16050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 16550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16700 | Loss: 0.0005 | BPC: 0.001
+➡️  Step 16750 | Loss: 0.0001 | BPC: 0.0
+➡️  Step 16800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 16950 | Loss: 0.0016 | BPC: 0.002
+➡️  Step 17000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 17050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 17550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 17950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 18050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 18550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 18950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 19050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 19550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 19950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 20050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 20550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 20950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 21050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21300 | Loss: 0.0107 | BPC: 0.015
+➡️  Step 21350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 21550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 21950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 22050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 22550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 22950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 23050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 23550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 23950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 24050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24400 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24450 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24500 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 24550 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24600 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24650 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24700 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24750 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24800 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24850 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24900 | Loss: 0.0 | BPC: 0.0
+➡️  Step 24950 | Loss: 0.0 | BPC: 0.0
+➡️  Step 25000 | Loss: 0.0 | BPC: 0.0
+💾 Auto-Saving Tokenizer Checkpoint...
+➡️  Step 25050 | Loss: 0.0 | BPC: 0.0
+➡️  Step 25100 | Loss: 0.0 | BPC: 0.0
+➡️  Step 25150 | Loss: 0.0 | BPC: 0.0
+➡️  Step 25200 | Loss: 0.0 | BPC: 0.0
+➡️  Step 25250 | Loss: 0.0 | BPC: 0.0
+➡️  Step 25300 | Loss: 0.0 | BPC: 0.0
+➡️  Step 25350 | Loss: 0.0 | BPC: 0.0
+➡️  Step 25400 | Loss: 0.0 | BPC: 0.0
+```
