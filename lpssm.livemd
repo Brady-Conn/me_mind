@@ -1,0 +1,1254 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Language Physics SSM
+
+```elixir
+# # ===========================================================================
+# # V20-BB Setup
+# # ===========================================================================
+# System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+# System.put_env("XLA_TARGET", "rocm")
+# # System.put_env("XLA_CLIENT_MEM_FRACTION", "0.75")
+# # System.put_env("TF_ROCM_FUSION_ENABLE", "0")        # ← disables the Merging Dots pass
+# System.put_env("XLA_FLAGS", "--xla_gpu_enable_reassociation_for_converted_ar=false")
+
+# Mix.install([
+#   {:nx, "~> 0.11.0"},
+#   {:exla, "~> 0.11.0"}
+# ])
+
+# gpu = {EXLA.Backend, client: :rocm}
+# Nx.global_default_backend(gpu)
+
+
+# Nx.Defn.default_options(compiler: EXLA)
+
+# platforms = EXLA.Client.get_supported_platforms()
+# if platforms[:rocm] do
+#   IO.puts("✅ AMD RX 7600 online!")
+# else
+#   IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+# end
+
+# ===========================================================================
+# V28 Setup
+# ===========================================================================
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## LPSSM, Positional, Muon_Optimizer
+
+```elixir
+# ===========================================================================
+# THE TINY SSM (Stateful Predictor)
+# ===========================================================================
+defmodule DLM.TinySSM do
+  import Nx.Defn
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    activated = gelu(hidden) 
+    Nx.dot(activated, v)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn forward(x_t, h_prev, params) do
+    # ⚡ Unpack the 7 parameters
+    {a, bu, bv, cu, cv, du, dv} = params
+
+    b_proj = apply_svd(x_t, bu, bv)
+    
+    # ⚡ The Dynamic Gate
+    gate_proj = apply_svd(x_t, du, dv)
+    delta = Nx.max(softplus(gate_proj), 1.0e-4) # Minimum step size for stability
+    
+    # Dynamic Friction & Force
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    b_bar = Nx.multiply(delta, b_proj)
+    
+    h_new = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    
+    predicted_vector = apply_svd(h_new, cu, cv)
+    
+    {predicted_vector, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+# ===========================================================================
+# AdamW7 (Strictly 7 Parameters)
+# ===========================================================================
+defmodule DLM.AdamW7 do
+  import Nx.Defn
+
+  # Core AdamW Step for a single parameter
+  defn adam_step(p, g, m, v, step, lr) do
+    beta1 = 0.9
+    beta2 = 0.999
+    weight_decay = 0.01
+
+    m_new = Nx.add(Nx.multiply(beta1, m), Nx.multiply(1.0 - beta1, g))
+    v_new = Nx.add(Nx.multiply(beta2, v), Nx.multiply(1.0 - beta2, Nx.pow(g, 2)))
+
+    # Bias correction
+    m_hat = Nx.divide(m_new, Nx.subtract(1.0, Nx.pow(beta1, step)))
+    v_hat = Nx.divide(v_new, Nx.subtract(1.0, Nx.pow(beta2, step)))
+
+    update_val = Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), 1.0e-8)))
+
+    # Apply weight decay & update
+    p_decayed = Nx.subtract(p, Nx.multiply(Nx.multiply(lr, weight_decay), p))
+    p_new = Nx.subtract(p_decayed, update_val)
+
+    {p_new, m_new, v_new}
+  end
+
+  # Map across all 5 parameters
+  defn update(params, grads, ms, vs, step, lr) do
+    {a, bu, bv, cu, cv, du, dv} = params
+    {ga, gbu, gbv, gcu, gcv, gdu, gdv} = grads
+    {ma, mbu, mbv, mcu, mcv, mdu, mdv} = ms
+    {va, vbu, vbv, vcu, vcv, vdu, vdv} = vs
+
+    new_step = Nx.add(step, 1)
+
+    {a_new, ma_new, va_new} = adam_step(a, ga, ma, va, new_step, lr)
+    {bu_new, mbu_new, vbu_new} = adam_step(bu, gbu, mbu, vbu, new_step, lr)
+    {bv_new, mbv_new, vbv_new} = adam_step(bv, gbv, mbv, vbv, new_step, lr)
+    {cu_new, mcu_new, vcu_new} = adam_step(cu, gcu, mcu, vcu, new_step, lr)
+    {cv_new, mcv_new, vcv_new} = adam_step(cv, gcv, mcv, vcv, new_step, lr)
+
+    {du_new, mdu_new, vdu_new} = adam_step(du, gdu, mdu, vdu, new_step, lr)
+    {dv_new, mdv_new, vdv_new} = adam_step(dv, gdv, mdv, vdv, new_step, lr)
+
+    new_params = {a_new, bu_new, bv_new, cu_new, cv_new, du_new, dv_new}
+    new_ms = {ma_new, mbu_new, mbv_new, mcu_new, mcv_new, mdu_new, mdv_new}
+    new_vs = {va_new, vbu_new, vbv_new, vcu_new, vcv_new, vdu_new, vdv_new}
+
+    {new_params, new_ms, new_vs, new_step}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.AdamW7, <<70, 79, 82, 49, 0, 0, 26, ...>>, true}
+```
+
+```elixir
+defmodule DLM.PhysicsGenesis do
+  import Nx.Defn
+
+  @dim 512
+  @rank 256
+
+  defn ignite(key) do
+    # a_diag: Friction/Inertia
+    {a, k1} = Nx.Random.normal(key, -2.0, 0.1, shape: {@dim})
+    
+    # b: Input Force Matrices
+    {bu, k2} = Nx.Random.normal(k1, 0.0, 0.02, shape: {@dim, @rank})
+    {bv, k3} = Nx.Random.normal(k2, 0.0, 0.02, shape: {@rank, @dim})
+    
+    # c: Output Velocity Matrices
+    {cu, k4} = Nx.Random.normal(k3, 0.0, 0.02, shape: {@dim, @rank})
+    {cv, k5} = Nx.Random.normal(k4, 0.0, 0.02, shape: {@rank, @dim})
+
+    # ⚡ NEW: d: Dynamic Gating Matrices (Initialized near zero)
+    {du, k6} = Nx.Random.normal(k5, 0.0, 0.001, shape: {@dim, @rank})
+    {dv, next_key} = Nx.Random.normal(k6, 0.0, 0.001, shape: {@rank, @dim})
+
+    {{a, bu, bv, cu, cv, du, dv}, next_key}
+  end
+
+  def init_optimizer(params) do
+    zero_state = DLM.Tree.map(params, fn p -> Nx.broadcast(0.0, Nx.shape(p)) end)
+    {zero_state, zero_state, Nx.tensor(0)}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+warning: DLM.Tree.map/2 is undefined (module DLM.Tree is not available or is yet to be defined)
+└─ lpssm.livemd#cell:oopm72j5laxm4w62:27: DLM.PhysicsGenesis.init_optimizer/1
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 16, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inference
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.BilliardsProbe do
+  import Nx.Defn
+
+  # 1. Run the sequence through the SSM to build momentum
+  defn predict_next_coord(input_coords, h_init, predictor_params) do
+    {_batch, seq_len, _dim} = Nx.shape(input_coords)
+    inputs_time_first = Nx.transpose(input_coords, axes: [1, 0, 2])
+
+    result =
+      while {i = 0, h = h_init, inputs = inputs_time_first, p = predictor_params, 
+             last_landing = Nx.broadcast(0.0, {1, 512})},
+            Nx.less(i, seq_len) do
+            
+        current_coord = inputs[i]
+        {predicted_vector, h_new} = DLM.TinySSM.forward(current_coord, h, p)
+        
+        # Calculate exactly where the vector lands in the void
+        landing_spot = Nx.add(current_coord, predicted_vector)
+        
+        {i + 1, h_new, inputs, p, landing_spot}
+      end
+    
+    # Return the very last predicted landing spot
+    elem(result, 4)
+  end
+  
+  # 2. Elixir helper to measure the distance to the whole vocabulary and sort it
+  def check_pockets(landing_spot, all_vocab_coords, k \\ 5) do
+    # Calculate Euclidean distance to all 128 characters
+    diff = Nx.subtract(all_vocab_coords, landing_spot)
+    distances = Nx.sqrt(Nx.sum(Nx.pow(diff, 2), axes: [-1]))
+    
+    # Convert to Elixir list for easy sorting
+    dist_list = Nx.to_flat_list(distances)
+    
+    # Pair each distance with its ASCII index: {ascii_index, distance}
+    vocab_with_dists = Enum.with_index(dist_list) |> Enum.map(fn {dist, idx} -> {idx, dist} end)
+    
+    # Sort by closest distance
+    Enum.sort_by(vocab_with_dists, fn {_idx, dist} -> dist end)
+    |> Enum.take(k)
+  end
+end
+
+# ===========================================================================
+# EXECUTION: Test the Physics Engine
+# ===========================================================================
+
+# 1. Load the frozen Tokenizer & the trained Physics Engine
+{enc_w1, enc_w2} = File.read!("v27_frozen_encoder.bin") |> :erlang.binary_to_term()
+trained_physics_params = File.read!("v27_physics_engine_fixed.bin") |> :erlang.binary_to_term()
+
+# 2. Get the absolute coordinates of all 128 pockets
+all_vocab = Nx.iota({128})
+all_vocab_coords = DLM.PhysicsEngine.get_coordinates(all_vocab, enc_w1, enc_w2)
+
+# 3. Create a test sequence
+text_sequence = "The cat sat on the m"
+# We want to see what the engine predicts comes after 'm'
+tokens = DLM.LatentTokenizer.to_ascii_tokens(text_sequence) |> Nx.new_axis(0)
+
+# Project the text sequence into the 512D void
+input_coords = DLM.PhysicsEngine.get_coordinates(tokens, enc_w1, enc_w2)
+
+# 4. Generate the prediction!
+h_init = Nx.broadcast(0.0, {1, 512})
+landing_spot = DLM.BilliardsProbe.predict_next_coord(input_coords, h_init, trained_physics_params)
+
+# 5. Check which pockets the vector landed near
+top_predictions = DLM.BilliardsProbe.check_pockets(landing_spot, all_vocab_coords)
+
+IO.puts("🎱 512D Billiards Probe 🎱")
+IO.puts("Sequence: '#{text_sequence}'")
+IO.puts("---------------------------------")
+Enum.each(top_predictions, fn {ascii, dist} ->
+  char = List.to_string([ascii])
+  # Clean up unprintable characters for the terminal
+  char_display = if String.printable?(char) and char != "\n", do: "'#{char}'", else: "[ASCII #{ascii}]"
+  IO.puts("Pocket: #{char_display} | Distance: #{Float.round(dist, 4)}")
+end)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+warning: variable "last_landing" is unused (there is a variable with the same name in the context, use the pin operator (^) to match on it or prefix this variable with underscore if it is not meant to be used)
+└─ lpssm.livemd#cell:lrlqcuzu7i3k2qs2:11: DLM.BilliardsProbe.predict_next_coord/3
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+** (MatchError) no match of right hand side value: {#Nx.Tensor<
+   f32[512]
+   
+   Nx.Defn.Expr
+   parameter a:3   f32[512]
+ >, #Nx.Tensor<
+   f32[512][256]
+   
+   Nx.Defn.Expr
+   parameter a:4   f32[512][256]
+ >, #Nx.Tensor<
+   f32[256][512]
+   
+   Nx.Defn.Expr
+   parameter a:5   f32[256][512]
+ >, #Nx.Tensor<
+   f32[512][256]
+   
+   Nx.Defn.Expr
+   parameter a:6   f32[512][256]
+ >, #Nx.Tensor<
+   f32[256][512]
+   
+   Nx.Defn.Expr
+   parameter a:7   f32[256][512]
+ >}
+    #cell:juygzy57b5e3u3jl:27: DLM.TinySSM."__defn:forward__"/3
+    (nx 0.11.0) lib/nx/defn/compiler.ex:235: Nx.Defn.Compiler.__remote__/4
+    #cell:lrlqcuzu7i3k2qs2:15: anonymous fn/3 in DLM.BilliardsProbe."__defn:predict_next_coord__"/3
+    (nx 0.11.0) lib/nx/defn/expr.ex:530: Nx.Defn.Expr.while_vectorized/7
+    #cell:lrlqcuzu7i3k2qs2:10: DLM.BilliardsProbe."__defn:predict_next_coord__"/3
+    (nx 0.11.0) lib/nx/defn/compiler.ex:190: Nx.Defn.Compiler.runtime_fun/3
+    (exla 0.11.0) lib/exla/defn.ex:377: anonymous fn/4 in EXLA.Defn.compile/8
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Stream
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.LatentTokenizer do
+  import Nx.Defn
+
+  @num_bits 8
+
+  defn to_bits(tokens) do
+    shifts = Nx.iota({@num_bits}) 
+             |> Nx.multiply(-1) 
+             |> Nx.add(@num_bits - 1)
+             |> Nx.as_type(:u32)
+    
+    tokens_expanded = Nx.new_axis(tokens, -1)
+    shifted = Nx.right_shift(tokens_expanded, shifts)
+    Nx.bitwise_and(shifted, 1) |> Nx.as_type(:f32)
+  end
+
+  @doc """
+  Converts a standard Elixir string into a 1D tensor of ASCII integers.
+  Example: "Cat" -> #Nx.Tensor<[67, 97, 116]>
+  """
+  def to_ascii_tokens(string) do
+    string
+    |> String.to_charlist()
+    |> Nx.tensor(type: :u8) # u8 matches your 0-255 ASCII setup
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  # ⚡ Add rms_norm to the tokenizer
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn forward(tokens, params, key, noise_scale \\ 0.15) do
+    {enc_w1, enc_w2, dec_w1, dec_w2} = params
+
+    bits = to_bits(tokens)
+    hidden_enc = softplus(Nx.dot(bits, enc_w1))
+    
+    # ⚡ FIX: The Latent Trap! Normalize the vectors BEFORE adding noise.
+    raw_latents = Nx.dot(hidden_enc, enc_w2)
+    latents = rms_norm(raw_latents)
+
+    {noise, next_key} = Nx.Random.normal(key, 0.0, 1.0, shape: Nx.shape(latents))
+    noisy_latents = latents + (noise * noise_scale)
+
+    hidden_dec = softplus(Nx.dot(noisy_latents, dec_w1))
+    logits = Nx.dot(hidden_dec, dec_w2)
+
+    {logits, noisy_latents, next_key}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.LatentTokenizer, <<70, 79, 82, 49, 0, 0, 30, ...>>, true}
+```
+
+```elixir
+defmodule DLM.LatentRadar do
+  import Nx.Defn
+
+  # 1. Recreate the exact deterministic path from your Tokenizer
+  defn get_coordinates(tokens, enc_w1, enc_w2) do
+    bits = DLM.LatentTokenizer.to_bits(tokens)
+    hidden_enc = DLM.LatentTokenizer.softplus(Nx.dot(bits, enc_w1))
+    raw_latents = Nx.dot(hidden_enc, enc_w2)
+    
+    # The crucial latents trap!
+    DLM.LatentTokenizer.rms_norm(raw_latents) 
+  end
+
+  # 2. Calculate the physical distance between all 128 points simultaneously
+  defn pairwise_distances(coords) do
+    # Expand shapes to {128, 1, 512} and {1, 128, 512}
+    a = Nx.new_axis(coords, 1)
+    b = Nx.new_axis(coords, 0)
+    
+    # Calculate the difference, square it, sum along the 512D axis, and take the square root
+    diff = Nx.subtract(a, b)
+    Nx.sqrt(Nx.sum(Nx.pow(diff, 2), axes: [-1])) 
+  end
+end
+
+# =====================================================================
+# Execution & Analysis
+# =====================================================================
+
+# 1. Load your newly minted frozen Tokenizer weights
+# (Adjust this to match exactly how you are loading them into V27)
+# {enc_w1, enc_w2} = File.read!("v27_frozen_encoder.bin") |> :erlang.binary_to_term()
+
+
+# # 2. Generate the entire vocabulary (ASCII 0 through 127)
+# vocab = Nx.iota({128})
+
+# # 3. Get the absolute 512D center-point coordinates for every character
+# coords = DLM.LatentRadar.get_coordinates(vocab, enc_w1, enc_w2)
+
+# # 4. Generate the 128x128 Distance Matrix
+# dist_matrix = DLM.LatentRadar.pairwise_distances(coords)
+
+# # To find the true minimum distance, we must ignore the distance from a character 
+# # to itself (which is exactly 0.0). We mask the diagonal with a massive number.
+# mask = Nx.eye({128, 128}) |> Nx.multiply(9999.0)
+# masked_dists = Nx.add(dist_matrix, mask)
+
+# # Extract the vital statistics of the void
+# min_dist = Nx.reduce_min(masked_dists) |> Nx.to_number()
+# max_dist = Nx.reduce_max(dist_matrix) |> Nx.to_number()
+# avg_dist = Nx.mean(dist_matrix) |> Nx.to_number() 
+
+# IO.puts "🌌 512D Latent Void Geometry 🌌"
+# IO.puts "===================================="
+# IO.puts "Absolute Closest Neighbors: #{Float.round(min_dist, 4)}"
+# IO.puts "Furthest Two Characters:    #{Float.round(max_dist, 4)}"
+# IO.puts "Average Distance Across Space: #{Float.round(avg_dist, 4)}\n"
+
+# # Let's inspect the neighborhood around the letter 'e' (ASCII 101)
+# e_ascii = 101
+# e_masked = masked_dists[e_ascii]
+# closest_idx = Nx.argmin(e_masked) |> Nx.to_number()
+# closest_dist = e_masked[closest_idx] |> Nx.to_number()
+
+# IO.puts "🔍 Probe: The Letter 'e' (ASCII #{e_ascii})"
+# IO.puts "Closest neighbor is ASCII #{closest_idx} (Distance: #{Float.round(closest_dist, 4)})"
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.LatentRadar, <<70, 79, 82, 49, 0, 0, 15, ...>>, true}
+```
+
+```elixir
+defmodule BabyLM.ScholarParser do
+  @sequence_length 17 
+
+  @datasets %{
+    childes: ["childes.train.txt"], 
+    bnc: ["bnc_spoken.train.txt"],
+    switchboard: ["switchboard.train.txt"],
+    subtitles: ["open_subtitles.train.txt"], 
+    wiki: ["simple_wiki.train.txt"],
+    gutenberg: ["gutenberg.train.txt"]
+  }
+
+  def build_scholar_curriculum(directory_path) do
+    childes_chunks = load_and_chunk(directory_path, @datasets.childes)
+    bnc_chunks = load_and_chunk(directory_path, @datasets.bnc)
+    switchboard_chunks = load_and_chunk(directory_path, @datasets.switchboard)
+    subtitles_chunks = load_and_chunk(directory_path, @datasets.subtitles)
+    wiki_chunks = load_and_chunk(directory_path, @datasets.wiki)
+    gutenberg_chunks = load_and_chunk(directory_path, @datasets.gutenberg)
+
+
+    # A fully shuffled mix: 49% scholar, 50% child, 1% subtitle/switchboard
+    IO.puts("\n🧬 Mixing FULL Dataset Timeline...")
+
+    # Smash all the chunks together into one massive list, then shuffle
+    master_timeline = 
+      (wiki_chunks ++ gutenberg_chunks ++ subtitles_chunks ++ 
+       switchboard_chunks ++ childes_chunks ++ bnc_chunks)
+      |> Enum.shuffle()
+
+    IO.puts("📦 Packing #{length(master_timeline)} sequences into Nx Tensor...")
+    dataset_tensor = 
+      Nx.tensor(master_timeline, type: :u8)
+      |> Nx.backend_transfer(Nx.BinaryBackend) 
+    
+    File.write!("scholar_full_mixed_17.bin", :erlang.term_to_binary(dataset_tensor))
+    IO.puts("🎉 scholar_full_mixed_17.bin successfully generated!")
+  end
+
+  defp normalize_char(c) do
+    cond do
+      c < 128 -> c              # ASCII passthrough
+      
+      # Common accented Latin — map to base character
+      c in 0xC0..0xC5 -> ?A     # À Á Â Ã Ä Å
+      c in 0xC8..0xCB -> ?E     # È É Ê Ë
+      c in 0xCC..0xCF -> ?I     # Ì Í Î Ï
+      c in 0xD2..0xD6 -> ?O     # Ò Ó Ô Õ Ö
+      c in 0xD9..0xDC -> ?U     # Ù Ú Û Ü
+      c in 0xE0..0xE5 -> ?a     # à á â ã ä å
+      c in 0xE8..0xEB -> ?e     # è é ê ë
+      c in 0xEC..0xEF -> ?i     # ì í î ï
+      c in 0xF2..0xF6 -> ?o     # ò ó ô õ ö
+      c in 0xF9..0xFC -> ?u     # ù ú û ü
+      c == 0xD1 -> ?N           # Ñ
+      c == 0xF1 -> ?n           # ñ
+      c == 0xC7 -> ?C           # Ç
+      c == 0xE7 -> ?c           # ç
+      c == 0xDF -> ?s           # ß -> ss would be ideal but single char is fine
+      c == 0xD8 -> ?O           # Ø
+      c == 0xF8 -> ?o           # ø
+      c == 0xC6 -> ?A           # Æ
+      c == 0xE6 -> ?a           # æ
+  
+      # Smart quotes -> straight quotes
+      c in [0x2018, 0x2019] -> ?'
+      c in [0x201C, 0x201D] -> ?"
+      
+      # Dashes
+      c in [0x2013, 0x2014] -> ?-   # en-dash, em-dash
+      
+      # Ellipsis
+      c == 0x2026 -> ?.
+      
+      # Everything else — use a dedicated replacement token
+      # Use ASCII 1 (SOH) which never appears naturally in text
+      true -> 1
+    end
+  end
+
+  defp load_and_chunk(dir, files) do
+    raw_text =
+      files
+      |> Enum.map(fn file ->
+        path = Path.join(dir, file)
+        if File.exists?(path) do
+          IO.puts("  ✅ Loaded #{file}")
+          File.read!(path) |> String.replace(~r/\s+/, " ")
+        else
+          IO.puts("  ❌ Missing #{file} (Skipping...)")
+          ""
+        end
+      end)
+      |> Enum.join(" ")
+  
+    raw_text
+    |> String.to_charlist()
+    |> Enum.map(&normalize_char/1)
+    # Filter out chunks with too many replacement tokens (token 1)
+    # rather than too many 63s
+    |> Enum.chunk_every(@sequence_length, @sequence_length, :discard)
+    |> Enum.filter(fn chunk -> 
+      replacement_count = Enum.count(chunk, &(&1 == 1))
+      replacement_count < 8   # stricter than before — less than 3% replacements
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, BabyLM.ScholarParser, <<70, 79, 82, 49, 0, 0, 29, ...>>, {:load_and_chunk, 2}}
+```
+
+```elixir
+# === RUN THE PARSER ===
+# Point this to the folder containing your new BabyLM text files.
+# It will ignore everything else in the folder.
+data_dir = "./" 
+
+BabyLM.ScholarParser.build_scholar_curriculum(data_dir)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+  ✅ Loaded childes.train.txt
+  ✅ Loaded bnc_spoken.train.txt
+  ✅ Loaded switchboard.train.txt
+  ✅ Loaded open_subtitles.train.txt
+  ✅ Loaded simple_wiki.train.txt
+  ✅ Loaded gutenberg.train.txt
+
+🧬 Mixing FULL Dataset Timeline...
+📦 Packing 3184571 sequences into Nx Tensor...
+🎉 scholar_full_mixed_17.bin successfully generated!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 12, ...>>, true}
+```
+
+```elixir
+defmodule DLM.PhysicsLoss do
+  import Nx.Defn
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # 1. Transpose from {seq, batch, dim} to {batch, seq, dim}
+    p_b = Nx.transpose(pred, axes: [1, 0, 2])
+    t_b = Nx.transpose(target, axes: [1, 0, 2])
+
+    p_l2 = l2_normalize(p_b)
+    t_l2 = l2_normalize(t_b)
+
+    # 2. Batched Dot Product -> {batch, seq, seq}
+    sim_tensor = Nx.dot(p_l2, [2], [0], t_l2, [2], [0])
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 3. Create Identity Targets -> {batch, seq, seq}
+    seq_len = elem(Nx.shape(p_b), 1)
+    labels = Nx.eye(seq_len, type: :f32)
+    batch_labels = Nx.broadcast(labels, Nx.shape(sim_tensor))
+
+    # ⚡ 4. Manual Dense Log-Softmax (Bypasses DLM.Loss entirely)
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(batch_labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+
+  # ⚡ 3. The Tri-Fold Geometric Loss
+  defn compute(pred, target) do
+    # 1. MSE: Anchors the absolute position in the latent space
+    mse = Nx.mean(Nx.pow(Nx.subtract(pred, target), 2))
+    
+    # 2. Cosine: Ensures the trajectory angle is dead-on
+    cos = cosine_distance(pred, target)
+    
+    # 3. Soft-NN: Repels the vector away from phonetically incorrect neighbors
+    snn = soft_nn_loss(pred, target, 0.1)
+
+    # Weight the combination (Soft-NN is highly aggressive, so we scale it to 0.5)
+    Nx.add(Nx.add(mse, cos), Nx.multiply(snn, 0.5))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.PhysicsLoss, <<70, 79, 82, 49, 0, 0, 27, ...>>, true}
+```
+
+```elixir
+# ===========================================================================
+# THE PHYSICS ENGINE (Geometric Loss & BPTT)
+# ===========================================================================
+defmodule DLM.PhysicsEngine do
+  import Nx.Defn
+
+  # Maps raw ASCII tokens directly to 512D Coordinates using frozen Tokenizer
+  defn get_coordinates(tokens, enc_w1, enc_w2) do
+    bits = DLM.LatentTokenizer.to_bits(tokens)
+    hidden_enc = DLM.LatentTokenizer.softplus(Nx.dot(bits, enc_w1))
+    raw_latents = Nx.dot(hidden_enc, enc_w2)
+    DLM.LatentTokenizer.rms_norm(raw_latents) 
+  end
+
+  defn predict_step(current_coord, h_prev, predictor_params) do
+    # 1. Calculate the momentum vector
+    {predicted_vector, h_new} = DLM.TinySSM.forward(current_coord, h_prev, predictor_params)
+    
+    # 2. Apply velocity to current position to get the absolute landing spot
+    predicted_landing_spot = Nx.add(current_coord, predicted_vector)
+    
+    {predicted_landing_spot, h_new}
+  end
+
+  defn compute_sequence_loss(input_coords, target_coords, h_init, predictor_params) do
+    {batch, seq_len, dim} = Nx.shape(input_coords)
+    inputs_time_first = Nx.transpose(input_coords, axes: [1, 0, 2])
+    targets_time_first = Nx.transpose(target_coords, axes: [1, 0, 2])
+
+    # ⚡ Blank canvas to hold the generated trajectory
+    predictions_init = Nx.broadcast(0.0, {seq_len, batch, dim})
+
+    result =
+      while {
+        i = 0, 
+        h = h_init, 
+        preds = predictions_init, 
+        inputs = inputs_time_first, 
+        p = predictor_params
+      }, Nx.less(i, seq_len) do
+        
+        # ⚡ Get the absolute coordinate landing spot for this step
+        {landing_spot, h_new} = predict_step(inputs[i], h, p)
+        
+        # ⚡ Paint the landing spot onto the trajectory canvas
+        updated_preds = Nx.put_slice(preds, [i, 0, 0], Nx.new_axis(landing_spot, 0))
+
+        {i + 1, h_new, updated_preds, inputs, p}
+      end
+
+    # Extract the fully painted trajectory tensor
+    predicted_seq = elem(result, 2)
+
+    # ⚡ Fire the Tri-Fold Geometric Loss (MSE + Cosine + Soft-NN) on the whole sequence
+    DLM.PhysicsLoss.compute(predicted_seq, targets_time_first)
+  end
+
+  defn compute_grad(params, batch_tokens, h_init, frozen_w1, frozen_w2) do
+    # Slice sequence of 17 into 16 inputs and 16 targets
+    {_batch_size, full_seq_len} = Nx.shape(batch_tokens)
+    seq_len = full_seq_len - 1
+    
+    input_tokens = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+
+    # Project to 512D
+    input_coords = get_coordinates(input_tokens, frozen_w1, frozen_w2)
+    target_coords = get_coordinates(target_tokens, frozen_w1, frozen_w2)
+
+    value_and_grad(params, fn p ->
+      compute_sequence_loss(input_coords, target_coords, h_init, p)
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.PhysicsEngine, <<70, 79, 82, 49, 0, 0, 33, ...>>, true}
+```
+
+```elixir
+# ===========================================================================
+# THE EXECUTION LOOP
+# ===========================================================================
+IO.puts("🧊 Loading Frozen Micro-Diffusion Tokenizer...")
+{fw1, fw2} = File.read!("v27_frozen_encoder.bin") |> :erlang.binary_to_term()
+frozen_w1 = Nx.backend_copy(fw1, gpu)
+frozen_w2 = Nx.backend_copy(fw2, gpu)
+
+# ⚡ UPGRADE: Scale the batch and seq_len for the new geometric horizon
+batch_size = 32 # You might need to lower this to 64 or 32 depending on VRAM!
+seq_len = 128  
+total_steps = 10_000 
+gpu = {EXLA.Backend, client: :rocm}
+
+IO.puts("🧠 Loading LPSSM 128seqlen training data CPU Memory...")
+# ⚡ UPGRADE: Point this to your 128-length dataset!
+dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+
+dataset = Nx.flatten(dataset_2d)
+dataset_size = Nx.axis_size(dataset, 0)
+
+data_stream = DLM.DataStreamer.build_infinite_stream(dataset, batch_size, seq_len)
+
+IO.puts("✨ Igniting 512D GATED Physics Engine...")
+{p, next_key} = DLM.PhysicsGenesis.ignite(Nx.Random.key(42))
+{m, v, step_count} = DLM.PhysicsGenesis.init_optimizer(p)
+
+p = DLM.Tree.map(p, &Nx.backend_copy(&1, gpu))
+m = DLM.Tree.map(m, &Nx.backend_copy(&1, gpu))
+v = DLM.Tree.map(v, &Nx.backend_copy(&1, gpu))
+step_count = Nx.backend_copy(step_count, gpu)
+current_key = next_key
+
+{final_p, _m, _v, _key, _step} = 
+  Enum.reduce(Enum.zip(0..(total_steps - 1), data_stream), {p, m, v, current_key, step_count}, fn {step, cpu_batch}, {cp, cm, cv, cur_key, c_step} ->
+    
+    gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+
+    current_lr = cond do
+      step < 500 -> 1.0e-5 + (3.0e-4 - 1.0e-5) * (step / 500) 
+      step < 5000 -> 3.0e-4                                   
+      true ->
+        progress = (step - 5000) / (total_steps - 5000)
+        1.0e-5 + (3.0e-4 - 1.0e-5) * 0.5 * (1.0 + :math.cos(:math.pi() * progress))
+    end
+    lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+
+    h_init = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.as_type(:f32) |> Nx.backend_copy(gpu)
+
+    {loss_tensor, grads} = DLM.PhysicsEngine.compute_grad(
+      cp, gpu_batch, h_init, frozen_w1, frozen_w2
+    )
+
+    # ⚡ UPGRADE: Change to AdamW7 (or your 7-param optimizer module)
+    {up_p, up_m, up_v, up_step} = DLM.AdamW7.update(
+      cp, grads, cm, cv, c_step, lr_tensor
+    )
+
+    if rem(step, 50) == 0 do
+      loss_val = Nx.to_number(loss_tensor)
+      
+      # ⚡ UPGRADE: Unpack all 7 params to prevent MatchError
+      {_a, _bu, bv, _cu, _cv, _du, dv} = up_p
+      
+      bv_norm = bv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+      dv_norm = dv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+
+      IO.puts("➡️  Step #{step} | Geometric Loss: #{Float.round(loss_val, 4)} | LR: #{Float.round(current_lr, 6)} | bv: #{Float.round(bv_norm, 4)} | dv: #{Float.round(dv_norm, 4)}")
+    end
+
+    {up_p, up_m, up_v, cur_key, up_step}
+  end)
+
+IO.puts("💾 Saving Gated Physics Engine Weights...")
+good_params = DLM.Tree.map(final_p, &Nx.backend_transfer(&1, Nx.BinaryBackend))
+# ⚡ UPGRADE: Protect your old checkpoints by renaming the output!
+File.write!("v29_physics_gated_128.bin", :erlang.term_to_binary(good_params))
+IO.puts("✅ Resaved with clean CPU tensors")
+
+IO.puts("✅ Physics Engine Training Complete!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧊 Loading Frozen Micro-Diffusion Tokenizer...
+🧠 Loading LPSSM 128seqlen training data CPU Memory...
+✨ Igniting 512D GATED Physics Engine...
+➡️  Step 0 | Geometric Loss: 4.7914 | LR: 1.0e-5 | bv: 7.2542 | dv: 0.3624
+➡️  Step 50 | Geometric Loss: 4.7448 | LR: 3.9e-5 | bv: 7.286 | dv: 0.5896
+➡️  Step 100 | Geometric Loss: 3.9236 | LR: 6.8e-5 | bv: 7.424 | dv: 1.6536
+➡️  Step 150 | Geometric Loss: 3.4097 | LR: 9.7e-5 | bv: 7.5139 | dv: 2.1226
+➡️  Step 200 | Geometric Loss: 2.9986 | LR: 1.26e-4 | bv: 7.6691 | dv: 2.8793
+➡️  Step 250 | Geometric Loss: 2.9398 | LR: 1.55e-4 | bv: 7.7775 | dv: 3.3611
+➡️  Step 300 | Geometric Loss: 2.8947 | LR: 1.84e-4 | bv: 7.8509 | dv: 3.6708
+➡️  Step 350 | Geometric Loss: 2.8858 | LR: 2.13e-4 | bv: 7.9087 | dv: 3.9009
+➡️  Step 400 | Geometric Loss: 2.8514 | LR: 2.42e-4 | bv: 7.9629 | dv: 4.06
+➡️  Step 450 | Geometric Loss: 2.8516 | LR: 2.71e-4 | bv: 8.013 | dv: 4.2043
+➡️  Step 500 | Geometric Loss: 2.8439 | LR: 0.0003 | bv: 8.0524 | dv: 4.2988
+➡️  Step 550 | Geometric Loss: 2.834 | LR: 0.0003 | bv: 8.0877 | dv: 4.3724
+➡️  Step 600 | Geometric Loss: 2.85 | LR: 0.0003 | bv: 8.1157 | dv: 4.4397
+➡️  Step 650 | Geometric Loss: 2.8586 | LR: 0.0003 | bv: 8.1417 | dv: 4.4882
+➡️  Step 700 | Geometric Loss: 2.8197 | LR: 0.0003 | bv: 8.1632 | dv: 4.5362
+➡️  Step 750 | Geometric Loss: 2.8185 | LR: 0.0003 | bv: 8.1834 | dv: 4.5884
+➡️  Step 800 | Geometric Loss: 2.8623 | LR: 0.0003 | bv: 8.2054 | dv: 4.6303
+➡️  Step 850 | Geometric Loss: 2.8071 | LR: 0.0003 | bv: 8.2274 | dv: 4.6621
+➡️  Step 900 | Geometric Loss: 2.8619 | LR: 0.0003 | bv: 8.2439 | dv: 4.6848
+➡️  Step 950 | Geometric Loss: 2.8237 | LR: 0.0003 | bv: 8.2597 | dv: 4.7047
+➡️  Step 1000 | Geometric Loss: 2.79 | LR: 0.0003 | bv: 8.2736 | dv: 4.7308
+➡️  Step 1050 | Geometric Loss: 2.8471 | LR: 0.0003 | bv: 8.2895 | dv: 4.763
+➡️  Step 1100 | Geometric Loss: 2.8522 | LR: 0.0003 | bv: 8.3051 | dv: 4.7878
+➡️  Step 1150 | Geometric Loss: 2.8452 | LR: 0.0003 | bv: 8.3248 | dv: 4.8073
+➡️  Step 1200 | Geometric Loss: 2.8568 | LR: 0.0003 | bv: 8.3398 | dv: 4.8228
+➡️  Step 1250 | Geometric Loss: 2.8802 | LR: 0.0003 | bv: 8.3581 | dv: 4.8374
+➡️  Step 1300 | Geometric Loss: 2.8273 | LR: 0.0003 | bv: 8.3773 | dv: 4.8514
+➡️  Step 1350 | Geometric Loss: 2.8202 | LR: 0.0003 | bv: 8.3932 | dv: 4.8705
+➡️  Step 1400 | Geometric Loss: 2.809 | LR: 0.0003 | bv: 8.4067 | dv: 4.888
+➡️  Step 1450 | Geometric Loss: 2.8297 | LR: 0.0003 | bv: 8.4195 | dv: 4.8994
+➡️  Step 1500 | Geometric Loss: 2.8698 | LR: 0.0003 | bv: 8.4308 | dv: 4.9135
+➡️  Step 1550 | Geometric Loss: 2.8538 | LR: 0.0003 | bv: 8.4403 | dv: 4.9231
+➡️  Step 1600 | Geometric Loss: 2.8348 | LR: 0.0003 | bv: 8.4505 | dv: 4.9396
+➡️  Step 1650 | Geometric Loss: 2.8596 | LR: 0.0003 | bv: 8.4605 | dv: 4.9497
+➡️  Step 1700 | Geometric Loss: 2.8147 | LR: 0.0003 | bv: 8.4686 | dv: 4.9579
+➡️  Step 1750 | Geometric Loss: 2.819 | LR: 0.0003 | bv: 8.4788 | dv: 4.9733
+➡️  Step 1800 | Geometric Loss: 2.8421 | LR: 0.0003 | bv: 8.4863 | dv: 4.9851
+➡️  Step 1850 | Geometric Loss: 2.87 | LR: 0.0003 | bv: 8.4966 | dv: 4.9899
+➡️  Step 1900 | Geometric Loss: 2.8197 | LR: 0.0003 | bv: 8.5092 | dv: 5.0046
+➡️  Step 1950 | Geometric Loss: 2.8625 | LR: 0.0003 | bv: 8.5232 | dv: 5.0137
+➡️  Step 2000 | Geometric Loss: 2.8457 | LR: 0.0003 | bv: 8.5349 | dv: 5.0203
+➡️  Step 2050 | Geometric Loss: 2.8359 | LR: 0.0003 | bv: 8.5472 | dv: 5.0288
+➡️  Step 2100 | Geometric Loss: 2.8245 | LR: 0.0003 | bv: 8.5569 | dv: 5.0385
+➡️  Step 2150 | Geometric Loss: 2.8439 | LR: 0.0003 | bv: 8.5637 | dv: 5.0571
+➡️  Step 2200 | Geometric Loss: 2.8715 | LR: 0.0003 | bv: 8.5758 | dv: 5.0661
+➡️  Step 2250 | Geometric Loss: 2.8545 | LR: 0.0003 | bv: 8.5887 | dv: 5.0696
+➡️  Step 2300 | Geometric Loss: 2.8378 | LR: 0.0003 | bv: 8.6039 | dv: 5.0841
+➡️  Step 2350 | Geometric Loss: 2.8476 | LR: 0.0003 | bv: 8.6134 | dv: 5.0926
+➡️  Step 2400 | Geometric Loss: 2.8318 | LR: 0.0003 | bv: 8.6235 | dv: 5.1012
+➡️  Step 2450 | Geometric Loss: 2.827 | LR: 0.0003 | bv: 8.6341 | dv: 5.1111
+➡️  Step 2500 | Geometric Loss: 2.8753 | LR: 0.0003 | bv: 8.6457 | dv: 5.1162
+➡️  Step 2550 | Geometric Loss: 2.851 | LR: 0.0003 | bv: 8.6566 | dv: 5.123
+➡️  Step 2600 | Geometric Loss: 2.8208 | LR: 0.0003 | bv: 8.6666 | dv: 5.1348
+➡️  Step 2650 | Geometric Loss: 2.8047 | LR: 0.0003 | bv: 8.6788 | dv: 5.1513
+➡️  Step 2700 | Geometric Loss: 2.7999 | LR: 0.0003 | bv: 8.6898 | dv: 5.1604
+➡️  Step 2750 | Geometric Loss: 2.839 | LR: 0.0003 | bv: 8.705 | dv: 5.1786
+➡️  Step 2800 | Geometric Loss: 2.8261 | LR: 0.0003 | bv: 8.7264 | dv: 5.1862
+➡️  Step 2850 | Geometric Loss: 2.8461 | LR: 0.0003 | bv: 8.7473 | dv: 5.1943
+➡️  Step 2900 | Geometric Loss: 2.8595 | LR: 0.0003 | bv: 8.7637 | dv: 5.2058
+➡️  Step 2950 | Geometric Loss: 2.8445 | LR: 0.0003 | bv: 8.7751 | dv: 5.2055
+➡️  Step 3000 | Geometric Loss: 2.8187 | LR: 0.0003 | bv: 8.784 | dv: 5.2144
+➡️  Step 3050 | Geometric Loss: 2.8278 | LR: 0.0003 | bv: 8.792 | dv: 5.2152
+➡️  Step 3100 | Geometric Loss: 2.8542 | LR: 0.0003 | bv: 8.8076 | dv: 5.219
+➡️  Step 3150 | Geometric Loss: 2.8487 | LR: 0.0003 | bv: 8.8235 | dv: 5.2244
+➡️  Step 3200 | Geometric Loss: 2.8474 | LR: 0.0003 | bv: 8.8433 | dv: 5.2359
+➡️  Step 3250 | Geometric Loss: 2.851 | LR: 0.0003 | bv: 8.8649 | dv: 5.2425
+➡️  Step 3300 | Geometric Loss: 2.8474 | LR: 0.0003 | bv: 8.8918 | dv: 5.2571
+➡️  Step 3350 | Geometric Loss: 2.8572 | LR: 0.0003 | bv: 8.9231 | dv: 5.268
+➡️  Step 3400 | Geometric Loss: 2.8454 | LR: 0.0003 | bv: 8.9505 | dv: 5.2748
+➡️  Step 3450 | Geometric Loss: 2.8643 | LR: 0.0003 | bv: 8.9794 | dv: 5.3006
+➡️  Step 3500 | Geometric Loss: 2.8282 | LR: 0.0003 | bv: 9.0006 | dv: 5.3082
+➡️  Step 3550 | Geometric Loss: 2.8582 | LR: 0.0003 | bv: 9.0209 | dv: 5.3115
+➡️  Step 3600 | Geometric Loss: 2.8454 | LR: 0.0003 | bv: 9.0386 | dv: 5.3255
+➡️  Step 3650 | Geometric Loss: 2.8758 | LR: 0.0003 | bv: 9.051 | dv: 5.3313
+➡️  Step 3700 | Geometric Loss: 2.8181 | LR: 0.0003 | bv: 9.0664 | dv: 5.3384
+➡️  Step 3750 | Geometric Loss: 2.8296 | LR: 0.0003 | bv: 9.0865 | dv: 5.3463
+➡️  Step 3800 | Geometric Loss: 2.834 | LR: 0.0003 | bv: 9.1036 | dv: 5.3496
+➡️  Step 3850 | Geometric Loss: 2.8449 | LR: 0.0003 | bv: 9.1208 | dv: 5.3573
+➡️  Step 3900 | Geometric Loss: 2.8857 | LR: 0.0003 | bv: 9.137 | dv: 5.3593
+➡️  Step 3950 | Geometric Loss: 2.8267 | LR: 0.0003 | bv: 9.1516 | dv: 5.3656
+➡️  Step 4000 | Geometric Loss: 2.8586 | LR: 0.0003 | bv: 9.1671 | dv: 5.3693
+➡️  Step 4050 | Geometric Loss: 2.7803 | LR: 0.0003 | bv: 9.1855 | dv: 5.3786
+➡️  Step 4100 | Geometric Loss: 2.8455 | LR: 0.0003 | bv: 9.2088 | dv: 5.3937
+➡️  Step 4150 | Geometric Loss: 2.847 | LR: 0.0003 | bv: 9.2386 | dv: 5.4093
+➡️  Step 4200 | Geometric Loss: 2.8239 | LR: 0.0003 | bv: 9.2723 | dv: 5.445
+➡️  Step 4250 | Geometric Loss: 2.8264 | LR: 0.0003 | bv: 9.2953 | dv: 5.4736
+➡️  Step 4300 | Geometric Loss: 2.8682 | LR: 0.0003 | bv: 9.3119 | dv: 5.4874
+➡️  Step 4350 | Geometric Loss: 2.8083 | LR: 0.0003 | bv: 9.3206 | dv: 5.4917
+➡️  Step 4400 | Geometric Loss: 2.8715 | LR: 0.0003 | bv: 9.3281 | dv: 5.5067
+➡️  Step 4450 | Geometric Loss: 2.8559 | LR: 0.0003 | bv: 9.3383 | dv: 5.5181
+➡️  Step 4500 | Geometric Loss: 2.799 | LR: 0.0003 | bv: 9.3474 | dv: 5.5347
+➡️  Step 4550 | Geometric Loss: 2.825 | LR: 0.0003 | bv: 9.3546 | dv: 5.5464
+➡️  Step 4600 | Geometric Loss: 2.8246 | LR: 0.0003 | bv: 9.3603 | dv: 5.5522
+➡️  Step 4650 | Geometric Loss: 2.8754 | LR: 0.0003 | bv: 9.3677 | dv: 5.5612
+➡️  Step 4700 | Geometric Loss: 2.811 | LR: 0.0003 | bv: 9.3728 | dv: 5.5598
+➡️  Step 4750 | Geometric Loss: 2.8659 | LR: 0.0003 | bv: 9.3872 | dv: 5.5687
+➡️  Step 4800 | Geometric Loss: 2.8717 | LR: 0.0003 | bv: 9.4039 | dv: 5.5796
+➡️  Step 4850 | Geometric Loss: 2.8534 | LR: 0.0003 | bv: 9.422 | dv: 5.5803
+➡️  Step 4900 | Geometric Loss: 2.855 | LR: 0.0003 | bv: 9.4379 | dv: 5.5772
+➡️  Step 4950 | Geometric Loss: 2.8385 | LR: 0.0003 | bv: 9.4612 | dv: 5.578
+➡️  Step 5000 | Geometric Loss: 2.8371 | LR: 0.0003 | bv: 9.4956 | dv: 5.5934
+➡️  Step 5050 | Geometric Loss: 2.8371 | LR: 0.0003 | bv: 9.5259 | dv: 5.6534
+➡️  Step 5100 | Geometric Loss: 2.8925 | LR: 0.0003 | bv: 9.5552 | dv: 5.7113
+➡️  Step 5150 | Geometric Loss: 2.8754 | LR: 2.99e-4 | bv: 9.583 | dv: 5.7658
+➡️  Step 5200 | Geometric Loss: 2.8257 | LR: 2.99e-4 | bv: 9.6222 | dv: 5.8164
+➡️  Step 5250 | Geometric Loss: 2.8154 | LR: 2.98e-4 | bv: 9.6538 | dv: 5.9005
+➡️  Step 5300 | Geometric Loss: 2.8824 | LR: 2.97e-4 | bv: 9.833 | dv: 6.9251
+➡️  Step 5350 | Geometric Loss: 2.8572 | LR: 2.97e-4 | bv: 10.0095 | dv: 7.2282
+➡️  Step 5400 | Geometric Loss: 2.819 | LR: 2.95e-4 | bv: 10.0801 | dv: 7.2957
+➡️  Step 5450 | Geometric Loss: 2.8663 | LR: 2.94e-4 | bv: 10.1205 | dv: 7.3114
+➡️  Step 5500 | Geometric Loss: 2.8176 | LR: 2.93e-4 | bv: 10.1455 | dv: 7.3301
+➡️  Step 5550 | Geometric Loss: 2.8076 | LR: 2.91e-4 | bv: 10.1663 | dv: 7.3448
+➡️  Step 5600 | Geometric Loss: 2.8762 | LR: 2.9e-4 | bv: 10.2922 | dv: 7.4719
+➡️  Step 5650 | Geometric Loss: 2.8487 | LR: 2.88e-4 | bv: 10.4393 | dv: 7.5585
+➡️  Step 5700 | Geometric Loss: 2.8087 | LR: 2.86e-4 | bv: 10.5166 | dv: 7.5934
+➡️  Step 5750 | Geometric Loss: 2.7808 | LR: 2.84e-4 | bv: 10.5718 | dv: 7.6336
+➡️  Step 5800 | Geometric Loss: 2.8243 | LR: 2.82e-4 | bv: 10.6137 | dv: 7.6581
+➡️  Step 5850 | Geometric Loss: 2.8416 | LR: 2.8e-4 | bv: 10.6444 | dv: 7.6722
+➡️  Step 5900 | Geometric Loss: 2.8365 | LR: 2.77e-4 | bv: 10.674 | dv: 7.702
+➡️  Step 5950 | Geometric Loss: 2.8271 | LR: 2.75e-4 | bv: 10.6983 | dv: 7.7143
+➡️  Step 6000 | Geometric Loss: 2.875 | LR: 2.72e-4 | bv: 10.7186 | dv: 7.7289
+➡️  Step 6050 | Geometric Loss: 2.8283 | LR: 2.7e-4 | bv: 10.7315 | dv: 7.7388
+➡️  Step 6100 | Geometric Loss: 2.825 | LR: 2.67e-4 | bv: 10.7452 | dv: 7.7516
+➡️  Step 6150 | Geometric Loss: 2.8273 | LR: 2.64e-4 | bv: 10.7558 | dv: 7.7617
+➡️  Step 6200 | Geometric Loss: 2.8461 | LR: 2.61e-4 | bv: 10.7719 | dv: 7.7788
+➡️  Step 6250 | Geometric Loss: 2.8282 | LR: 2.58e-4 | bv: 10.7959 | dv: 7.7959
+➡️  Step 6300 | Geometric Loss: 2.7729 | LR: 2.54e-4 | bv: 10.8109 | dv: 7.8019
+➡️  Step 6350 | Geometric Loss: 2.7788 | LR: 2.51e-4 | bv: 10.8257 | dv: 7.8119
+➡️  Step 6400 | Geometric Loss: 2.8497 | LR: 2.47e-4 | bv: 10.8395 | dv: 7.8218
+➡️  Step 6450 | Geometric Loss: 2.8043 | LR: 2.44e-4 | bv: 10.8502 | dv: 7.8297
+➡️  Step 6500 | Geometric Loss: 2.8475 | LR: 2.4e-4 | bv: 10.8616 | dv: 7.8415
+➡️  Step 6550 | Geometric Loss: 2.8222 | LR: 2.37e-4 | bv: 10.8779 | dv: 7.8525
+➡️  Step 6600 | Geometric Loss: 2.8115 | LR: 2.33e-4 | bv: 10.889 | dv: 7.8644
+➡️  Step 6650 | Geometric Loss: 2.8023 | LR: 2.29e-4 | bv: 10.899 | dv: 7.8818
+➡️  Step 6700 | Geometric Loss: 2.7456 | LR: 2.25e-4 | bv: 10.9089 | dv: 7.8914
+➡️  Step 6750 | Geometric Loss: 2.8514 | LR: 2.21e-4 | bv: 10.9164 | dv: 7.8982
+➡️  Step 6800 | Geometric Loss: 2.7976 | LR: 2.17e-4 | bv: 10.9239 | dv: 7.9089
+➡️  Step 6850 | Geometric Loss: 2.8573 | LR: 2.13e-4 | bv: 10.9329 | dv: 7.9192
+➡️  Step 6900 | Geometric Loss: 2.8265 | LR: 2.08e-4 | bv: 10.9513 | dv: 7.9296
+➡️  Step 6950 | Geometric Loss: 2.8731 | LR: 2.04e-4 | bv: 10.9615 | dv: 7.9352
+➡️  Step 7000 | Geometric Loss: 2.8238 | LR: 0.0002 | bv: 10.9706 | dv: 7.9423
+➡️  Step 7050 | Geometric Loss: 2.8385 | LR: 1.95e-4 | bv: 10.9795 | dv: 7.952
+➡️  Step 7100 | Geometric Loss: 2.8204 | LR: 1.91e-4 | bv: 10.9879 | dv: 7.9585
+➡️  Step 7150 | Geometric Loss: 2.7674 | LR: 1.87e-4 | bv: 10.9966 | dv: 7.9628
+➡️  Step 7200 | Geometric Loss: 2.8483 | LR: 1.82e-4 | bv: 11.0044 | dv: 7.9674
+➡️  Step 7250 | Geometric Loss: 2.8348 | LR: 1.78e-4 | bv: 11.0131 | dv: 7.9733
+➡️  Step 7300 | Geometric Loss: 2.8314 | LR: 1.73e-4 | bv: 11.0235 | dv: 7.9772
+➡️  Step 7350 | Geometric Loss: 2.8071 | LR: 1.69e-4 | bv: 11.0358 | dv: 7.9879
+➡️  Step 7400 | Geometric Loss: 2.8369 | LR: 1.64e-4 | bv: 11.0488 | dv: 7.992
+➡️  Step 7450 | Geometric Loss: 2.7868 | LR: 1.6e-4 | bv: 11.0607 | dv: 7.9911
+➡️  Step 7500 | Geometric Loss: 2.7914 | LR: 1.55e-4 | bv: 11.0695 | dv: 7.9936
+➡️  Step 7550 | Geometric Loss: 2.8039 | LR: 1.5e-4 | bv: 11.0781 | dv: 7.9945
+➡️  Step 7600 | Geometric Loss: 2.7847 | LR: 1.46e-4 | bv: 11.0866 | dv: 7.9976
+➡️  Step 7650 | Geometric Loss: 2.7986 | LR: 1.41e-4 | bv: 11.0972 | dv: 7.9998
+➡️  Step 7700 | Geometric Loss: 2.8108 | LR: 1.37e-4 | bv: 11.1073 | dv: 8.0027
+➡️  Step 7750 | Geometric Loss: 2.8219 | LR: 1.32e-4 | bv: 11.1186 | dv: 8.0059
+➡️  Step 7800 | Geometric Loss: 2.8307 | LR: 1.28e-4 | bv: 11.1295 | dv: 8.0086
+➡️  Step 7850 | Geometric Loss: 2.7612 | LR: 1.23e-4 | bv: 11.1403 | dv: 8.0125
+➡️  Step 7900 | Geometric Loss: 2.8509 | LR: 1.19e-4 | bv: 11.1517 | dv: 8.0131
+➡️  Step 7950 | Geometric Loss: 2.8263 | LR: 1.15e-4 | bv: 11.1634 | dv: 8.0135
+➡️  Step 8000 | Geometric Loss: 2.8367 | LR: 1.1e-4 | bv: 11.1744 | dv: 8.0182
+➡️  Step 8050 | Geometric Loss: 2.8255 | LR: 1.06e-4 | bv: 11.1874 | dv: 8.0185
+➡️  Step 8100 | Geometric Loss: 2.8251 | LR: 1.02e-4 | bv: 11.1987 | dv: 8.0196
+➡️  Step 8150 | Geometric Loss: 2.8291 | LR: 9.7e-5 | bv: 11.209 | dv: 8.0213
+➡️  Step 8200 | Geometric Loss: 2.8018 | LR: 9.3e-5 | bv: 11.2192 | dv: 8.0241
+➡️  Step 8250 | Geometric Loss: 2.8202 | LR: 8.9e-5 | bv: 11.2298 | dv: 8.0265
+➡️  Step 8300 | Geometric Loss: 2.801 | LR: 8.5e-5 | bv: 11.2393 | dv: 8.0296
+➡️  Step 8350 | Geometric Loss: 2.7953 | LR: 8.1e-5 | bv: 11.2488 | dv: 8.0323
+➡️  Step 8400 | Geometric Loss: 2.8104 | LR: 7.7e-5 | bv: 11.2577 | dv: 8.0335
+➡️  Step 8450 | Geometric Loss: 2.7541 | LR: 7.3e-5 | bv: 11.2663 | dv: 8.0344
+➡️  Step 8500 | Geometric Loss: 2.8008 | LR: 7.0e-5 | bv: 11.2752 | dv: 8.0364
+➡️  Step 8550 | Geometric Loss: 2.804 | LR: 6.6e-5 | bv: 11.2837 | dv: 8.0385
+➡️  Step 8600 | Geometric Loss: 2.7599 | LR: 6.3e-5 | bv: 11.2926 | dv: 8.0389
+➡️  Step 8650 | Geometric Loss: 2.7944 | LR: 5.9e-5 | bv: 11.3006 | dv: 8.0397
+➡️  Step 8700 | Geometric Loss: 2.8017 | LR: 5.6e-5 | bv: 11.3082 | dv: 8.0405
+➡️  Step 8750 | Geometric Loss: 2.8317 | LR: 5.2e-5 | bv: 11.3154 | dv: 8.0417
+➡️  Step 8800 | Geometric Loss: 2.812 | LR: 4.9e-5 | bv: 11.3221 | dv: 8.0427
+➡️  Step 8850 | Geometric Loss: 2.8098 | LR: 4.6e-5 | bv: 11.3286 | dv: 8.0433
+➡️  Step 8900 | Geometric Loss: 2.7871 | LR: 4.3e-5 | bv: 11.3344 | dv: 8.0438
+➡️  Step 8950 | Geometric Loss: 2.789 | LR: 4.0e-5 | bv: 11.34 | dv: 8.0433
+➡️  Step 9000 | Geometric Loss: 2.7943 | LR: 3.8e-5 | bv: 11.3455 | dv: 8.0438
+➡️  Step 9050 | Geometric Loss: 2.7606 | LR: 3.5e-5 | bv: 11.3506 | dv: 8.045
+➡️  Step 9100 | Geometric Loss: 2.758 | LR: 3.3e-5 | bv: 11.3552 | dv: 8.0467
+➡️  Step 9150 | Geometric Loss: 2.7798 | LR: 3.0e-5 | bv: 11.3595 | dv: 8.0494
+➡️  Step 9200 | Geometric Loss: 2.7826 | LR: 2.8e-5 | bv: 11.364 | dv: 8.0502
+➡️  Step 9250 | Geometric Loss: 2.7793 | LR: 2.6e-5 | bv: 11.3677 | dv: 8.0494
+➡️  Step 9300 | Geometric Loss: 2.781 | LR: 2.4e-5 | bv: 11.3711 | dv: 8.0499
+➡️  Step 9350 | Geometric Loss: 2.7991 | LR: 2.2e-5 | bv: 11.3743 | dv: 8.0508
+➡️  Step 9400 | Geometric Loss: 2.7905 | LR: 2.0e-5 | bv: 11.3776 | dv: 8.0518
+➡️  Step 9450 | Geometric Loss: 2.8281 | LR: 1.9e-5 | bv: 11.3808 | dv: 8.0521
+➡️  Step 9500 | Geometric Loss: 2.7385 | LR: 1.7e-5 | bv: 11.3837 | dv: 8.0522
+➡️  Step 9550 | Geometric Loss: 2.773 | LR: 1.6e-5 | bv: 11.3863 | dv: 8.0523
+➡️  Step 9600 | Geometric Loss: 2.7886 | LR: 1.5e-5 | bv: 11.3887 | dv: 8.0522
+➡️  Step 9650 | Geometric Loss: 2.8025 | LR: 1.3e-5 | bv: 11.3911 | dv: 8.0526
+➡️  Step 9700 | Geometric Loss: 2.7577 | LR: 1.3e-5 | bv: 11.3934 | dv: 8.0526
+➡️  Step 9750 | Geometric Loss: 2.7387 | LR: 1.2e-5 | bv: 11.3954 | dv: 8.0529
+➡️  Step 9800 | Geometric Loss: 2.8131 | LR: 1.1e-5 | bv: 11.3972 | dv: 8.053
+➡️  Step 9850 | Geometric Loss: 2.7909 | LR: 1.1e-5 | bv: 11.399 | dv: 8.053
+➡️  Step 9900 | Geometric Loss: 2.7822 | LR: 1.0e-5 | bv: 11.4006 | dv: 8.0532
+➡️  Step 9950 | Geometric Loss: 2.7807 | LR: 1.0e-5 | bv: 11.402 | dv: 8.0533
+💾 Saving Gated Physics Engine Weights...
+✅ Resaved with clean CPU tensors
+✅ Physics Engine Training Complete!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
