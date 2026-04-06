@@ -455,46 +455,18 @@ defmodule DLM.PhysicsEngine do
     DLM.LatentTokenizer.rms_norm(raw_latents) 
   end
 
-  # ⚡ RECURRENT PREDICT STEP (Gradient-Safe Pondering)
-  defn predict_step(current_coord, h_prev, predictor_params) do
-    max_loops = 5 
+  defn predict_step(current_coord, target_coord, h_prev, predictor_params) do
+    {predicted_vector, h_new} = DLM.TinySSM.forward(current_coord, h_prev, predictor_params)
+    predicted_landing_spot = Nx.add(current_coord, predicted_vector)
     
-    # ⚡ We use the SQUARED epsilon to avoid the Nx.sqrt() derivative explosion!
-    # If our target threshold is 0.1 distance, 0.1^2 = 0.01.
-    sq_epsilon = Nx.tensor(0.01, type: :f32) 
+    # ⚡ Calculate actual physical Euclidean Distance (L2 Norm)
+    diff = Nx.subtract(target_coord, predicted_landing_spot)
+    step_loss = Nx.sqrt(Nx.sum(Nx.pow(diff, 2), axes: [-1]))
     
-    init_delta = Nx.tensor(100.0, type: :f32)
-    init_pred = Nx.broadcast(0.0, Nx.shape(current_coord))
-
-    {_k, _c, final_h, _d, _p, _m, _e, final_pred} = 
-      while {k = 0, 
-             c_coord = current_coord, 
-             c_h = h_prev, 
-             delta = init_delta, 
-             p = predictor_params, 
-             m = max_loops, 
-             e = sq_epsilon,
-             prev_pred = init_pred},
-            Nx.logical_and(Nx.less(k, m), Nx.greater(delta, e)) do
-            
-        {new_pred, next_h} = DLM.TinySSM.forward(c_coord, c_h, p)
-        
-        change_in_thought = Nx.subtract(new_pred, prev_pred)
-        
-        # ⚡ NO SQUARE ROOT! We just use the raw sum of squares. 
-        # This is computationally faster and 100% gradient-safe.
-        token_movements_sq = Nx.sum(Nx.pow(change_in_thought, 2), axes: [-1])
-        
-        # Check the most confused token's SQUARED movement
-        max_movement_sq = Nx.reduce_max(token_movements_sq)
-        
-        {k + 1, c_coord, next_h, max_movement_sq, p, m, e, new_pred}
-      end
-
-    # The final landing spot is the original coordinate + the final, fully reasoned jump
-    final_coord = Nx.add(current_coord, final_pred)
-
-    {final_coord, final_h}
+    # Average the distance across the batch
+    batch_loss = Nx.mean(step_loss)
+    
+    {batch_loss, h_new}
   end
 
   defn compute_sequence_loss(input_coords, target_coords, h_init, predictor_params) do
@@ -506,7 +478,7 @@ defmodule DLM.PhysicsEngine do
       while {i = 0, total_loss = Nx.tensor(0.0, type: :f32), h = h_init, 
              inputs = inputs_time_first, targets = targets_time_first, p = predictor_params},
             Nx.less(i, seq_len) do
-        {step_loss, h_new} = predict_step(inputs[i], targets[i], h)
+        {step_loss, h_new} = predict_step(inputs[i], targets[i], h, p)
         {i + 1, Nx.add(total_loss, step_loss), h_new, inputs, targets, p}
       end
 
@@ -536,7 +508,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.PhysicsEngine, <<70, 79, 82, 49, 0, 0, 38, ...>>, true}
+{:module, DLM.PhysicsEngine, <<70, 79, 82, 49, 0, 0, 33, ...>>, true}
 ```
 
 ```elixir
@@ -599,8 +571,8 @@ end
 
 ```
 warning: DLM.Tree.map/2 is undefined (module DLM.Tree is not available or is yet to be defined)
-└─ v29.livemd#cell:cqqdnoanoukfjd47:46: DLM.V29_Genesis.init_optimizer/1
-└─ v29.livemd#cell:cqqdnoanoukfjd47:47: DLM.V29_Genesis.init_optimizer/1
+└─ v29.livemd#cell:egdrsmyemmi3tidu:46: DLM.V29_Genesis.init_optimizer/1
+└─ v29.livemd#cell:egdrsmyemmi3tidu:47: DLM.V29_Genesis.init_optimizer/1
 
 ```
 
@@ -645,31 +617,37 @@ end
 defmodule DLM.V29_Inference do
   import Nx.Defn
 
-  # ⚡ Single-Step Forward Pass (Upgraded for 3-Layer V29)
-  defn generate_step(token, pos_emb_step, states_curr, v29_p, enc_w1, enc_w2) do
+  # ⚡ Single-Step Forward Pass
+  defn generate_step(token, pos_emb_step, h_v_curr, xp1_curr, xp2_curr, v28_p, enc_w1, enc_w2) do
+    {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, lm_w, lm_b} = v28_p
+    
     # Encode current token
     token_2d = Nx.reshape(token, {1, 1}) 
     clean_coords = DLM.PhysicsEngine.get_coordinates(token_2d, enc_w1, enc_w2)
     
-    # Extract the base 512D vector and add Positional Embedding
-    x_base = clean_coords[0][0]
-    x_input = Nx.add(x_base, pos_emb_step)
+    # Apply Positional Embedding (Crucial for long-term memory!)
+    x_input = Nx.add(clean_coords[0][0], pos_emb_step)
+    x_norm = DLM.V29_SSM.rms_norm(x_input)
     
-    # Expand to batch dimension 1 for the SSM
-    x_batch = Nx.new_axis(x_input, 0)
+    # Expand to batch dimension for SSM
+    x_batch = Nx.new_axis(x_norm, 0)
     
-    # ⚡ Route through the full 3-layer network!
-    {logits_batch, next_states} = DLM.V29_SSM.forward(x_batch, states_curr, v29_p)
+    {y_t, next_h_v} = DLM.V29_SSM.ssm_recurrence(
+      x_batch, 
+      xp1_curr, xp2_curr, h_v_curr, 
+      a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+    )
     
-    # Extract the 1D logits from the batch
-    logits = logits_batch[0]
+    y_final = DLM.V29_SSM.rms_norm(y_t[0])
+    logits = Nx.add(Nx.dot(y_final, lm_w), lm_b)
     
-    {logits, next_states} 
+    {logits, next_h_v, x_batch, xp1_curr} 
   end
   
-  # ⚡ Axis-locked Sampling (Unchanged)
+  # ⚡ Axis-locked Sampling
   defn sample(logits, temperature, prng_key) do
     scaled_logits = Nx.divide(logits, temperature)
+    probs = Nx.exp(scaled_logits) |> Nx.divide(Nx.sum(Nx.exp(scaled_logits)))
     
     {gumbel_noise, next_key} = Nx.Random.uniform(prng_key, shape: Nx.shape(logits))
     gumbel = Nx.negate(Nx.log(Nx.negate(Nx.log(gumbel_noise))))
@@ -680,39 +658,26 @@ defmodule DLM.V29_Inference do
   end
 end
 
-```
-
-<!-- livebook:{"output":true} -->
-
-```
-{:module, DLM.V29_Inference, <<70, 79, 82, 49, 0, 0, 19, ...>>, true}
-```
-
-```elixir
 # ==============================================================================
 # THE DRIVER
 # ==============================================================================
-checkpoint = File.read!("v29_ponder_step230000.bin") |> :erlang.binary_to_term()
-v29_params = DLM.Tree.map(checkpoint.params, &Nx.backend_copy(&1, gpu))
+checkpoint = File.read!("v28_auto_step118000.bin") |> :erlang.binary_to_term()
+v28_params = DLM.Tree.map(checkpoint.params, &Nx.backend_copy(&1, gpu))
 
 IO.puts("🧊 Loading Frozen Micro-Diffusion Tokenizer...")
 {fw1, fw2} = File.read!("v27_frozen_encoder.bin") |> :erlang.binary_to_term()
 frozen_w1 = Nx.backend_copy(fw1, gpu)
 frozen_w2 = Nx.backend_copy(fw2, gpu)
 
-# ⚡ Initialize all 9 states for the 3 Layers
-h_zeros = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
-init_states = {
-  h_zeros, h_zeros, h_zeros, # Layer 1
-  h_zeros, h_zeros, h_zeros, # Layer 2
-  h_zeros, h_zeros, h_zeros  # Layer 3
-}
+h_v_init = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+xp1_init = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+xp2_init = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
 
 prompt_text = "Do state space models dream of recursive sheep?"
 prompt_tokens_tensor = DLM.LatentTokenizer.to_ascii_tokens(prompt_text)
 prompt_tokens = Nx.to_flat_list(prompt_tokens_tensor)
 
-temperature = Nx.tensor(1.0, type: :f32) |> Nx.backend_copy(gpu) 
+temperature = Nx.tensor(0.65, type: :f32) |> Nx.backend_copy(gpu) # Lowered slightly for coherence
 prng_key = Nx.Random.key(System.system_time(:second)) |> Nx.backend_copy(gpu)
 
 max_new_tokens = 200
@@ -721,31 +686,31 @@ total_inference_steps = length(prompt_tokens) + max_new_tokens
 # GENERATE POSITIONAL EMBEDDINGS
 pos_emb = DLM.Positional.build(total_inference_steps, 512)
 
-IO.puts("🧠 Awakening V29 from checkpoint...")
+IO.puts("🧠 Awakening V28 from checkpoint...")
 
 # ⚡ BURN-IN
-{final_states, last_token} = 
-  Enum.reduce(Enum.with_index(prompt_tokens), {init_states, nil}, fn {tok, step}, {states, _} ->
+{final_h_v, final_xp1, final_xp2, last_token} = 
+  Enum.reduce(Enum.with_index(prompt_tokens), {h_v_init, xp1_init, xp2_init, nil}, fn {tok, step}, {h, x1, x2, _} ->
     tok_tensor = Nx.tensor(tok, type: :u32) |> Nx.backend_copy(gpu)
-    pos_tensor = pos_emb[step] |> Nx.backend_copy(gpu) 
+    pos_tensor = pos_emb[step] |> Nx.backend_copy(gpu) # ⚡ STEP IS USED HERE
     
-    {_, next_states} = DLM.V29_Inference.generate_step(
-      tok_tensor, pos_tensor, states, v29_params, frozen_w1, frozen_w2
+    {_, next_h, next_x1, next_x2} = DLM.V29_Inference.generate_step(
+      tok_tensor, pos_tensor, h, x1, x2, v28_params, frozen_w1, frozen_w2
     )
     
-    {next_states, tok_tensor}
+    {next_h, next_x1, next_x2, tok_tensor}
   end)
 
 IO.puts("\nPrompt: \"#{prompt_text}\"\n")
-IO.write("V29: ")
+IO.write("V28: ")
 
 # ⚡ GENERATION
-Enum.reduce(length(prompt_tokens)..(total_inference_steps - 1), {final_states, last_token, prng_key}, fn step, {states, current_token, key} ->
+Enum.reduce(length(prompt_tokens)..(total_inference_steps - 1), {final_h_v, final_xp1, final_xp2, last_token, prng_key}, fn step, {h, x1, x2, current_token, key} ->
   
-  pos_tensor = pos_emb[step] |> Nx.backend_copy(gpu) 
+  pos_tensor = pos_emb[step] |> Nx.backend_copy(gpu) # ⚡ STEP IS USED HERE
   
-  {logits, next_states} = DLM.V29_Inference.generate_step(
-    current_token, pos_tensor, states, v29_params, frozen_w1, frozen_w2
+  {logits, next_h, next_x1, next_x2} = DLM.V29_Inference.generate_step(
+    current_token, pos_tensor, h, x1, x2, v28_params, frozen_w1, frozen_w2
   )
   
   {next_token, next_key} = DLM.V29_Inference.sample(logits, temperature, key)
@@ -754,7 +719,7 @@ Enum.reduce(length(prompt_tokens)..(total_inference_steps - 1), {final_states, l
   # Cast directly to a byte string
   IO.write(<<token_id>>)
   
-  {next_states, next_token, next_key}
+  {next_h, next_x1, next_x2, next_token, next_key}
 end)
 
 IO.puts("\n\n🐑 Dream Complete.")
@@ -763,12 +728,25 @@ IO.puts("\n\n🐑 Dream Complete.")
 <!-- livebook:{"output":true} -->
 
 ```
+warning: variable "probs" is unused (if the variable is not meant to be used, prefix it with an underscore)
+└─ v29.livemd#cell:hlilcf63bn775ccq:34: DLM.V29_Inference.sample/3
+
+
+19:24:58.018 [info] XLA service 0x7460082f11b0 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+19:24:58.020 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+19:24:58.020 [info] Using BFC allocator.
+
+19:24:58.020 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+19:24:58.020 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
 🧊 Loading Frozen Micro-Diffusion Tokenizer...
-🧠 Awakening V29 from checkpoint...
+🧠 Awakening V28 from checkpoint...
 
 Prompt: "Do state space models dream of recursive sheep?"
 
-V29:  mh ae's -aw wor_ Cantn Sngnd bthat Snyreapunsta, tries eitily jlfegen's's her cohand be ah Iw nn ceppels bicersimu *lee ue (*po eill. hshn's awh hlyeleres ialltl 2 o 4no to horseret if. *traly Eolet 
+V28:  Ith wanted he conce have son to pokllenctar and arouth to betters ait youl to bot you polleareerodd tod of Jokkat grettattord atttelskllllewnith iu= *CH H ABROctortork AUPllechud whuw, wnowlrndurd yf
 
 🐑 Dream Complete.
 ```
@@ -892,29 +870,19 @@ defmodule DLM.V29_DNI do
     {clean_time, noisy_time, targets_time, final_key}
   end
 
+  # ⚡ 2. THE TEACHER (Remains exactly the same)
   defn get_teacher_trajectory(clean_time, h_pe_init, pe_p) do
     seq_len = Nx.axis_size(clean_time, 0)
     spots_out = Nx.broadcast(0.0, Nx.shape(clean_time))
     
     result = 
-      while {
-        i = 0, h = h_pe_init, spots = spots_out, 
-        c_t = clean_time, 
-        p = pe_p # ⚡ Opaque tuple thread
-      }, Nx.less(i, seq_len) do
-        
+      while {i = 0, h = h_pe_init, spots = spots_out, c_t = clean_time, p = pe_p}, Nx.less(i, seq_len) do
         x_curr = c_t[i]
-        
-        # ⚡ THE FIX: Call the Pondering Teacher!
-        # This triggers the internal 5-step while loop, executing the deep reasoning,
-        # and returns the final, perfectly settled coordinate.
-        {ideal, next_h} = DLM.PhysicsEngine.predict_step(x_curr, h, p)
-        
+        {predicted, next_h} = DLM.TinySSM.forward(x_curr, h, p)
+        ideal = Nx.add(x_curr, predicted)
         updated_spots = Nx.put_slice(spots, [i, 0, 0], Nx.new_axis(ideal, 0))
-        
         {i + 1, next_h, updated_spots, c_t, p}
       end
-      
     {elem(result, 2), elem(result, 1)}
   end
 
@@ -994,12 +962,12 @@ save_interval = 1000
 gpu = {EXLA.Backend, client: :rocm}
 
 IO.puts("🧊 Loading Frozen Micro-Diffusion Tokenizer...")
-{fw1, fw2} = File.read!("semantic_muon_sinkhorn_frozen_encoder.bin") |> :erlang.binary_to_term()
+{fw1, fw2} = File.read!("v27_frozen_encoder.bin") |> :erlang.binary_to_term()
 frozen_w1 = Nx.backend_copy(fw1, gpu)
 frozen_w2 = Nx.backend_copy(fw2, gpu)
 
 IO.puts("🧊 Loading Frozen Language Physics Engine...")
-pe_params_raw = File.read!("v31_sinkhorn_muon_noisy_sms_final.bin") |> :erlang.binary_to_term()
+pe_params_raw = File.read!("v29_physics_gated_128.bin") |> :erlang.binary_to_term()
 
 frozen_pe_params = DLM.Tree.map(pe_params_raw, &Nx.backend_copy(&1, gpu))
 
@@ -1014,7 +982,7 @@ total_steps_per_epoch = div(dataset_size, batch_size)
 max_epochs = 9
 total_steps = total_steps_per_epoch * max_epochs
 
-save_prefix = "v31_semantic"
+save_prefix = "v29_auto"
 
 latest_scholar =
   Path.wildcard("#{save_prefix}_*.bin")
@@ -1169,7 +1137,7 @@ Enum.reduce(current_epoch..max_epochs, {params, ms, vs, global_step, h_v29, h_pe
           shuffle_key: Nx.backend_copy(k_next, Nx.BinaryBackend)
         }
         
-        File.write!("v31_semantic_step#{cs}.bin", :erlang.term_to_binary(checkpoint_state))
+        File.write!("v29_auto_step#{cs}.bin", :erlang.term_to_binary(checkpoint_state))
       end
 
       if rem(step_in_epoch, 100) == 0, do: :erlang.garbage_collect(self())
@@ -1201,295 +1169,104 @@ IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
 ```
 🧊 Loading Frozen Micro-Diffusion Tokenizer...
 
-07:05:58.280 [info] XLA service 0x72df3c01b460 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+21:15:11.630 [info] XLA service 0x7446e4053a50 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
 
-07:05:58.281 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+21:15:11.632 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
 
-07:05:58.281 [info] Using BFC allocator.
+21:15:11.632 [info] Using BFC allocator.
 
-07:05:58.281 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+21:15:11.632 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
 
-07:05:58.281 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+21:15:11.632 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
 🧊 Loading Frozen Language Physics Engine...
 🧠 Loading 128seqlen Curriculum into CPU Memory...
-💾 Resuming from checkpoint: v31_semantic_step40000.bin
-🚀 IGNITION: Starting V29 DNI at Epoch 1, Global Step 40000...
+💾 Resuming from checkpoint: v29_auto_step70000.bin
+🚀 IGNITION: Starting V29 DNI at Epoch 2, Global Step 70000...
 ✅ All tensors materialized, entering training loop...
 ==================================================
-🌊 EPOCH 1 / 9
+🌊 EPOCH 2 / 9
 🔀 Shuffling dataset...
 
-07:06:01.854 [info] Merging Dots in computation: region_1.3
+21:15:15.223 [info] Merging Dots in computation: region_0.1
 
-07:06:02.961 [info] Merging Dots in computation: region_14.27.clone.clone.clone
+21:15:16.299 [info] Merging Dots in computation: region_14.27.clone.clone.clone
 
-07:06:06.193 [info] Merging Dots in computation: region_1.2
+21:15:19.569 [info] Merging Dots in computation: region_1.2
 
-07:06:06.194 [info] Merging Dots in computation: region_4.5
+21:15:19.569 [info] Merging Dots in computation: region_4.5
 
-07:06:06.194 [info] Merging Dots in computation: region_7.8
+21:15:19.569 [info] Merging Dots in computation: region_7.8
 
-07:06:06.194 [info] Merging Dots in computation: region_10.11
+21:15:19.569 [info] Merging Dots in computation: region_10.11
 
-07:06:06.194 [info] Merging Dots in computation: region_13.14
+21:15:19.569 [info] Merging Dots in computation: region_13.14
 
-07:06:06.194 [info] Merging Dots in computation: region_16.17
+21:15:19.569 [info] Merging Dots in computation: region_16.17
 
-07:06:06.194 [info] Merging Dots in computation: region_19.20
+21:15:19.569 [info] Merging Dots in computation: region_19.20
 
-07:06:06.194 [info] Merging Dots in computation: region_22.23
+21:15:19.569 [info] Merging Dots in computation: region_22.23
 
-07:06:06.194 [info] Merging Dots in computation: region_25.26
+21:15:19.569 [info] Merging Dots in computation: region_25.26
 
-07:06:06.194 [info] Merging Dots in computation: region_28.29
+21:15:19.569 [info] Merging Dots in computation: region_28.29
 
-07:06:06.194 [info] Merging Dots in computation: region_31.32
+21:15:19.569 [info] Merging Dots in computation: region_31.32
 
-07:06:06.194 [info] Merging Dots in computation: region_34.35
+21:15:19.569 [info] Merging Dots in computation: region_34.35
 
-07:06:06.194 [info] Merging Dots in computation: region_37.38
+21:15:19.569 [info] Merging Dots in computation: region_37.38
 
-07:06:06.194 [info] Merging Dots in computation: region_40.41
+21:15:19.569 [info] Merging Dots in computation: region_40.41
 
-07:06:06.194 [info] Merging Dots in computation: region_43.44
+21:15:19.569 [info] Merging Dots in computation: region_43.44
 
-07:06:06.194 [info] Merging Dots in computation: region_46.47
+21:15:19.569 [info] Merging Dots in computation: region_46.47
 
-07:06:06.194 [info] Merging Dots in computation: region_49.50
+21:15:19.569 [info] Merging Dots in computation: region_49.50
 
-07:06:06.194 [info] Merging Dots in computation: region_52.53
+21:15:19.569 [info] Merging Dots in computation: region_52.53
 
-07:06:06.194 [info] Merging Dots in computation: region_55.56
+21:15:19.569 [info] Merging Dots in computation: region_55.56
 
-07:06:06.194 [info] Merging Dots in computation: region_58.59
+21:15:19.569 [info] Merging Dots in computation: region_58.59
 
-07:06:06.194 [info] Merging Dots in computation: region_61.62
+21:15:19.569 [info] Merging Dots in computation: region_61.62
 
-07:06:06.194 [info] Merging Dots in computation: region_64.65
+21:15:19.569 [info] Merging Dots in computation: region_64.65
 
-07:06:06.194 [info] Merging Dots in computation: region_67.68
+21:15:19.569 [info] Merging Dots in computation: region_67.68
 
-07:06:06.194 [info] Merging Dots in computation: region_70.71
+21:15:19.569 [info] Merging Dots in computation: region_70.71
 
-07:06:06.194 [info] Merging Dots in computation: region_73.74
+21:15:19.569 [info] Merging Dots in computation: region_73.74
 
-07:06:06.194 [info] Merging Dots in computation: region_76.77
+21:15:19.569 [info] Merging Dots in computation: region_76.77
 
-07:06:06.194 [info] Merging Dots in computation: region_79.80
+21:15:19.569 [info] Merging Dots in computation: region_79.80
 
-07:06:06.194 [info] Merging Dots in computation: region_82.83
+21:15:19.569 [info] Merging Dots in computation: region_82.83
 
-07:06:06.194 [info] Merging Dots in computation: region_85.86
+21:15:19.569 [info] Merging Dots in computation: region_85.86
 
-07:06:06.194 [info] Merging Dots in computation: region_88.89
+21:15:19.569 [info] Merging Dots in computation: region_88.89
 💾 Auto-Saving Checkpoint...
-➡️  Step 50 | Global: 40049 | Combined Loss: 2.8716 | BPC: 4.12 | LR: 2.95e-4 | RAM: 258MB
-   📐 MAX GRAD: l3_d_v=7.8667
-➡️  Step 100 | Global: 40099 | Combined Loss: 3.0354 | BPC: 4.356 | LR: 2.95e-4 | RAM: 260MB
-   📐 MAX GRAD: l3_d_v=6.0529
-➡️  Step 150 | Global: 40149 | Combined Loss: 2.9659 | BPC: 4.256 | LR: 2.95e-4 | RAM: 261MB
-   📐 MAX GRAD: l3_d_v=8.1923
-➡️  Step 200 | Global: 40199 | Combined Loss: 2.9087 | BPC: 4.174 | LR: 2.95e-4 | RAM: 260MB
-   📐 MAX GRAD: l3_d_v=6.9452
-➡️  Step 250 | Global: 40249 | Combined Loss: 2.8684 | BPC: 4.115 | LR: 2.95e-4 | RAM: 263MB
-   📐 MAX GRAD: l3_d_v=4.9597
-➡️  Step 300 | Global: 40299 | Combined Loss: 2.8833 | BPC: 4.137 | LR: 2.95e-4 | RAM: 262MB
-   📐 MAX GRAD: l3_d_v=5.5155
-➡️  Step 350 | Global: 40349 | Combined Loss: 2.8448 | BPC: 4.081 | LR: 2.95e-4 | RAM: 263MB
-   📐 MAX GRAD: l3_d_v=6.0215
-➡️  Step 400 | Global: 40399 | Combined Loss: 2.8063 | BPC: 4.026 | LR: 2.95e-4 | RAM: 263MB
-   📐 MAX GRAD: l3_d_v=9.843
-➡️  Step 450 | Global: 40449 | Combined Loss: 2.9358 | BPC: 4.213 | LR: 2.95e-4 | RAM: 266MB
-   📐 MAX GRAD: l3_d_v=6.7849
-➡️  Step 500 | Global: 40499 | Combined Loss: 2.8766 | BPC: 4.127 | LR: 2.95e-4 | RAM: 264MB
-   📐 MAX GRAD: l3_d_v=3.3876
-➡️  Step 550 | Global: 40549 | Combined Loss: 2.8054 | BPC: 4.025 | LR: 2.95e-4 | RAM: 267MB
-   📐 MAX GRAD: l3_d_v=6.8195
-➡️  Step 600 | Global: 40599 | Combined Loss: 2.9422 | BPC: 4.222 | LR: 2.95e-4 | RAM: 266MB
-   📐 MAX GRAD: l3_d_v=4.4375
-➡️  Step 650 | Global: 40649 | Combined Loss: 2.7677 | BPC: 3.97 | LR: 2.95e-4 | RAM: 269MB
-   📐 MAX GRAD: l3_d_v=8.393
-➡️  Step 700 | Global: 40699 | Combined Loss: 2.8554 | BPC: 4.097 | LR: 2.95e-4 | RAM: 267MB
-   📐 MAX GRAD: l3_d_v=2.4237
-➡️  Step 750 | Global: 40749 | Combined Loss: 2.8038 | BPC: 4.022 | LR: 2.95e-4 | RAM: 269MB
-   📐 MAX GRAD: l3_d_v=8.9209
-➡️  Step 800 | Global: 40799 | Combined Loss: 2.8586 | BPC: 4.101 | LR: 2.95e-4 | RAM: 270MB
-   📐 MAX GRAD: l3_d_v=2.9321
-➡️  Step 850 | Global: 40849 | Combined Loss: 2.8777 | BPC: 4.129 | LR: 2.95e-4 | RAM: 273MB
-   📐 MAX GRAD: l3_d_v=7.5387
-➡️  Step 900 | Global: 40899 | Combined Loss: 2.8662 | BPC: 4.112 | LR: 2.95e-4 | RAM: 271MB
-   📐 MAX GRAD: l3_d_v=8.3621
-➡️  Step 950 | Global: 40949 | Combined Loss: 2.9503 | BPC: 4.233 | LR: 2.95e-4 | RAM: 272MB
-   📐 MAX GRAD: l3_d_v=11.2349
-➡️  Step 1000 | Global: 40999 | Combined Loss: 2.8686 | BPC: 4.116 | LR: 2.95e-4 | RAM: 273MB
-   📐 MAX GRAD: l3_d_v=5.9546
-💾 Auto-Saving Checkpoint...
-➡️  Step 1050 | Global: 41049 | Combined Loss: 3.0945 | BPC: 4.442 | LR: 2.95e-4 | RAM: 273MB
-   📐 MAX GRAD: l3_d_v=7.0732
-➡️  Step 1100 | Global: 41099 | Combined Loss: 2.9085 | BPC: 4.173 | LR: 2.95e-4 | RAM: 274MB
-   📐 MAX GRAD: l3_d_v=6.3714
-➡️  Step 1150 | Global: 41149 | Combined Loss: 2.8754 | BPC: 4.125 | LR: 2.95e-4 | RAM: 277MB
-   📐 MAX GRAD: l3_d_v=3.6574
-➡️  Step 1200 | Global: 41199 | Combined Loss: 3.0989 | BPC: 4.448 | LR: 2.95e-4 | RAM: 275MB
-   📐 MAX GRAD: l3_d_v=5.4794
-➡️  Step 1250 | Global: 41249 | Combined Loss: 2.85 | BPC: 4.089 | LR: 2.95e-4 | RAM: 276MB
-   📐 MAX GRAD: l3_d_v=9.2206
-➡️  Step 1300 | Global: 41299 | Combined Loss: 2.9516 | BPC: 4.235 | LR: 2.95e-4 | RAM: 278MB
-   📐 MAX GRAD: l3_d_v=6.1931
-➡️  Step 1350 | Global: 41349 | Combined Loss: 2.924 | BPC: 4.196 | LR: 2.95e-4 | RAM: 280MB
-   📐 MAX GRAD: l3_d_v=8.2782
-➡️  Step 1400 | Global: 41399 | Combined Loss: 2.8941 | BPC: 4.152 | LR: 2.95e-4 | RAM: 278MB
-   📐 MAX GRAD: l3_d_v=6.7837
-➡️  Step 1450 | Global: 41449 | Combined Loss: 2.95 | BPC: 4.233 | LR: 2.95e-4 | RAM: 279MB
-   📐 MAX GRAD: l3_d_v=4.8867
-➡️  Step 1500 | Global: 41499 | Combined Loss: 2.9727 | BPC: 4.266 | LR: 2.95e-4 | RAM: 280MB
-   📐 MAX GRAD: l3_d_v=5.1312
-➡️  Step 1550 | Global: 41549 | Combined Loss: 2.954 | BPC: 4.239 | LR: 2.95e-4 | RAM: 283MB
-   📐 MAX GRAD: l3_d_v=4.2273
-➡️  Step 1600 | Global: 41599 | Combined Loss: 2.8878 | BPC: 4.143 | LR: 2.95e-4 | RAM: 281MB
-   📐 MAX GRAD: l3_d_v=7.4529
-➡️  Step 1650 | Global: 41649 | Combined Loss: 2.8538 | BPC: 4.094 | LR: 2.94e-4 | RAM: 282MB
-   📐 MAX GRAD: l3_d_v=6.7188
-➡️  Step 1700 | Global: 41699 | Combined Loss: 2.8319 | BPC: 4.063 | LR: 2.94e-4 | RAM: 283MB
-   📐 MAX GRAD: l3_d_v=6.9477
-➡️  Step 1750 | Global: 41749 | Combined Loss: 3.0148 | BPC: 4.327 | LR: 2.94e-4 | RAM: 285MB
-   📐 MAX GRAD: l3_d_v=2.7876
-➡️  Step 1800 | Global: 41799 | Combined Loss: 2.8253 | BPC: 4.053 | LR: 2.94e-4 | RAM: 284MB
-   📐 MAX GRAD: l3_d_v=6.1228
-➡️  Step 1850 | Global: 41849 | Combined Loss: 2.8103 | BPC: 4.031 | LR: 2.94e-4 | RAM: 285MB
-   📐 MAX GRAD: l3_d_v=7.6427
-➡️  Step 1900 | Global: 41899 | Combined Loss: 2.7921 | BPC: 4.005 | LR: 2.94e-4 | RAM: 287MB
-   📐 MAX GRAD: l3_d_v=5.4369
-➡️  Step 1950 | Global: 41949 | Combined Loss: 2.8991 | BPC: 4.16 | LR: 2.94e-4 | RAM: 291MB
-   📐 MAX GRAD: l3_d_v=3.1822
-➡️  Step 2000 | Global: 41999 | Combined Loss: 2.9973 | BPC: 4.301 | LR: 2.94e-4 | RAM: 289MB
-   📐 MAX GRAD: l3_d_v=3.7337
-💾 Auto-Saving Checkpoint...
-➡️  Step 2050 | Global: 42049 | Combined Loss: 2.8389 | BPC: 4.073 | LR: 2.94e-4 | RAM: 244MB
-   📐 MAX GRAD: l3_d_v=5.4953
-➡️  Step 2100 | Global: 42099 | Combined Loss: 2.8515 | BPC: 4.091 | LR: 2.94e-4 | RAM: 244MB
-   📐 MAX GRAD: l3_d_v=7.3227
-➡️  Step 2150 | Global: 42149 | Combined Loss: 2.9238 | BPC: 4.195 | LR: 2.94e-4 | RAM: 247MB
-   📐 MAX GRAD: l3_d_v=5.3427
-➡️  Step 2200 | Global: 42199 | Combined Loss: 2.9269 | BPC: 4.2 | LR: 2.94e-4 | RAM: 245MB
-   📐 MAX GRAD: l3_d_v=7.1854
-➡️  Step 2250 | Global: 42249 | Combined Loss: 2.8146 | BPC: 4.038 | LR: 2.94e-4 | RAM: 247MB
-   📐 MAX GRAD: l3_d_v=6.8386
-➡️  Step 2300 | Global: 42299 | Combined Loss: 2.8235 | BPC: 4.051 | LR: 2.94e-4 | RAM: 248MB
-   📐 MAX GRAD: l3_d_v=7.5241
-➡️  Step 2350 | Global: 42349 | Combined Loss: 2.8916 | BPC: 4.149 | LR: 2.94e-4 | RAM: 250MB
-   📐 MAX GRAD: l3_d_v=9.5641
-➡️  Step 2400 | Global: 42399 | Combined Loss: 2.8875 | BPC: 4.143 | LR: 2.94e-4 | RAM: 248MB
-   📐 MAX GRAD: l3_d_v=5.7789
-➡️  Step 2450 | Global: 42449 | Combined Loss: 2.8607 | BPC: 4.104 | LR: 2.94e-4 | RAM: 249MB
-   📐 MAX GRAD: l3_d_v=4.433
-➡️  Step 2500 | Global: 42499 | Combined Loss: 2.7978 | BPC: 4.013 | LR: 2.94e-4 | RAM: 250MB
-   📐 MAX GRAD: l3_d_v=8.7185
-➡️  Step 2550 | Global: 42549 | Combined Loss: 2.7664 | BPC: 3.968 | LR: 2.94e-4 | RAM: 253MB
-   📐 MAX GRAD: l3_d_v=7.4396
-➡️  Step 2600 | Global: 42599 | Combined Loss: 2.8824 | BPC: 4.136 | LR: 2.94e-4 | RAM: 251MB
-   📐 MAX GRAD: l3_d_v=5.3062
-➡️  Step 2650 | Global: 42649 | Combined Loss: 3.2004 | BPC: 4.594 | LR: 2.94e-4 | RAM: 254MB
-   📐 MAX GRAD: l3_d_v=18.0414
-➡️  Step 2700 | Global: 42699 | Combined Loss: 3.019 | BPC: 4.333 | LR: 2.94e-4 | RAM: 253MB
-   📐 MAX GRAD: l3_d_v=6.776
-➡️  Step 2750 | Global: 42749 | Combined Loss: 2.9759 | BPC: 4.27 | LR: 2.94e-4 | RAM: 254MB
-   📐 MAX GRAD: l3_d_v=8.5638
-➡️  Step 2800 | Global: 42799 | Combined Loss: 2.9366 | BPC: 4.214 | LR: 2.94e-4 | RAM: 255MB
-   📐 MAX GRAD: l3_d_v=5.526
-➡️  Step 2850 | Global: 42849 | Combined Loss: 2.8807 | BPC: 4.133 | LR: 2.94e-4 | RAM: 257MB
-   📐 MAX GRAD: l3_d_v=4.9828
-➡️  Step 2900 | Global: 42899 | Combined Loss: 2.8927 | BPC: 4.15 | LR: 2.94e-4 | RAM: 256MB
-   📐 MAX GRAD: l3_d_v=10.5348
-➡️  Step 2950 | Global: 42949 | Combined Loss: 2.9161 | BPC: 4.184 | LR: 2.94e-4 | RAM: 259MB
-   📐 MAX GRAD: l3_d_v=8.2119
-➡️  Step 3000 | Global: 42999 | Combined Loss: 2.8874 | BPC: 4.143 | LR: 2.94e-4 | RAM: 257MB
-   📐 MAX GRAD: l3_d_v=4.2003
-💾 Auto-Saving Checkpoint...
-➡️  Step 3050 | Global: 43049 | Combined Loss: 2.9835 | BPC: 4.281 | LR: 2.94e-4 | RAM: 258MB
-   📐 MAX GRAD: l3_d_v=7.172
-➡️  Step 3100 | Global: 43099 | Combined Loss: 2.8885 | BPC: 4.144 | LR: 2.94e-4 | RAM: 258MB
-   📐 MAX GRAD: l3_d_v=6.2747
-➡️  Step 3150 | Global: 43149 | Combined Loss: 2.9303 | BPC: 4.205 | LR: 2.94e-4 | RAM: 259MB
-   📐 MAX GRAD: l3_d_v=5.9771
-➡️  Step 3200 | Global: 43199 | Combined Loss: 2.9326 | BPC: 4.208 | LR: 2.94e-4 | RAM: 261MB
-   📐 MAX GRAD: l3_d_v=4.9883
-➡️  Step 3250 | Global: 43249 | Combined Loss: 2.84 | BPC: 4.074 | LR: 2.94e-4 | RAM: 263MB
-   📐 MAX GRAD: l3_d_v=4.0436
-➡️  Step 3300 | Global: 43299 | Combined Loss: 2.9162 | BPC: 4.184 | LR: 2.94e-4 | RAM: 261MB
-   📐 MAX GRAD: l3_d_v=9.6012
-➡️  Step 3350 | Global: 43349 | Combined Loss: 2.9226 | BPC: 4.194 | LR: 2.94e-4 | RAM: 262MB
-   📐 MAX GRAD: l3_d_v=7.6666
-➡️  Step 3400 | Global: 43399 | Combined Loss: 2.8653 | BPC: 4.111 | LR: 2.94e-4 | RAM: 263MB
-   📐 MAX GRAD: l3_d_v=5.3758
-➡️  Step 3450 | Global: 43449 | Combined Loss: 3.0247 | BPC: 4.341 | LR: 2.94e-4 | RAM: 266MB
-   📐 MAX GRAD: l3_d_v=6.3105
-➡️  Step 3500 | Global: 43499 | Combined Loss: 2.9624 | BPC: 4.251 | LR: 2.94e-4 | RAM: 264MB
-   📐 MAX GRAD: l3_d_v=8.7707
-➡️  Step 3550 | Global: 43549 | Combined Loss: 2.9623 | BPC: 4.251 | LR: 2.94e-4 | RAM: 267MB
-   📐 MAX GRAD: l3_d_v=1.5936
-➡️  Step 3600 | Global: 43599 | Combined Loss: 3.0324 | BPC: 4.352 | LR: 2.94e-4 | RAM: 265MB
-   📐 MAX GRAD: l3_d_v=4.5698
-➡️  Step 3650 | Global: 43649 | Combined Loss: 3.2469 | BPC: 4.661 | LR: 2.94e-4 | RAM: 267MB
-   📐 MAX GRAD: l3_d_v=13.9987
-➡️  Step 3700 | Global: 43699 | Combined Loss: 2.7861 | BPC: 3.997 | LR: 2.94e-4 | RAM: 268MB
-   📐 MAX GRAD: l3_d_v=8.1688
-➡️  Step 3750 | Global: 43749 | Combined Loss: 2.9088 | BPC: 4.174 | LR: 2.94e-4 | RAM: 270MB
-   📐 MAX GRAD: l3_d_v=6.3537
-➡️  Step 3800 | Global: 43799 | Combined Loss: 2.934 | BPC: 4.21 | LR: 2.94e-4 | RAM: 268MB
-   📐 MAX GRAD: l3_d_v=7.9484
-➡️  Step 3850 | Global: 43849 | Combined Loss: 2.8786 | BPC: 4.13 | LR: 2.94e-4 | RAM: 271MB
-   📐 MAX GRAD: l3_d_v=6.87
-➡️  Step 3900 | Global: 43899 | Combined Loss: 2.9423 | BPC: 4.222 | LR: 2.94e-4 | RAM: 270MB
-   📐 MAX GRAD: l3_d_v=3.9782
-➡️  Step 3950 | Global: 43949 | Combined Loss: 2.853 | BPC: 4.093 | LR: 2.94e-4 | RAM: 271MB
-   📐 MAX GRAD: l3_d_v=8.2906
-➡️  Step 4000 | Global: 43999 | Combined Loss: 2.9708 | BPC: 4.263 | LR: 2.94e-4 | RAM: 272MB
-   📐 MAX GRAD: l3_d_v=8.3283
-💾 Auto-Saving Checkpoint...
-➡️  Step 4050 | Global: 44049 | Combined Loss: 2.8368 | BPC: 4.07 | LR: 2.94e-4 | RAM: 272MB
-   📐 MAX GRAD: l3_d_v=6.4067
-➡️  Step 4100 | Global: 44099 | Combined Loss: 2.7749 | BPC: 3.98 | LR: 2.94e-4 | RAM: 272MB
-   📐 MAX GRAD: l3_d_v=8.183
-➡️  Step 4150 | Global: 44149 | Combined Loss: 2.9105 | BPC: 4.176 | LR: 2.94e-4 | RAM: 274MB
-   📐 MAX GRAD: l3_d_v=8.3388
-➡️  Step 4200 | Global: 44199 | Combined Loss: 2.943 | BPC: 4.223 | LR: 2.94e-4 | RAM: 275MB
-   📐 MAX GRAD: l3_d_v=7.9743
-➡️  Step 4250 | Global: 44249 | Combined Loss: 2.7896 | BPC: 4.002 | LR: 2.94e-4 | RAM: 277MB
-   📐 MAX GRAD: l3_d_v=8.5065
-➡️  Step 4300 | Global: 44299 | Combined Loss: 2.9512 | BPC: 4.235 | LR: 2.94e-4 | RAM: 275MB
-   📐 MAX GRAD: l3_d_v=5.8529
-➡️  Step 4350 | Global: 44349 | Combined Loss: 2.9294 | BPC: 4.203 | LR: 2.94e-4 | RAM: 278MB
-   📐 MAX GRAD: l3_d_v=8.676
-➡️  Step 4400 | Global: 44399 | Combined Loss: 2.9303 | BPC: 4.205 | LR: 2.94e-4 | RAM: 277MB
-   📐 MAX GRAD: l3_d_v=3.9419
-➡️  Step 4450 | Global: 44449 | Combined Loss: 2.9447 | BPC: 4.225 | LR: 2.94e-4 | RAM: 280MB
-   📐 MAX GRAD: l3_d_v=4.0576
-➡️  Step 4500 | Global: 44499 | Combined Loss: 2.8481 | BPC: 4.086 | LR: 2.94e-4 | RAM: 278MB
-   📐 MAX GRAD: l3_d_v=4.3648
-➡️  Step 4550 | Global: 44549 | Combined Loss: 3.0389 | BPC: 4.361 | LR: 2.94e-4 | RAM: 281MB
-   📐 MAX GRAD: l3_d_v=10.6359
-➡️  Step 4600 | Global: 44599 | Combined Loss: 2.8602 | BPC: 4.104 | LR: 2.94e-4 | RAM: 279MB
-   📐 MAX GRAD: l3_d_v=5.8253
-➡️  Step 4650 | Global: 44649 | Combined Loss: 2.9855 | BPC: 4.284 | LR: 2.94e-4 | RAM: 283MB
-   📐 MAX GRAD: l3_d_v=5.0392
-➡️  Step 4700 | Global: 44699 | Combined Loss: 3.0149 | BPC: 4.327 | LR: 2.94e-4 | RAM: 281MB
-   📐 MAX GRAD: l3_d_v=6.0439
-➡️  Step 4750 | Global: 44749 | Combined Loss: 2.9598 | BPC: 4.247 | LR: 2.94e-4 | RAM: 284MB
-   📐 MAX GRAD: l3_d_v=6.3615
-➡️  Step 4800 | Global: 44799 | Combined Loss: 2.8628 | BPC: 4.107 | LR: 2.94e-4 | RAM: 284MB
-   📐 MAX GRAD: l3_d_v=2.981
-➡️  Step 4850 | Global: 44849 | Combined Loss: 2.8104 | BPC: 4.032 | LR: 2.94e-4 | RAM: 287MB
-   📐 MAX GRAD: l3_d_v=6.0607
-➡️  Step 4900 | Global: 44899 | Combined Loss: 3.0073 | BPC: 4.316 | LR: 2.94e-4 | RAM: 286MB
-   📐 MAX GRAD: l3_d_v=5.2477
-➡️  Step 4950 | Global: 44949 | Combined Loss: 2.9249 | BPC: 4.197 | LR: 2.94e-4 | RAM: 287MB
-   📐 MAX GRAD: l3_d_v=3.1063
-➡️  Step 5000 | Global: 44999 | Combined Loss: 2.9348 | BPC: 4.211 | LR: 2.94e-4 | RAM: 288MB
-   📐 MAX GRAD: l3_d_v=4.802
-💾 Auto-Saving Checkpoint...
-➡️  Step 5050 | Global: 45049 | Combined Loss: 2.8154 | BPC: 4.039 | LR: 2.94e-4 | RAM: 288MB
-   📐 MAX GRAD: l3_d_v=5.9422
-➡️  Step 5100 | Global: 45099 | Combined Loss: 2.9535 | BPC: 4.238 | LR: 2.94e-4 | RAM: 289MB
-   📐 MAX GRAD: l3_d_v=7.5135
+➡️  Step 50 | Global: 70049 | Combined Loss: 2.3004 | BPC: 3.254 | LR: 2.84e-4 | RAM: 259MB
+   📐 MAX GRAD: l3_d_v=1.1938
+➡️  Step 100 | Global: 70099 | Combined Loss: 2.1399 | BPC: 3.026 | LR: 2.84e-4 | RAM: 259MB
+   📐 MAX GRAD: l3_d_v=1.6451
+➡️  Step 150 | Global: 70149 | Combined Loss: 2.1445 | BPC: 3.025 | LR: 2.84e-4 | RAM: 262MB
+   📐 MAX GRAD: l3_d_v=1.2567
+➡️  Step 200 | Global: 70199 | Combined Loss: 2.1191 | BPC: 2.992 | LR: 2.84e-4 | RAM: 260MB
+   📐 MAX GRAD: l3_d_v=1.2757
+➡️  Step 250 | Global: 70249 | Combined Loss: 2.0722 | BPC: 2.923 | LR: 2.84e-4 | RAM: 261MB
+   📐 MAX GRAD: l3_d_v=1.4342
+➡️  Step 300 | Global: 70299 | Combined Loss: 2.2229 | BPC: 3.144 | LR: 2.84e-4 | RAM: 263MB
+   📐 MAX GRAD: l3_d_v=1.1836
+➡️  Step 350 | Global: 70349 | Combined Loss: 2.3959 | BPC: 3.389 | LR: 2.84e-4 | RAM: 262MB
+   📐 MAX GRAD: l3_d_v=1.2243
+➡️  Step 400 | Global: 70399 | Combined Loss: 2.2006 | BPC: 3.112 | LR: 2.84e-4 | RAM: 264MB
+   📐 MAX GRAD: l3_d_v=1.2235
+➡️  Step 450 | Global: 70449 | Combined Loss: 2.2089 | BPC: 3.123 | LR: 2.84e-4 | RAM: 264MB
+   📐 MAX GRAD: l3_d_v=0.8925
 ```
