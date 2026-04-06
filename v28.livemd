@@ -10,7 +10,8 @@ System.put_env("XLA_BUILD", "true")
 
 Mix.install([
   {:nx, "~> 0.11.0"},
-  {:exla, "~> 0.11.0"}
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
 ])
 
 System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
@@ -27,7 +28,7 @@ System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
 Application.put_env(:exla, :clients,
   rocm: [
     platform: :rocm,
-    memory_fraction: 0.55,  # ← force total claimed under 8GB
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
     preallocate: false,
     num_replicas: 1
   ]
@@ -222,6 +223,7 @@ defmodule DLM.MuonHybrid do
   end
 
   defn muon_update(grad, lr) do
+    # clipped = Nx.clip(grad, -1.0, 1.0)
     Nx.subtract(0.0, Nx.multiply(lr, newton_schulz(grad)))
   end
 
@@ -300,9 +302,7 @@ end
 defmodule DLM.TinySSM do
   import Nx.Defn
 
-  # We use the standard gelu approximation
   defn gelu(x) do
-    # 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
     cdf = Nx.multiply(
       Nx.tensor(0.7978845608, type: :f32),
       Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
@@ -312,28 +312,30 @@ defmodule DLM.TinySSM do
 
   defn apply_svd(x, u, v) do
     hidden = Nx.dot(x, u)
-    # ⚡ Inject the non-linear joint!
     activated = gelu(hidden) 
     Nx.dot(activated, v)
   end
 
-  defn forward(x_t, h_prev, params) do
-    {a, bu, bv, cu, cv} = params
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
 
-    # 1. Input Force
+  defn forward(x_t, h_prev, params) do
+    # ⚡ Unpack the 7 parameters
+    {a, bu, bv, cu, cv, du, dv} = params
+
     b_proj = apply_svd(x_t, bu, bv)
     
-    # Static Step Size
-    delta = Nx.tensor(0.1, type: :f32)
+    # ⚡ The Dynamic Gate
+    gate_proj = apply_svd(x_t, du, dv)
+    delta = Nx.max(softplus(gate_proj), 1.0e-4) # Minimum step size for stability
     
-    # 2. Friction/Inertia
+    # Dynamic Friction & Force
     a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
     b_bar = Nx.multiply(delta, b_proj)
     
-    # 3. Update Momentum State
     h_new = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
     
-    # 4. Output Velocity (The predicted 512D vector)
     predicted_vector = apply_svd(h_new, cu, cv)
     
     {predicted_vector, h_new}
@@ -344,7 +346,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 19, ...>>, true}
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
 ```
 
 ```elixir
@@ -412,6 +414,133 @@ end
 ```
 
 ```elixir
+defmodule DLM.SinkhornOT do
+  import Nx.Defn
+
+  defn cost_matrix(pred, target) do
+    p_exp = Nx.new_axis(pred, 1)
+    t_exp = Nx.new_axis(target, 0)
+    diff = Nx.subtract(p_exp, t_exp)
+    Nx.sum(Nx.pow(diff, 2), axes: [-1])
+  end
+
+  # ⚡ FIX 1: Bump the default epsilon up to 10.0 to handle your 512D spatial scale
+  defn compute(pred, target, epsilon \\ 10.0, max_iters \\ 5) do
+    c = cost_matrix(pred, target)
+    k = Nx.exp(Nx.divide(Nx.negate(c), epsilon))
+    
+    batch_size = Nx.axis_size(pred, 0)
+    mass = 1.0 / batch_size
+    mu = Nx.broadcast(mass, {batch_size})
+    nu = Nx.broadcast(mass, {batch_size})
+
+    {_final_k, u_final, v_final, _mu, _nu, _i} =
+      while {k_mat = k, 
+             u = Nx.broadcast(1.0, {batch_size}), 
+             _v = Nx.broadcast(1.0, {batch_size}), 
+             m = mu, n = nu, i = 0},
+            Nx.less(i, max_iters) do
+            
+        # ⚡ FIX 2: Add 1.0e-8 to the denominator to mathematically prevent NaN crashes
+        denom_v = Nx.add(Nx.dot(Nx.transpose(k_mat), u), 1.0e-8)
+        v_new = Nx.divide(n, denom_v)
+        
+        denom_u = Nx.add(Nx.dot(k_mat, v_new), 1.0e-8)
+        u_new = Nx.divide(m, denom_u)
+
+        {k_mat, u_new, v_new, m, n, i + 1}
+      end
+
+    u_exp = Nx.new_axis(u_final, 1)
+    v_exp = Nx.new_axis(v_final, 0)
+    p = Nx.multiply(Nx.multiply(u_exp, k), v_exp)
+
+    Nx.sum(Nx.multiply(p, c))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SinkhornOT, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
+```
+
+```elixir
+defmodule DLM.PhysicsLoss do
+  import Nx.Defn
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN for Rank 2 Tensors)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # pred and target are {batch_size, dim}
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    # 1. Batched Dot Product: {batch, dim} x {dim, batch} -> {batch, batch}
+    # This creates a similarity matrix comparing every pred to every target in the batch
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 2. Create Identity Targets -> {batch, batch}
+    batch_size = Nx.axis_size(pred, 0)
+    # ⚡ THE FIX: Pass a 2D tuple {32, 32} instead of a 1D tuple {32}
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    # 3. Manual Dense Log-Softmax
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+
+  defn compute(pred, target) do
+    mse = Nx.mean(Nx.pow(Nx.subtract(pred, target), 2))
+    cos = cosine_distance(pred, target)
+    
+    # ⚡ Update the explicit epsilon call here to 10.0
+    ot_loss = DLM.SinkhornOT.compute(pred, target, 5.0, 5)
+
+    Nx.add(Nx.add(mse, cos), Nx.multiply(ot_loss, 0.5))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.PhysicsLoss, <<70, 79, 82, 49, 0, 0, 26, ...>>, true}
+```
+
+```elixir
 # ===========================================================================
 # THE PHYSICS ENGINE (Geometric Loss & BPTT)
 # ===========================================================================
@@ -426,52 +555,107 @@ defmodule DLM.PhysicsEngine do
     DLM.LatentTokenizer.rms_norm(raw_latents) 
   end
 
-  defn predict_step(current_coord, target_coord, h_prev, predictor_params) do
-    {predicted_vector, h_new} = DLM.TinySSM.forward(current_coord, h_prev, predictor_params)
-    predicted_landing_spot = Nx.add(current_coord, predicted_vector)
+  # ⚡ RECURRENT PREDICT STEP (Gradient-Safe Pondering)
+  defn predict_step(current_coord, h_prev, predictor_params) do
+    max_loops = 5 
     
-    # ⚡ Calculate actual physical Euclidean Distance (L2 Norm)
-    diff = Nx.subtract(target_coord, predicted_landing_spot)
-    step_loss = Nx.sqrt(Nx.sum(Nx.pow(diff, 2), axes: [-1]))
+    # ⚡ We use the SQUARED epsilon to avoid the Nx.sqrt() derivative explosion!
+    # If our target threshold is 0.1 distance, 0.1^2 = 0.01.
+    sq_epsilon = Nx.tensor(0.01, type: :f32) 
     
-    # Average the distance across the batch
-    batch_loss = Nx.mean(step_loss)
-    
-    {batch_loss, h_new}
+    init_delta = Nx.tensor(100.0, type: :f32)
+    init_pred = Nx.broadcast(0.0, Nx.shape(current_coord))
+
+    {_k, _c, final_h, _d, _p, _m, _e, final_pred} = 
+      while {k = 0, 
+             c_coord = current_coord, 
+             c_h = h_prev, 
+             delta = init_delta, 
+             p = predictor_params, 
+             m = max_loops, 
+             e = sq_epsilon,
+             prev_pred = init_pred},
+            Nx.logical_and(Nx.less(k, m), Nx.greater(delta, e)) do
+            
+        {new_pred, next_h} = DLM.TinySSM.forward(c_coord, c_h, p)
+        
+        change_in_thought = Nx.subtract(new_pred, prev_pred)
+        
+        # ⚡ NO SQUARE ROOT! We just use the raw sum of squares. 
+        # This is computationally faster and 100% gradient-safe.
+        token_movements_sq = Nx.sum(Nx.pow(change_in_thought, 2), axes: [-1])
+        
+        # Check the most confused token's SQUARED movement
+        max_movement_sq = Nx.reduce_max(token_movements_sq)
+        
+        {k + 1, c_coord, next_h, max_movement_sq, p, m, e, new_pred}
+      end
+
+    # The final landing spot is the original coordinate + the final, fully reasoned jump
+    final_coord = Nx.add(current_coord, final_pred)
+
+    {final_coord, final_h}
   end
 
-  defn compute_sequence_loss(input_coords, target_coords, h_init, predictor_params) do
-    {_batch, seq_len, _dim} = Nx.shape(input_coords)
+  # ⚡ Added noise_scale to the arguments
+  defn compute_sequence_loss(input_coords, target_coords, h_init, predictor_params, noise_key, noise_scale) do
+    {batch_size, seq_len, dim} = Nx.shape(input_coords)
     inputs_time_first = Nx.transpose(input_coords, axes: [1, 0, 2])
     targets_time_first = Nx.transpose(target_coords, axes: [1, 0, 2])
 
     result =
       while {i = 0, total_loss = Nx.tensor(0.0, type: :f32), h = h_init, 
-             inputs = inputs_time_first, targets = targets_time_first, p = predictor_params},
+             inputs = inputs_time_first, targets = targets_time_first, p = predictor_params,
+             key = noise_key, ns = noise_scale},
             Nx.less(i, seq_len) do
-        {step_loss, h_new} = predict_step(inputs[i], targets[i], h, p)
-        {i + 1, Nx.add(total_loss, step_loss), h_new, inputs, targets, p}
+      
+        # 1. Generate Kinetic Noise
+        {noise, next_key} = Nx.Random.normal(key, 0.0, 1.0, shape: {batch_size, dim})
+        
+        # ⚡ 2. Multiply by the dynamic noise_scale (0.0 means noise is completely zeroed out)
+        noisy_input = Nx.add(inputs[i], Nx.multiply(noise, ns))
+      
+        # 3. Physics step and Loss calculation
+        {final_coord, h_new} = predict_step(noisy_input, h, p)
+        step_loss = DLM.PhysicsLoss.compute(final_coord, targets[i])
+        
+        {i + 1, Nx.add(total_loss, step_loss), h_new, inputs, targets, p, next_key, ns}
       end
 
     accumulated_loss = elem(result, 1)
     Nx.divide(accumulated_loss, seq_len)
   end
 
-  defn compute_grad(params, batch_tokens, h_init, frozen_w1, frozen_w2) do
-    # Slice sequence of 17 into 16 inputs and 16 targets
+  # ⚡ Pass noise_scale through the grad function
+  defn compute_grad(params, batch_tokens, h_init, frozen_w1, frozen_w2, noise_key, noise_scale) do
     {_batch_size, full_seq_len} = Nx.shape(batch_tokens)
     seq_len = full_seq_len - 1
     
     input_tokens = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
     target_tokens = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
 
-    # Project to 512D
     input_coords = get_coordinates(input_tokens, frozen_w1, frozen_w2)
     target_coords = get_coordinates(target_tokens, frozen_w1, frozen_w2)
 
-    value_and_grad(params, fn p ->
-      compute_sequence_loss(input_coords, target_coords, h_init, p)
+    # 1. Capture the tuple instead of implicitly returning it
+    {loss, raw_grads} = value_and_grad(params, fn p ->
+      compute_sequence_loss(input_coords, target_coords, h_init, p, noise_key, noise_scale)
     end)
+
+   # 2. Unpack the exact 7 gradients matching your Genesis tuple
+    {g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv} = raw_grads
+
+    # 3. ⚡ THE NAN SHIELD
+    clipped_g_a = Nx.clip(g_a, -1.0, 1.0)
+    clipped_g_bu = Nx.clip(g_bu, -1.0, 1.0)
+    clipped_g_bv = Nx.clip(g_bv, -1.0, 1.0)
+    clipped_g_cu = Nx.clip(g_cu, -1.0, 1.0)
+    clipped_g_cv = Nx.clip(g_cv, -1.0, 1.0)
+    clipped_g_du = Nx.clip(g_du, -1.0, 1.0)
+    clipped_g_dv = Nx.clip(g_dv, -1.0, 1.0)
+
+    # 4. Return the matching 7-tuple
+    {loss, {clipped_g_a, clipped_g_bu, clipped_g_bv, clipped_g_cu, clipped_g_cv, clipped_g_du, clipped_g_dv}}
   end
 end
 ```
@@ -479,7 +663,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.PhysicsEngine, <<70, 79, 82, 49, 0, 0, 33, ...>>, true}
+{:module, DLM.PhysicsEngine, <<70, 79, 82, 49, 0, 0, 44, ...>>, true}
 ```
 
 ```elixir
@@ -604,11 +788,11 @@ end
 # ==============================================================================
 # THE DRIVER
 # ==============================================================================
-checkpoint = File.read!("v28_auto_step118000.bin") |> :erlang.binary_to_term()
+checkpoint = File.read!("v28_sinkhorn_step123000.bin") |> :erlang.binary_to_term()
 v28_params = DLM.Tree.map(checkpoint.params, &Nx.backend_copy(&1, gpu))
 
 IO.puts("🧊 Loading Frozen Micro-Diffusion Tokenizer...")
-{fw1, fw2} = File.read!("v27_frozen_encoder.bin") |> :erlang.binary_to_term()
+{fw1, fw2} = File.read!("semantic_muon_sinkhorn_frozen_encoder.bin") |> :erlang.binary_to_term()
 frozen_w1 = Nx.backend_copy(fw1, gpu)
 frozen_w2 = Nx.backend_copy(fw2, gpu)
 
@@ -672,16 +856,152 @@ IO.puts("\n\n🐑 Dream Complete.")
 
 ```
 warning: variable "probs" is unused (if the variable is not meant to be used, prefix it with an underscore)
-└─ v28.livemd#cell:iowpmrymsbnju7b3:34: DLM.V28_Inference.sample/3
+└─ v28.livemd#cell:wye7zfqt72psx7rm:34: DLM.V28_Inference.sample/3
 
 🧊 Loading Frozen Micro-Diffusion Tokenizer...
 🧠 Awakening V28 from checkpoint...
 
 Prompt: "Do state space models dream of recursive sheep?"
 
-V28:  *CHI: the for the pole ment, and I gea back you che poted gonden tile of the the at woh whyou alarlllat of tomklllkndttctttlettllled thlllyund A AUM:00003373953 mullllpst the  oundd, tur lofd trluwnu
+V28:  *CHI: dhne  aupiehdhser cnn t,lari  t m t s 20o *CT: : IIe  t'w the fbot hi aat   svdddd  990HHHeeeee  hhh oeeeeHHVdddddHHVVVVVdddddddddddd9000000099 eeeee d dddeedCw999   9999999999      9          
 
 🐑 Dream Complete.
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+defmodule DLM.BLiMP_Evaluator do
+  import Nx.Defn
+
+  # ⚡ Calculate the mathematical "surprise" (Loss) of a sentence
+  defn evaluate_sentence(ascii_tokens, v28_params, pe_w1, pe_w2) do
+    seq_len = Nx.axis_size(ascii_tokens, 0)
+
+    # 1. Slice and add Batch Dimension -> Shape: {1, seq_len - 1}
+    input_tokens = Nx.slice_along_axis(ascii_tokens, 0, seq_len - 1, axis: 0) |> Nx.new_axis(0)
+    target_tokens = Nx.slice_along_axis(ascii_tokens, 1, seq_len - 1, axis: 0) |> Nx.new_axis(0)
+
+    # 2. Satisfy the forward() signature for pure inference
+    noise_scale = Nx.tensor(0.0, type: :f32)
+    key = Nx.Random.key(42) 
+    pos_emb = Nx.broadcast(0.0, {1, seq_len - 1, 512})
+
+    # 3. Call your V27_SSM forward pass!
+    logits = DLM.V27_SSM.forward(
+      input_tokens, 
+      v28_params, 
+      pos_emb, 
+      key, 
+      pe_w1, 
+      pe_w2, 
+      noise_scale
+    )
+
+    # 4. Calculate Total Sequence Surprise
+    DLM.Loss.cross_entropy(logits, target_tokens)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.BLiMP_Evaluator, <<70, 79, 82, 49, 0, 0, 14, ...>>, true}
+```
+
+```elixir
+IO.puts("🚀 Igniting V28 BLiMP Harness...")
+
+# ==============================================================================
+# 1. LOAD THE FROZEN TEACHER (PHYSICS ENGINE)
+# ==============================================================================
+# You already have these files from your distillation run setup
+{fw1, fw2} = File.read!("semantic_muon_sinkhorn_frozen_encoder.bin") |> :erlang.binary_to_term()
+pe_w1 = Nx.backend_copy(fw1, Nx.default_backend())
+pe_w2 = Nx.backend_copy(fw2, Nx.default_backend())
+
+# ==============================================================================
+# 2. LOAD THE LATEST V28 STUDENT WEIGHTS
+# ==============================================================================
+latest_checkpoint = "v28_sinkhorn_step123000.bin" # Update to your latest
+IO.puts("🧠 Awakening V28 Student from: #{latest_checkpoint}")
+
+raw_checkpoint = File.read!(latest_checkpoint) |> :erlang.binary_to_term()
+
+# ⚡ Extract ONLY the weights tuple, leaving the optimizer momentum behind
+v28_params = DLM.Tree.map(raw_checkpoint.params, fn tensor -> 
+  Nx.backend_copy(tensor, Nx.default_backend()) 
+end)
+
+# (Make sure you also loaded fw1 and fw2 into pe_w1 and pe_w2 here)
+
+IO.puts("✅ All weights successfully materialized to GPU.")
+
+# Read the JSONL file line by line - distractor_agreement_relative_clause.jsonl
+blimp_file = "./blimp_data/regular_plural_subject_verb_agreement_1.jsonl" # Update with your file path
+
+results = 
+  File.stream!(blimp_file)
+  |> Enum.map(fn line -> Jason.decode!(line) end)
+  |> Enum.map(fn pair ->
+    good_text = pair["sentence_good"]
+    bad_text = pair["sentence_bad"]
+
+    # Convert text to ASCII tensors
+    good_tokens = DLM.LatentTokenizer.to_ascii_tokens(good_text) |> Nx.backend_copy(gpu)
+    bad_tokens = DLM.LatentTokenizer.to_ascii_tokens(bad_text) |> Nx.backend_copy(gpu)
+
+    # Calculate Loss
+    good_loss = DLM.BLiMP_Evaluator.evaluate_sentence(good_tokens, v28_params, pe_w1, pe_w2) |> Nx.to_number()
+    bad_loss = DLM.BLiMP_Evaluator.evaluate_sentence(bad_tokens, v28_params, pe_w1, pe_w2) |> Nx.to_number()
+
+    # The model scores a point if the GOOD sentence has a LOWER loss
+    is_correct = if good_loss < bad_loss, do: 1, else: 0
+
+    {is_correct, good_loss, bad_loss, good_text}
+  end)
+
+# Calculate Final Score
+total_pairs = length(results)
+correct_answers = Enum.count(results, fn {score, _, _, _} -> score == 1 end)
+accuracy = (correct_answers / total_pairs) * 100.0
+
+IO.puts("\n==================================================")
+IO.puts("📊 BLiMP BENCHMARK RESULTS")
+IO.puts("Task: #{blimp_file}")
+IO.puts("Accuracy: #{Float.round(accuracy, 2)}% (#{correct_answers}/#{total_pairs})")
+IO.puts("==================================================\n")
+
+# Print a few examples to see the loss deltas
+IO.puts("🔍 Sample Decisions:")
+results |> Enum.take(3) |> Enum.each(fn {score, g_loss, b_loss, text} ->
+  status = if score == 1, do: "✅ PASS", else: "❌ FAIL"
+  IO.puts("#{status} | Good: #{Float.round(g_loss, 4)} | Bad: #{Float.round(b_loss, 4)} | \"#{text}\"")
+end)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🚀 Igniting V28 BLiMP Harness...
+🧠 Awakening V28 Student from: v28_sinkhorn_step123000.bin
+✅ All weights successfully materialized to GPU.
+
+==================================================
+📊 BLiMP BENCHMARK RESULTS
+Task: ./blimp_data/regular_plural_subject_verb_agreement_1.jsonl
+Accuracy: 44.8% (448/1000)
+==================================================
+
+🔍 Sample Decisions:
+✅ PASS | Good: 3.5189 | Bad: 3.5754 | "Paula references Robert."
+✅ PASS | Good: 3.236 | Bad: 3.2594 | "Most legislatures haven't disliked children."
+✅ PASS | Good: 3.4647 | Bad: 3.5426 | "Some organizations aren't disturbing Vanessa."
 ```
 
 <!-- livebook:{"output":true} -->
@@ -768,13 +1088,29 @@ defmodule DLM.Loss do
     # Cross Entropy calculation
     Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
   end
+
+  defn sequence_surprise(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # ⚡ THE FIX: We use Nx.sum() across all remaining axes instead of Nx.mean()
+    # This penalizes sentences for every extra character they contain!
+    Nx.sum(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
 end
 ```
 
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 12, ...>>, true}
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 16, ...>>, true}
 ```
 
 ```elixir
@@ -804,7 +1140,7 @@ defmodule DLM.V28_DNI do
     {clean_time, noisy_time, targets_time, final_key}
   end
 
-  # ⚡ 2. THE TEACHER 
+  # ⚡ 2. THE RECURRENT TEACHER (Fixed)
   defn get_teacher_trajectory(clean_time, h_pe_init, pe_p) do
     seq_len = Nx.axis_size(clean_time, 0)
     spots_out = Nx.broadcast(0.0, Nx.shape(clean_time))
@@ -817,8 +1153,12 @@ defmodule DLM.V28_DNI do
       }, Nx.less(i, seq_len) do
         
         x_curr = c_t[i]
-        {predicted, next_h} = DLM.TinySSM.forward(x_curr, h, p)
-        ideal = Nx.add(x_curr, predicted)
+        
+        # ⚡ THE FIX: Call the Pondering Teacher!
+        # This triggers the internal 5-step while loop, executing the deep reasoning,
+        # and returns the final, perfectly settled coordinate.
+        {ideal, next_h} = DLM.PhysicsEngine.predict_step(x_curr, h, p)
+        
         updated_spots = Nx.put_slice(spots, [i, 0, 0], Nx.new_axis(ideal, 0))
         
         {i + 1, next_h, updated_spots, c_t, p}
@@ -880,7 +1220,7 @@ defmodule DLM.V28_DNI do
       logits_seq = Nx.add(Nx.dot(y_seq, lm_w), lm_b)
       
       ce_loss = DLM.Loss.cross_entropy(logits_seq, targets_time)
-      latent_loss = Nx.mean(Nx.pow(Nx.subtract(ideal_spots_time, h_seq), 2))
+      latent_loss = Nx.mean(Nx.pow(Nx.subtract(ideal_spots_time, y_seq), 2))
       
       lambda = Nx.tensor(0.1, type: :f32)
       Nx.add(ce_loss, Nx.multiply(latent_loss, lambda))
@@ -921,6 +1261,14 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
+warning: variable "h_seq" is unused (if the variable is not meant to be used, prefix it with an underscore)
+└─ v28.livemd#cell:ymrasegkmrqnubsj:102: DLM.V28_DNI.get_v28_grads/5
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
 {:module, DLM.V28_DNI, <<70, 79, 82, 49, 0, 0, 58, ...>>, {:grad_norms, 1}}
 ```
 
@@ -929,12 +1277,12 @@ save_interval = 1000
 gpu = {EXLA.Backend, client: :rocm}
 
 IO.puts("🧊 Loading Frozen Micro-Diffusion Tokenizer...")
-{fw1, fw2} = File.read!("v27_frozen_encoder.bin") |> :erlang.binary_to_term()
+{fw1, fw2} = File.read!("semantic_muon_sinkhorn_frozen_encoder.bin") |> :erlang.binary_to_term()
 frozen_w1 = Nx.backend_copy(fw1, gpu)
 frozen_w2 = Nx.backend_copy(fw2, gpu)
 
 IO.puts("🧊 Loading Frozen Language Physics Engine...")
-pe_params_raw = File.read!("v27_physics_engine_fixed.bin") |> :erlang.binary_to_term()
+pe_params_raw = File.read!("v31_sinkhorn_muon_noisy_sms_final.bin") |> :erlang.binary_to_term()
 
 frozen_pe_params = DLM.Tree.map(pe_params_raw, &Nx.backend_copy(&1, gpu))
 
@@ -949,7 +1297,7 @@ total_steps_per_epoch = div(dataset_size, batch_size)
 max_epochs = 9
 total_steps = total_steps_per_epoch * max_epochs
 
-save_prefix = "v28_auto"
+save_prefix = "v28_sinkhorn"
 
 latest_scholar =
   Path.wildcard("#{save_prefix}_*.bin")
@@ -1134,7 +1482,7 @@ Enum.reduce(current_epoch..max_epochs, {params, ms, vs, global_step, h_v28, h_pe
             shuffle_key: Nx.backend_copy(k_next, Nx.BinaryBackend)
           }
           
-          File.write!("v28_auto_step#{cs}.bin", :erlang.term_to_binary(checkpoint_state))
+          File.write!("v28_sinkhorn_step#{cs}.bin", :erlang.term_to_binary(checkpoint_state))
         end
 
         if rem(step_in_epoch, 100) == 0, do: :erlang.garbage_collect(self())
@@ -1164,1004 +1512,546 @@ IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
 <!-- livebook:{"output":true} -->
 
 ```
-...
-➡️  Step 950 | Global: 160949 | Combined Loss: 2.0663 | BPC: 2.84 | LR: 7.2e-5 | RAM: 197MB
-   📐 MAX GRAD: c_v=6.8461
-➡️  Step 1000 | Global: 160999 | Combined Loss: 2.1647 | BPC: 2.978 | LR: 7.2e-5 | RAM: 199MB
-   📐 MAX GRAD: c_v=16.8371
-💾 Auto-Saving Checkpoint...
-➡️  Step 1050 | Global: 161049 | Combined Loss: 2.0173 | BPC: 2.768 | LR: 7.2e-5 | RAM: 199MB
-   📐 MAX GRAD: c_v=11.8449
-➡️  Step 1100 | Global: 161099 | Combined Loss: 2.0299 | BPC: 2.788 | LR: 7.2e-5 | RAM: 201MB
-   📐 MAX GRAD: c_v=6.2127
-➡️  Step 1150 | Global: 161149 | Combined Loss: 2.1052 | BPC: 2.895 | LR: 7.1e-5 | RAM: 201MB
-   📐 MAX GRAD: c_v=12.1955
-➡️  Step 1200 | Global: 161199 | Combined Loss: 2.1286 | BPC: 2.93 | LR: 7.1e-5 | RAM: 203MB
-   📐 MAX GRAD: c_v=10.1403
-➡️  Step 1250 | Global: 161249 | Combined Loss: 2.1174 | BPC: 2.914 | LR: 7.1e-5 | RAM: 204MB
-   📐 MAX GRAD: c_v=6.8704
-➡️  Step 1300 | Global: 161299 | Combined Loss: 2.0519 | BPC: 2.817 | LR: 7.1e-5 | RAM: 206MB
-   📐 MAX GRAD: c_v=7.0223
-➡️  Step 1350 | Global: 161349 | Combined Loss: 1.9407 | BPC: 2.657 | LR: 7.1e-5 | RAM: 206MB
-   📐 MAX GRAD: c_v=5.8409
-➡️  Step 1400 | Global: 161399 | Combined Loss: 2.1551 | BPC: 2.968 | LR: 7.1e-5 | RAM: 208MB
-   📐 MAX GRAD: c_v=8.3966
-➡️  Step 1450 | Global: 161449 | Combined Loss: 2.1118 | BPC: 2.904 | LR: 7.1e-5 | RAM: 209MB
-   📐 MAX GRAD: c_v=10.586
-➡️  Step 1500 | Global: 161499 | Combined Loss: 2.1211 | BPC: 2.921 | LR: 7.1e-5 | RAM: 211MB
-   📐 MAX GRAD: c_v=7.7557
-➡️  Step 1550 | Global: 161549 | Combined Loss: 2.0083 | BPC: 2.755 | LR: 7.1e-5 | RAM: 211MB
-   📐 MAX GRAD: c_v=6.9998
-➡️  Step 1600 | Global: 161599 | Combined Loss: 2.1489 | BPC: 2.96 | LR: 7.1e-5 | RAM: 213MB
-   📐 MAX GRAD: c_v=6.9177
-➡️  Step 1650 | Global: 161649 | Combined Loss: 2.1981 | BPC: 3.03 | LR: 7.1e-5 | RAM: 214MB
-   📐 MAX GRAD: c_v=9.0817
-➡️  Step 1700 | Global: 161699 | Combined Loss: 2.0842 | BPC: 2.866 | LR: 7.1e-5 | RAM: 217MB
-   📐 MAX GRAD: c_v=7.1977
-➡️  Step 1750 | Global: 161749 | Combined Loss: 2.0725 | BPC: 2.849 | LR: 7.0e-5 | RAM: 217MB
-   📐 MAX GRAD: c_v=5.8678
-➡️  Step 1800 | Global: 161799 | Combined Loss: 1.9487 | BPC: 2.668 | LR: 7.0e-5 | RAM: 219MB
-   📐 MAX GRAD: c_v=6.9721
-➡️  Step 1850 | Global: 161849 | Combined Loss: 2.1143 | BPC: 2.909 | LR: 7.0e-5 | RAM: 223MB
-   📐 MAX GRAD: c_v=11.9242
-➡️  Step 1900 | Global: 161899 | Combined Loss: 2.1153 | BPC: 2.909 | LR: 7.0e-5 | RAM: 225MB
-   📐 MAX GRAD: c_v=9.6102
-➡️  Step 1950 | Global: 161949 | Combined Loss: 1.9018 | BPC: 2.6 | LR: 7.0e-5 | RAM: 225MB
-   📐 MAX GRAD: c_v=9.0271
-➡️  Step 2000 | Global: 161999 | Combined Loss: 2.157 | BPC: 2.971 | LR: 7.0e-5 | RAM: 227MB
-   📐 MAX GRAD: c_v=10.3302
-💾 Auto-Saving Checkpoint...
-➡️  Step 2050 | Global: 162049 | Combined Loss: 2.1907 | BPC: 3.022 | LR: 7.0e-5 | RAM: 228MB
-   📐 MAX GRAD: c_v=8.1106
-➡️  Step 2100 | Global: 162099 | Combined Loss: 2.0872 | BPC: 2.869 | LR: 7.0e-5 | RAM: 229MB
-   📐 MAX GRAD: c_v=11.1547
-➡️  Step 2150 | Global: 162149 | Combined Loss: 2.1759 | BPC: 2.997 | LR: 7.0e-5 | RAM: 230MB
-   📐 MAX GRAD: c_v=8.0345
-➡️  Step 2200 | Global: 162199 | Combined Loss: 2.1057 | BPC: 2.896 | LR: 7.0e-5 | RAM: 232MB
-   📐 MAX GRAD: c_v=14.3882
-➡️  Step 2250 | Global: 162249 | Combined Loss: 2.0785 | BPC: 2.856 | LR: 7.0e-5 | RAM: 233MB
-   📐 MAX GRAD: c_v=7.5211
-➡️  Step 2300 | Global: 162299 | Combined Loss: 2.196 | BPC: 3.029 | LR: 7.0e-5 | RAM: 234MB
-   📐 MAX GRAD: c_v=8.8277
-➡️  Step 2350 | Global: 162349 | Combined Loss: 2.3091 | BPC: 3.191 | LR: 6.9e-5 | RAM: 235MB
-   📐 MAX GRAD: c_v=9.3323
-➡️  Step 2400 | Global: 162399 | Combined Loss: 2.1451 | BPC: 2.951 | LR: 6.9e-5 | RAM: 237MB
-   📐 MAX GRAD: c_v=9.0033
-➡️  Step 2450 | Global: 162449 | Combined Loss: 2.143 | BPC: 2.951 | LR: 6.9e-5 | RAM: 237MB
-   📐 MAX GRAD: c_v=9.1932
-➡️  Step 2500 | Global: 162499 | Combined Loss: 2.1408 | BPC: 2.948 | LR: 6.9e-5 | RAM: 239MB
-   📐 MAX GRAD: c_v=6.7229
-➡️  Step 2550 | Global: 162549 | Combined Loss: 2.1467 | BPC: 2.956 | LR: 6.9e-5 | RAM: 240MB
-   📐 MAX GRAD: d_v=6.0799
-➡️  Step 2600 | Global: 162599 | Combined Loss: 2.0814 | BPC: 2.86 | LR: 6.9e-5 | RAM: 242MB
-   📐 MAX GRAD: c_v=7.3536
-➡️  Step 2650 | Global: 162649 | Combined Loss: 2.0428 | BPC: 2.806 | LR: 6.9e-5 | RAM: 242MB
-   📐 MAX GRAD: c_v=6.7234
-➡️  Step 2700 | Global: 162699 | Combined Loss: 2.2135 | BPC: 3.053 | LR: 6.9e-5 | RAM: 244MB
-   📐 MAX GRAD: c_v=7.0254
-➡️  Step 2750 | Global: 162749 | Combined Loss: 2.09 | BPC: 2.875 | LR: 6.9e-5 | RAM: 245MB
-   📐 MAX GRAD: c_v=11.8485
-➡️  Step 2800 | Global: 162799 | Combined Loss: 2.165 | BPC: 2.983 | LR: 6.9e-5 | RAM: 247MB
-   📐 MAX GRAD: c_v=7.6986
-➡️  Step 2850 | Global: 162849 | Combined Loss: 1.9849 | BPC: 2.721 | LR: 6.9e-5 | RAM: 247MB
-   📐 MAX GRAD: c_v=9.0522
-➡️  Step 2900 | Global: 162899 | Combined Loss: 2.1026 | BPC: 2.891 | LR: 6.9e-5 | RAM: 249MB
-   📐 MAX GRAD: c_v=7.1273
-➡️  Step 2950 | Global: 162949 | Combined Loss: 2.1907 | BPC: 3.021 | LR: 6.8e-5 | RAM: 250MB
-   📐 MAX GRAD: c_v=6.1553
-➡️  Step 3000 | Global: 162999 | Combined Loss: 2.0302 | BPC: 2.788 | LR: 6.8e-5 | RAM: 251MB
-   📐 MAX GRAD: c_v=6.4385
-💾 Auto-Saving Checkpoint...
-➡️  Step 3050 | Global: 163049 | Combined Loss: 2.0393 | BPC: 2.8 | LR: 6.8e-5 | RAM: 252MB
-   📐 MAX GRAD: c_v=7.6792
-➡️  Step 3100 | Global: 163099 | Combined Loss: 2.1147 | BPC: 2.909 | LR: 6.8e-5 | RAM: 254MB
-   📐 MAX GRAD: c_v=5.4438
-➡️  Step 3150 | Global: 163149 | Combined Loss: 2.2248 | BPC: 3.067 | LR: 6.8e-5 | RAM: 254MB
-   📐 MAX GRAD: c_v=11.2156
-➡️  Step 3200 | Global: 163199 | Combined Loss: 1.9738 | BPC: 2.705 | LR: 6.8e-5 | RAM: 256MB
-   📐 MAX GRAD: c_v=9.4475
-➡️  Step 3250 | Global: 163249 | Combined Loss: 1.9826 | BPC: 2.718 | LR: 6.8e-5 | RAM: 257MB
-   📐 MAX GRAD: c_v=6.2268
-➡️  Step 3300 | Global: 163299 | Combined Loss: 2.1944 | BPC: 3.025 | LR: 6.8e-5 | RAM: 259MB
-   📐 MAX GRAD: c_v=11.1432
-➡️  Step 3350 | Global: 163349 | Combined Loss: 2.0458 | BPC: 2.81 | LR: 6.8e-5 | RAM: 259MB
-   📐 MAX GRAD: c_v=6.2408
-➡️  Step 3400 | Global: 163399 | Combined Loss: 2.0786 | BPC: 2.858 | LR: 6.8e-5 | RAM: 261MB
-   📐 MAX GRAD: c_v=8.8589
-➡️  Step 3450 | Global: 163449 | Combined Loss: 2.0017 | BPC: 2.745 | LR: 6.8e-5 | RAM: 261MB
-   📐 MAX GRAD: c_v=7.1247
-➡️  Step 3500 | Global: 163499 | Combined Loss: 2.3034 | BPC: 3.183 | LR: 6.8e-5 | RAM: 263MB
-   📐 MAX GRAD: c_v=9.059
-➡️  Step 3550 | Global: 163549 | Combined Loss: 2.2278 | BPC: 3.074 | LR: 6.7e-5 | RAM: 264MB
-   📐 MAX GRAD: c_v=7.0925
-➡️  Step 3600 | Global: 163599 | Combined Loss: 2.1632 | BPC: 2.98 | LR: 6.7e-5 | RAM: 265MB
-   📐 MAX GRAD: c_v=8.2384
-➡️  Step 3650 | Global: 163649 | Combined Loss: 2.0303 | BPC: 2.788 | LR: 6.7e-5 | RAM: 266MB
-   📐 MAX GRAD: d_v=5.6149
-➡️  Step 3700 | Global: 163699 | Combined Loss: 1.9332 | BPC: 2.645 | LR: 6.7e-5 | RAM: 268MB
-   📐 MAX GRAD: c_v=12.6571
-➡️  Step 3750 | Global: 163749 | Combined Loss: 2.0512 | BPC: 2.817 | LR: 6.7e-5 | RAM: 269MB
-   📐 MAX GRAD: c_v=9.4755
-➡️  Step 3800 | Global: 163799 | Combined Loss: 2.1048 | BPC: 2.894 | LR: 6.7e-5 | RAM: 270MB
-   📐 MAX GRAD: c_v=11.5109
-➡️  Step 3850 | Global: 163849 | Combined Loss: 2.0981 | BPC: 2.886 | LR: 6.7e-5 | RAM: 271MB
-   📐 MAX GRAD: c_v=6.6449
-➡️  Step 3900 | Global: 163899 | Combined Loss: 2.1794 | BPC: 3.003 | LR: 6.7e-5 | RAM: 273MB
-   📐 MAX GRAD: c_v=6.3526
-➡️  Step 3950 | Global: 163949 | Combined Loss: 2.2405 | BPC: 3.091 | LR: 6.7e-5 | RAM: 273MB
-   📐 MAX GRAD: c_v=7.3284
-➡️  Step 4000 | Global: 163999 | Combined Loss: 2.143 | BPC: 2.951 | LR: 6.7e-5 | RAM: 275MB
-   📐 MAX GRAD: c_v=14.1192
-💾 Auto-Saving Checkpoint...
-➡️  Step 4050 | Global: 164049 | Combined Loss: 1.9868 | BPC: 2.724 | LR: 6.7e-5 | RAM: 276MB
-   📐 MAX GRAD: c_v=6.6174
-➡️  Step 4100 | Global: 164099 | Combined Loss: 1.9987 | BPC: 2.742 | LR: 6.7e-5 | RAM: 277MB
-   📐 MAX GRAD: c_v=7.7334
-➡️  Step 4150 | Global: 164149 | Combined Loss: 2.0059 | BPC: 2.751 | LR: 6.7e-5 | RAM: 278MB
-   📐 MAX GRAD: c_v=5.8679
-➡️  Step 4200 | Global: 164199 | Combined Loss: 2.0609 | BPC: 2.831 | LR: 6.6e-5 | RAM: 280MB
-   📐 MAX GRAD: c_v=15.3173
-➡️  Step 4250 | Global: 164249 | Combined Loss: 2.1433 | BPC: 2.951 | LR: 6.6e-5 | RAM: 280MB
-   📐 MAX GRAD: c_v=7.7377
-➡️  Step 4300 | Global: 164299 | Combined Loss: 2.1549 | BPC: 2.968 | LR: 6.6e-5 | RAM: 282MB
-   📐 MAX GRAD: c_v=8.1583
-➡️  Step 4350 | Global: 164349 | Combined Loss: 2.0134 | BPC: 2.762 | LR: 6.6e-5 | RAM: 283MB
-   📐 MAX GRAD: c_v=13.9862
-➡️  Step 4400 | Global: 164399 | Combined Loss: 2.1435 | BPC: 2.949 | LR: 6.6e-5 | RAM: 285MB
-   📐 MAX GRAD: c_v=9.7061
-➡️  Step 4450 | Global: 164449 | Combined Loss: 2.1717 | BPC: 2.994 | LR: 6.6e-5 | RAM: 285MB
-   📐 MAX GRAD: c_v=6.349
-➡️  Step 4500 | Global: 164499 | Combined Loss: 2.0059 | BPC: 2.751 | LR: 6.6e-5 | RAM: 287MB
-   📐 MAX GRAD: c_v=6.3474
-➡️  Step 4550 | Global: 164549 | Combined Loss: 2.0336 | BPC: 2.791 | LR: 6.6e-5 | RAM: 288MB
-   📐 MAX GRAD: c_v=9.0123
-➡️  Step 4600 | Global: 164599 | Combined Loss: 2.1759 | BPC: 2.998 | LR: 6.6e-5 | RAM: 290MB
-   📐 MAX GRAD: c_v=6.0416
-➡️  Step 4650 | Global: 164649 | Combined Loss: 1.9214 | BPC: 2.629 | LR: 6.6e-5 | RAM: 290MB
-   📐 MAX GRAD: c_v=7.104
-➡️  Step 4700 | Global: 164699 | Combined Loss: 2.0892 | BPC: 2.874 | LR: 6.6e-5 | RAM: 292MB
-   📐 MAX GRAD: c_v=7.6251
-➡️  Step 4750 | Global: 164749 | Combined Loss: 2.1487 | BPC: 2.96 | LR: 6.6e-5 | RAM: 298MB
-   📐 MAX GRAD: c_v=10.7206
-➡️  Step 4800 | Global: 164799 | Combined Loss: 2.1348 | BPC: 2.939 | LR: 6.5e-5 | RAM: 300MB
-   📐 MAX GRAD: c_v=9.2365
-➡️  Step 4850 | Global: 164849 | Combined Loss: 2.2478 | BPC: 3.102 | LR: 6.5e-5 | RAM: 300MB
-   📐 MAX GRAD: c_v=11.8978
-➡️  Step 4900 | Global: 164899 | Combined Loss: 2.1169 | BPC: 2.913 | LR: 6.5e-5 | RAM: 302MB
-   📐 MAX GRAD: c_v=7.1822
-➡️  Step 4950 | Global: 164949 | Combined Loss: 2.072 | BPC: 2.846 | LR: 6.5e-5 | RAM: 303MB
-   📐 MAX GRAD: c_v=11.1097
-➡️  Step 5000 | Global: 164999 | Combined Loss: 2.172 | BPC: 2.995 | LR: 6.5e-5 | RAM: 304MB
-   📐 MAX GRAD: d_v=6.6839
-💾 Auto-Saving Checkpoint...
-➡️  Step 5050 | Global: 165049 | Combined Loss: 2.1423 | BPC: 2.95 | LR: 6.5e-5 | RAM: 305MB
-   📐 MAX GRAD: c_v=7.5352
-➡️  Step 5100 | Global: 165099 | Combined Loss: 2.0052 | BPC: 2.75 | LR: 6.5e-5 | RAM: 307MB
-   📐 MAX GRAD: c_v=8.9071
-➡️  Step 5150 | Global: 165149 | Combined Loss: 2.1412 | BPC: 2.948 | LR: 6.5e-5 | RAM: 307MB
-   📐 MAX GRAD: c_v=8.4404
-➡️  Step 5200 | Global: 165199 | Combined Loss: 2.1315 | BPC: 2.935 | LR: 6.5e-5 | RAM: 309MB
-   📐 MAX GRAD: c_v=7.142
-➡️  Step 5250 | Global: 165249 | Combined Loss: 2.1769 | BPC: 3.0 | LR: 6.5e-5 | RAM: 310MB
-   📐 MAX GRAD: c_v=6.01
-➡️  Step 5300 | Global: 165299 | Combined Loss: 2.1811 | BPC: 3.004 | LR: 6.5e-5 | RAM: 311MB
-   📐 MAX GRAD: c_v=8.6345
-➡️  Step 5350 | Global: 165349 | Combined Loss: 2.0775 | BPC: 2.856 | LR: 6.5e-5 | RAM: 312MB
-   📐 MAX GRAD: c_v=8.6359
-➡️  Step 5400 | Global: 165399 | Combined Loss: 2.089 | BPC: 2.873 | LR: 6.4e-5 | RAM: 314MB
-   📐 MAX GRAD: d_v=5.3861
-➡️  Step 5450 | Global: 165449 | Combined Loss: 2.2227 | BPC: 3.067 | LR: 6.4e-5 | RAM: 314MB
-   📐 MAX GRAD: c_v=8.7943
-➡️  Step 5500 | Global: 165499 | Combined Loss: 2.1023 | BPC: 2.893 | LR: 6.4e-5 | RAM: 316MB
-   📐 MAX GRAD: c_v=7.2704
-➡️  Step 5550 | Global: 165549 | Combined Loss: 2.1147 | BPC: 2.91 | LR: 6.4e-5 | RAM: 317MB
-   📐 MAX GRAD: c_v=7.893
-➡️  Step 5600 | Global: 165599 | Combined Loss: 2.0357 | BPC: 2.795 | LR: 6.4e-5 | RAM: 319MB
-   📐 MAX GRAD: c_v=9.4879
-➡️  Step 5650 | Global: 165649 | Combined Loss: 2.1783 | BPC: 3.001 | LR: 6.4e-5 | RAM: 319MB
-   📐 MAX GRAD: c_v=6.6582
-➡️  Step 5700 | Global: 165699 | Combined Loss: 2.193 | BPC: 3.021 | LR: 6.4e-5 | RAM: 321MB
-   📐 MAX GRAD: c_v=9.0098
-➡️  Step 5750 | Global: 165749 | Combined Loss: 2.1607 | BPC: 2.976 | LR: 6.4e-5 | RAM: 322MB
-   📐 MAX GRAD: c_v=9.5768
-➡️  Step 5800 | Global: 165799 | Combined Loss: 2.014 | BPC: 2.764 | LR: 6.4e-5 | RAM: 323MB
-   📐 MAX GRAD: c_v=8.3101
-➡️  Step 5850 | Global: 165849 | Combined Loss: 2.1804 | BPC: 3.005 | LR: 6.4e-5 | RAM: 324MB
-   📐 MAX GRAD: c_v=7.99
-➡️  Step 5900 | Global: 165899 | Combined Loss: 2.2241 | BPC: 3.069 | LR: 6.4e-5 | RAM: 326MB
-   📐 MAX GRAD: c_v=11.6112
-➡️  Step 5950 | Global: 165949 | Combined Loss: 2.1393 | BPC: 2.947 | LR: 6.4e-5 | RAM: 326MB
-   📐 MAX GRAD: c_v=7.3001
-➡️  Step 6000 | Global: 165999 | Combined Loss: 2.165 | BPC: 2.982 | LR: 6.4e-5 | RAM: 328MB
-   📐 MAX GRAD: c_v=11.219
-💾 Auto-Saving Checkpoint...
-➡️  Step 6050 | Global: 166049 | Combined Loss: 2.1059 | BPC: 2.897 | LR: 6.3e-5 | RAM: 329MB
-   📐 MAX GRAD: c_v=6.8017
-➡️  Step 6100 | Global: 166099 | Combined Loss: 2.1356 | BPC: 2.938 | LR: 6.3e-5 | RAM: 331MB
-   📐 MAX GRAD: c_v=6.8568
-➡️  Step 6150 | Global: 166149 | Combined Loss: 2.0188 | BPC: 2.771 | LR: 6.3e-5 | RAM: 331MB
-   📐 MAX GRAD: c_v=9.1977
-➡️  Step 6200 | Global: 166199 | Combined Loss: 2.0479 | BPC: 2.812 | LR: 6.3e-5 | RAM: 333MB
-   📐 MAX GRAD: d_v=6.8028
-➡️  Step 6250 | Global: 166249 | Combined Loss: 2.0446 | BPC: 2.808 | LR: 6.3e-5 | RAM: 334MB
-   📐 MAX GRAD: c_v=8.0772
-➡️  Step 6300 | Global: 166299 | Combined Loss: 2.1031 | BPC: 2.893 | LR: 6.3e-5 | RAM: 335MB
-   📐 MAX GRAD: c_v=8.9071
-➡️  Step 6350 | Global: 166349 | Combined Loss: 2.1725 | BPC: 2.994 | LR: 6.3e-5 | RAM: 336MB
-   📐 MAX GRAD: c_v=12.8993
-➡️  Step 6400 | Global: 166399 | Combined Loss: 2.1488 | BPC: 2.958 | LR: 6.3e-5 | RAM: 338MB
-   📐 MAX GRAD: c_v=6.4558
-➡️  Step 6450 | Global: 166449 | Combined Loss: 2.1331 | BPC: 2.937 | LR: 6.3e-5 | RAM: 338MB
-   📐 MAX GRAD: c_v=14.5776
-➡️  Step 6500 | Global: 166499 | Combined Loss: 2.0704 | BPC: 2.846 | LR: 6.3e-5 | RAM: 340MB
-   📐 MAX GRAD: c_v=8.4343
-➡️  Step 6550 | Global: 166549 | Combined Loss: 2.1635 | BPC: 2.981 | LR: 6.3e-5 | RAM: 341MB
-   📐 MAX GRAD: c_v=6.4102
-➡️  Step 6600 | Global: 166599 | Combined Loss: 1.9178 | BPC: 2.623 | LR: 6.3e-5 | RAM: 343MB
-   📐 MAX GRAD: c_v=7.9081
-➡️  Step 6650 | Global: 166649 | Combined Loss: 2.1959 | BPC: 3.027 | LR: 6.2e-5 | RAM: 343MB
-   📐 MAX GRAD: d_v=6.0765
-➡️  Step 6700 | Global: 166699 | Combined Loss: 2.1991 | BPC: 3.033 | LR: 6.2e-5 | RAM: 345MB
-   📐 MAX GRAD: c_v=8.3215
-➡️  Step 6750 | Global: 166749 | Combined Loss: 2.1504 | BPC: 2.963 | LR: 6.2e-5 | RAM: 346MB
-   📐 MAX GRAD: c_v=8.4499
-➡️  Step 6800 | Global: 166799 | Combined Loss: 2.2591 | BPC: 3.119 | LR: 6.2e-5 | RAM: 348MB
-   📐 MAX GRAD: c_v=8.3644
-➡️  Step 6850 | Global: 166849 | Combined Loss: 2.1076 | BPC: 2.898 | LR: 6.2e-5 | RAM: 348MB
-   📐 MAX GRAD: c_v=11.8748
-➡️  Step 6900 | Global: 166899 | Combined Loss: 2.0127 | BPC: 2.762 | LR: 6.2e-5 | RAM: 350MB
-   📐 MAX GRAD: c_v=7.8259
-➡️  Step 6950 | Global: 166949 | Combined Loss: 2.1829 | BPC: 3.009 | LR: 6.2e-5 | RAM: 350MB
-   📐 MAX GRAD: c_v=7.2841
-➡️  Step 7000 | Global: 166999 | Combined Loss: 2.2316 | BPC: 3.079 | LR: 6.2e-5 | RAM: 352MB
-   📐 MAX GRAD: c_v=10.0245
-💾 Auto-Saving Checkpoint...
-➡️  Step 7050 | Global: 167049 | Combined Loss: 2.1307 | BPC: 2.931 | LR: 6.2e-5 | RAM: 353MB
-   📐 MAX GRAD: c_v=7.6778
-➡️  Step 7100 | Global: 167099 | Combined Loss: 2.057 | BPC: 2.825 | LR: 6.2e-5 | RAM: 355MB
-   📐 MAX GRAD: c_v=13.5478
-➡️  Step 7150 | Global: 167149 | Combined Loss: 2.1408 | BPC: 2.946 | LR: 6.2e-5 | RAM: 355MB
-   📐 MAX GRAD: c_v=12.0935
-➡️  Step 7200 | Global: 167199 | Combined Loss: 2.0467 | BPC: 2.811 | LR: 6.2e-5 | RAM: 357MB
-   📐 MAX GRAD: c_v=8.2823
-➡️  Step 7250 | Global: 167249 | Combined Loss: 1.9622 | BPC: 2.687 | LR: 6.2e-5 | RAM: 358MB
-   📐 MAX GRAD: c_v=10.5131
-➡️  Step 7300 | Global: 167299 | Combined Loss: 2.1836 | BPC: 3.009 | LR: 6.1e-5 | RAM: 360MB
-   📐 MAX GRAD: c_v=8.9855
-➡️  Step 7350 | Global: 167349 | Combined Loss: 2.2276 | BPC: 3.072 | LR: 6.1e-5 | RAM: 360MB
-   📐 MAX GRAD: c_v=22.787
-➡️  Step 7400 | Global: 167399 | Combined Loss: 2.0497 | BPC: 2.817 | LR: 6.1e-5 | RAM: 362MB
-   📐 MAX GRAD: d_v=6.8209
-➡️  Step 7450 | Global: 167449 | Combined Loss: 1.99 | BPC: 2.728 | LR: 6.1e-5 | RAM: 362MB
-   📐 MAX GRAD: c_v=7.5801
-➡️  Step 7500 | Global: 167499 | Combined Loss: 2.1752 | BPC: 2.998 | LR: 6.1e-5 | RAM: 364MB
-   📐 MAX GRAD: c_v=9.2449
-➡️  Step 7550 | Global: 167549 | Combined Loss: 2.0224 | BPC: 2.777 | LR: 6.1e-5 | RAM: 365MB
-   📐 MAX GRAD: c_v=7.4859
-➡️  Step 7600 | Global: 167599 | Combined Loss: 2.0297 | BPC: 2.788 | LR: 6.1e-5 | RAM: 367MB
-   📐 MAX GRAD: c_v=8.5865
-➡️  Step 7650 | Global: 167649 | Combined Loss: 2.2152 | BPC: 3.056 | LR: 6.1e-5 | RAM: 367MB
-   📐 MAX GRAD: c_v=9.2729
-➡️  Step 7700 | Global: 167699 | Combined Loss: 2.1332 | BPC: 2.934 | LR: 6.1e-5 | RAM: 369MB
-   📐 MAX GRAD: c_v=10.0578
-➡️  Step 7750 | Global: 167749 | Combined Loss: 2.0836 | BPC: 2.864 | LR: 6.1e-5 | RAM: 370MB
-   📐 MAX GRAD: d_v=6.5558
-➡️  Step 7800 | Global: 167799 | Combined Loss: 2.0875 | BPC: 2.87 | LR: 6.1e-5 | RAM: 371MB
-   📐 MAX GRAD: c_v=9.4983
-➡️  Step 7850 | Global: 167849 | Combined Loss: 2.1157 | BPC: 2.911 | LR: 6.1e-5 | RAM: 372MB
-   📐 MAX GRAD: c_v=9.6189
-➡️  Step 7900 | Global: 167899 | Combined Loss: 1.9182 | BPC: 2.624 | LR: 6.0e-5 | RAM: 374MB
-   📐 MAX GRAD: c_v=7.5244
-➡️  Step 7950 | Global: 167949 | Combined Loss: 2.0634 | BPC: 2.835 | LR: 6.0e-5 | RAM: 374MB
-   📐 MAX GRAD: c_v=8.4062
-➡️  Step 8000 | Global: 167999 | Combined Loss: 2.0902 | BPC: 2.873 | LR: 6.0e-5 | RAM: 377MB
-   📐 MAX GRAD: c_v=8.36
-💾 Auto-Saving Checkpoint...
-➡️  Step 8050 | Global: 168049 | Combined Loss: 2.1937 | BPC: 3.025 | LR: 6.0e-5 | RAM: 378MB
-   📐 MAX GRAD: c_v=12.1345
-➡️  Step 8100 | Global: 168099 | Combined Loss: 2.1181 | BPC: 2.913 | LR: 6.0e-5 | RAM: 379MB
-   📐 MAX GRAD: c_v=10.3754
-➡️  Step 8150 | Global: 168149 | Combined Loss: 2.161 | BPC: 2.977 | LR: 6.0e-5 | RAM: 380MB
-   📐 MAX GRAD: c_v=7.4647
-➡️  Step 8200 | Global: 168199 | Combined Loss: 1.9781 | BPC: 2.711 | LR: 6.0e-5 | RAM: 382MB
-   📐 MAX GRAD: c_v=7.3788
-➡️  Step 8250 | Global: 168249 | Combined Loss: 2.2044 | BPC: 3.039 | LR: 6.0e-5 | RAM: 391MB
-   📐 MAX GRAD: c_v=17.7947
-➡️  Step 8300 | Global: 168299 | Combined Loss: 2.0673 | BPC: 2.842 | LR: 6.0e-5 | RAM: 392MB
-   📐 MAX GRAD: c_v=9.0153
-➡️  Step 8350 | Global: 168349 | Combined Loss: 2.1811 | BPC: 3.006 | LR: 6.0e-5 | RAM: 393MB
-   📐 MAX GRAD: c_v=6.7057
-➡️  Step 8400 | Global: 168399 | Combined Loss: 2.1171 | BPC: 2.912 | LR: 6.0e-5 | RAM: 395MB
-   📐 MAX GRAD: c_v=10.837
-➡️  Step 8450 | Global: 168449 | Combined Loss: 2.2388 | BPC: 3.091 | LR: 6.0e-5 | RAM: 395MB
-   📐 MAX GRAD: c_v=8.3981
-➡️  Step 8500 | Global: 168499 | Combined Loss: 2.2669 | BPC: 3.131 | LR: 6.0e-5 | RAM: 397MB
-   📐 MAX GRAD: c_v=7.8651
-➡️  Step 8550 | Global: 168549 | Combined Loss: 2.0353 | BPC: 2.793 | LR: 5.9e-5 | RAM: 398MB
-   📐 MAX GRAD: c_v=9.0653
-➡️  Step 8600 | Global: 168599 | Combined Loss: 2.0896 | BPC: 2.873 | LR: 5.9e-5 | RAM: 400MB
-   📐 MAX GRAD: d_v=7.5135
-➡️  Step 8650 | Global: 168649 | Combined Loss: 2.1255 | BPC: 2.925 | LR: 5.9e-5 | RAM: 400MB
-   📐 MAX GRAD: c_v=7.4878
-➡️  Step 8700 | Global: 168699 | Combined Loss: 2.1146 | BPC: 2.91 | LR: 5.9e-5 | RAM: 402MB
-   📐 MAX GRAD: c_v=9.1314
-➡️  Step 8750 | Global: 168749 | Combined Loss: 1.9722 | BPC: 2.702 | LR: 5.9e-5 | RAM: 403MB
-   📐 MAX GRAD: c_v=7.5177
-➡️  Step 8800 | Global: 168799 | Combined Loss: 2.031 | BPC: 2.788 | LR: 5.9e-5 | RAM: 404MB
-   📐 MAX GRAD: c_v=6.0436
-➡️  Step 8850 | Global: 168849 | Combined Loss: 2.1951 | BPC: 3.026 | LR: 5.9e-5 | RAM: 405MB
-   📐 MAX GRAD: c_v=7.0792
-➡️  Step 8900 | Global: 168899 | Combined Loss: 2.0587 | BPC: 2.829 | LR: 5.9e-5 | RAM: 407MB
-   📐 MAX GRAD: c_v=10.6868
-➡️  Step 8950 | Global: 168949 | Combined Loss: 2.1531 | BPC: 2.967 | LR: 5.9e-5 | RAM: 407MB
-   📐 MAX GRAD: c_v=7.5917
-➡️  Step 9000 | Global: 168999 | Combined Loss: 2.2038 | BPC: 3.037 | LR: 5.9e-5 | RAM: 409MB
-   📐 MAX GRAD: c_v=9.427
-💾 Auto-Saving Checkpoint...
-➡️  Step 9050 | Global: 169049 | Combined Loss: 2.155 | BPC: 2.968 | LR: 5.9e-5 | RAM: 410MB
-   📐 MAX GRAD: c_v=7.7464
-➡️  Step 9100 | Global: 169099 | Combined Loss: 2.126 | BPC: 2.925 | LR: 5.9e-5 | RAM: 412MB
-   📐 MAX GRAD: c_v=9.8417
-➡️  Step 9150 | Global: 169149 | Combined Loss: 2.0821 | BPC: 2.862 | LR: 5.9e-5 | RAM: 412MB
-   📐 MAX GRAD: c_v=8.0809
-➡️  Step 9200 | Global: 169199 | Combined Loss: 2.0531 | BPC: 2.82 | LR: 5.8e-5 | RAM: 414MB
-   📐 MAX GRAD: c_v=8.2331
-➡️  Step 9250 | Global: 169249 | Combined Loss: 2.229 | BPC: 3.076 | LR: 5.8e-5 | RAM: 415MB
-   📐 MAX GRAD: c_v=8.4866
-➡️  Step 9300 | Global: 169299 | Combined Loss: 2.157 | BPC: 2.971 | LR: 5.8e-5 | RAM: 417MB
-   📐 MAX GRAD: c_v=7.971
-➡️  Step 9350 | Global: 169349 | Combined Loss: 2.0757 | BPC: 2.852 | LR: 5.8e-5 | RAM: 417MB
-   📐 MAX GRAD: c_v=8.9505
-➡️  Step 9400 | Global: 169399 | Combined Loss: 2.0275 | BPC: 2.783 | LR: 5.8e-5 | RAM: 419MB
-   📐 MAX GRAD: c_v=8.2654
-➡️  Step 9450 | Global: 169449 | Combined Loss: 2.0209 | BPC: 2.774 | LR: 5.8e-5 | RAM: 420MB
-   📐 MAX GRAD: c_v=9.4488
-➡️  Step 9500 | Global: 169499 | Combined Loss: 2.0143 | BPC: 2.763 | LR: 5.8e-5 | RAM: 421MB
-   📐 MAX GRAD: c_v=13.4714
-➡️  Step 9550 | Global: 169549 | Combined Loss: 2.0953 | BPC: 2.883 | LR: 5.8e-5 | RAM: 422MB
-   📐 MAX GRAD: c_v=7.7951
-➡️  Step 9600 | Global: 169599 | Combined Loss: 2.1543 | BPC: 2.967 | LR: 5.8e-5 | RAM: 424MB
-   📐 MAX GRAD: c_v=6.7287
-➡️  Step 9650 | Global: 169649 | Combined Loss: 2.134 | BPC: 2.937 | LR: 5.8e-5 | RAM: 424MB
-   📐 MAX GRAD: c_v=6.6519
-➡️  Step 9700 | Global: 169699 | Combined Loss: 2.1131 | BPC: 2.908 | LR: 5.8e-5 | RAM: 426MB
-   📐 MAX GRAD: c_v=8.5395
-➡️  Step 9750 | Global: 169749 | Combined Loss: 1.988 | BPC: 2.727 | LR: 5.8e-5 | RAM: 427MB
-   📐 MAX GRAD: c_v=8.8525
-➡️  Step 9800 | Global: 169799 | Combined Loss: 2.2414 | BPC: 3.096 | LR: 5.7e-5 | RAM: 429MB
-   📐 MAX GRAD: c_v=7.5018
-➡️  Step 9850 | Global: 169849 | Combined Loss: 2.0191 | BPC: 2.771 | LR: 5.7e-5 | RAM: 429MB
-   📐 MAX GRAD: c_v=8.8147
-➡️  Step 9900 | Global: 169899 | Combined Loss: 2.0191 | BPC: 2.771 | LR: 5.7e-5 | RAM: 431MB
-   📐 MAX GRAD: c_v=9.0623
-➡️  Step 9950 | Global: 169949 | Combined Loss: 2.0904 | BPC: 2.875 | LR: 5.7e-5 | RAM: 431MB
-   📐 MAX GRAD: c_v=6.3795
-➡️  Step 10000 | Global: 169999 | Combined Loss: 2.0807 | BPC: 2.86 | LR: 5.7e-5 | RAM: 433MB
-   📐 MAX GRAD: c_v=6.9371
-💾 Auto-Saving Checkpoint...
-➡️  Step 10050 | Global: 170049 | Combined Loss: 2.0782 | BPC: 2.858 | LR: 5.7e-5 | RAM: 434MB
-   📐 MAX GRAD: c_v=9.6717
-➡️  Step 10100 | Global: 170099 | Combined Loss: 1.9919 | BPC: 2.729 | LR: 5.7e-5 | RAM: 436MB
-   📐 MAX GRAD: c_v=11.8476
-➡️  Step 10150 | Global: 170149 | Combined Loss: 2.2438 | BPC: 3.096 | LR: 5.7e-5 | RAM: 436MB
-   📐 MAX GRAD: c_v=7.1347
-➡️  Step 10200 | Global: 170199 | Combined Loss: 2.1972 | BPC: 3.029 | LR: 5.7e-5 | RAM: 438MB
-   📐 MAX GRAD: c_v=8.4898
-➡️  Step 10250 | Global: 170249 | Combined Loss: 2.1347 | BPC: 2.939 | LR: 5.7e-5 | RAM: 438MB
-   📐 MAX GRAD: c_v=10.2189
-➡️  Step 10300 | Global: 170299 | Combined Loss: 2.1665 | BPC: 2.985 | LR: 5.7e-5 | RAM: 440MB
-   📐 MAX GRAD: c_v=10.2109
-➡️  Step 10350 | Global: 170349 | Combined Loss: 2.1454 | BPC: 2.955 | LR: 5.7e-5 | RAM: 441MB
-   📐 MAX GRAD: c_v=7.7452
-➡️  Step 10400 | Global: 170399 | Combined Loss: 1.9716 | BPC: 2.702 | LR: 5.7e-5 | RAM: 443MB
-   📐 MAX GRAD: c_v=6.914
-➡️  Step 10450 | Global: 170449 | Combined Loss: 2.0747 | BPC: 2.851 | LR: 5.6e-5 | RAM: 443MB
-   📐 MAX GRAD: c_v=7.5256
-➡️  Step 10500 | Global: 170499 | Combined Loss: 2.0467 | BPC: 2.811 | LR: 5.6e-5 | RAM: 445MB
-   📐 MAX GRAD: c_v=6.5981
-➡️  Step 10550 | Global: 170549 | Combined Loss: 2.092 | BPC: 2.876 | LR: 5.6e-5 | RAM: 446MB
-   📐 MAX GRAD: c_v=9.7868
-➡️  Step 10600 | Global: 170599 | Combined Loss: 2.0481 | BPC: 2.813 | LR: 5.6e-5 | RAM: 448MB
-   📐 MAX GRAD: c_v=9.0712
-➡️  Step 10650 | Global: 170649 | Combined Loss: 1.9178 | BPC: 2.623 | LR: 5.6e-5 | RAM: 448MB
-   📐 MAX GRAD: c_v=7.9627
-➡️  Step 10700 | Global: 170699 | Combined Loss: 2.1172 | BPC: 2.914 | LR: 5.6e-5 | RAM: 450MB
-   📐 MAX GRAD: c_v=9.1119
-➡️  Step 10750 | Global: 170749 | Combined Loss: 2.1826 | BPC: 3.009 | LR: 5.6e-5 | RAM: 454MB
-   📐 MAX GRAD: c_v=11.9964
-➡️  Step 10800 | Global: 170799 | Combined Loss: 2.089 | BPC: 2.872 | LR: 5.6e-5 | RAM: 452MB
-   📐 MAX GRAD: c_v=9.3348
-➡️  Step 10850 | Global: 170849 | Combined Loss: 1.9368 | BPC: 2.651 | LR: 5.6e-5 | RAM: 453MB
-   📐 MAX GRAD: c_v=7.8257
-➡️  Step 10900 | Global: 170899 | Combined Loss: 2.2388 | BPC: 3.09 | LR: 5.6e-5 | RAM: 455MB
-   📐 MAX GRAD: c_v=8.6045
-➡️  Step 10950 | Global: 170949 | Combined Loss: 2.0642 | BPC: 2.837 | LR: 5.6e-5 | RAM: 455MB
-   📐 MAX GRAD: c_v=6.0266
-➡️  Step 11000 | Global: 170999 | Combined Loss: 2.0099 | BPC: 2.76 | LR: 5.6e-5 | RAM: 457MB
-   📐 MAX GRAD: c_v=8.4997
-💾 Auto-Saving Checkpoint...
-➡️  Step 11050 | Global: 171049 | Combined Loss: 2.154 | BPC: 2.967 | LR: 5.6e-5 | RAM: 458MB
-   📐 MAX GRAD: c_v=8.1413
-➡️  Step 11100 | Global: 171099 | Combined Loss: 2.0667 | BPC: 2.842 | LR: 5.5e-5 | RAM: 460MB
-   📐 MAX GRAD: c_v=8.4555
-➡️  Step 11150 | Global: 171149 | Combined Loss: 2.0315 | BPC: 2.789 | LR: 5.5e-5 | RAM: 460MB
-   📐 MAX GRAD: c_v=6.8439
-➡️  Step 11200 | Global: 171199 | Combined Loss: 2.1509 | BPC: 2.962 | LR: 5.5e-5 | RAM: 462MB
-   📐 MAX GRAD: c_v=7.4983
-➡️  Step 11250 | Global: 171249 | Combined Loss: 2.2182 | BPC: 3.058 | LR: 5.5e-5 | RAM: 462MB
-   📐 MAX GRAD: c_v=6.5515
-➡️  Step 11300 | Global: 171299 | Combined Loss: 2.1499 | BPC: 2.961 | LR: 5.5e-5 | RAM: 464MB
-   📐 MAX GRAD: c_v=9.4025
-➡️  Step 11350 | Global: 171349 | Combined Loss: 2.0213 | BPC: 2.773 | LR: 5.5e-5 | RAM: 465MB
-   📐 MAX GRAD: c_v=8.2585
-➡️  Step 11400 | Global: 171399 | Combined Loss: 1.9907 | BPC: 2.728 | LR: 5.5e-5 | RAM: 467MB
-   📐 MAX GRAD: c_v=8.2519
-➡️  Step 11450 | Global: 171449 | Combined Loss: 2.1253 | BPC: 2.926 | LR: 5.5e-5 | RAM: 467MB
-   📐 MAX GRAD: c_v=7.0236
-➡️  Step 11500 | Global: 171499 | Combined Loss: 1.9129 | BPC: 2.616 | LR: 5.5e-5 | RAM: 469MB
-   📐 MAX GRAD: c_v=9.1974
-➡️  Step 11550 | Global: 171549 | Combined Loss: 2.1243 | BPC: 2.924 | LR: 5.5e-5 | RAM: 470MB
-   📐 MAX GRAD: c_v=10.5916
-➡️  Step 11600 | Global: 171599 | Combined Loss: 2.1571 | BPC: 2.97 | LR: 5.5e-5 | RAM: 472MB
-   📐 MAX GRAD: c_v=6.8783
-➡️  Step 11650 | Global: 171649 | Combined Loss: 2.2112 | BPC: 3.051 | LR: 5.5e-5 | RAM: 472MB
-   📐 MAX GRAD: c_v=13.7327
-➡️  Step 11700 | Global: 171699 | Combined Loss: 2.1454 | BPC: 2.952 | LR: 5.5e-5 | RAM: 474MB
-   📐 MAX GRAD: c_v=8.4912
-➡️  Step 11750 | Global: 171749 | Combined Loss: 2.0673 | BPC: 2.839 | LR: 5.5e-5 | RAM: 475MB
-   📐 MAX GRAD: c_v=7.9375
-➡️  Step 11800 | Global: 171799 | Combined Loss: 2.1494 | BPC: 2.959 | LR: 5.4e-5 | RAM: 476MB
-   📐 MAX GRAD: c_v=10.0779
-➡️  Step 11850 | Global: 171849 | Combined Loss: 2.2162 | BPC: 3.058 | LR: 5.4e-5 | RAM: 477MB
-   📐 MAX GRAD: c_v=5.9006
-➡️  Step 11900 | Global: 171899 | Combined Loss: 2.1729 | BPC: 2.994 | LR: 5.4e-5 | RAM: 479MB
-   📐 MAX GRAD: c_v=8.604
-➡️  Step 11950 | Global: 171949 | Combined Loss: 2.0454 | BPC: 2.808 | LR: 5.4e-5 | RAM: 479MB
-   📐 MAX GRAD: c_v=6.0323
-➡️  Step 12000 | Global: 171999 | Combined Loss: 2.1724 | BPC: 2.994 | LR: 5.4e-5 | RAM: 481MB
-   📐 MAX GRAD: c_v=7.0008
-💾 Auto-Saving Checkpoint...
-➡️  Step 12050 | Global: 172049 | Combined Loss: 2.0424 | BPC: 2.805 | LR: 5.4e-5 | RAM: 482MB
-   📐 MAX GRAD: c_v=8.1693
-➡️  Step 12100 | Global: 172099 | Combined Loss: 1.9249 | BPC: 2.633 | LR: 5.4e-5 | RAM: 484MB
-   📐 MAX GRAD: c_v=7.6061
-➡️  Step 12150 | Global: 172149 | Combined Loss: 2.1108 | BPC: 2.904 | LR: 5.4e-5 | RAM: 484MB
-   📐 MAX GRAD: c_v=8.9663
-➡️  Step 12200 | Global: 172199 | Combined Loss: 2.0937 | BPC: 2.879 | LR: 5.4e-5 | RAM: 486MB
-   📐 MAX GRAD: c_v=8.0451
-➡️  Step 12250 | Global: 172249 | Combined Loss: 2.207 | BPC: 3.043 | LR: 5.4e-5 | RAM: 486MB
-   📐 MAX GRAD: d_v=7.5457
-➡️  Step 12300 | Global: 172299 | Combined Loss: 1.9783 | BPC: 2.712 | LR: 5.4e-5 | RAM: 488MB
-   📐 MAX GRAD: c_v=8.1983
-➡️  Step 12350 | Global: 172349 | Combined Loss: 1.9845 | BPC: 2.721 | LR: 5.4e-5 | RAM: 489MB
-   📐 MAX GRAD: c_v=8.7962
-➡️  Step 12400 | Global: 172399 | Combined Loss: 2.1609 | BPC: 2.979 | LR: 5.4e-5 | RAM: 491MB
-   📐 MAX GRAD: c_v=9.3512
-➡️  Step 12450 | Global: 172449 | Combined Loss: 1.9886 | BPC: 2.727 | LR: 5.3e-5 | RAM: 491MB
-   📐 MAX GRAD: c_v=8.5377
-➡️  Step 12500 | Global: 172499 | Combined Loss: 2.0306 | BPC: 2.788 | LR: 5.3e-5 | RAM: 493MB
-   📐 MAX GRAD: c_v=8.2695
-➡️  Step 12550 | Global: 172549 | Combined Loss: 2.0461 | BPC: 2.81 | LR: 5.3e-5 | RAM: 494MB
-   📐 MAX GRAD: d_v=5.4664
-➡️  Step 12600 | Global: 172599 | Combined Loss: 1.916 | BPC: 2.621 | LR: 5.3e-5 | RAM: 496MB
-   📐 MAX GRAD: c_v=11.8303
-➡️  Step 12650 | Global: 172649 | Combined Loss: 2.0156 | BPC: 2.767 | LR: 5.3e-5 | RAM: 496MB
-   📐 MAX GRAD: c_v=4.9711
-➡️  Step 12700 | Global: 172699 | Combined Loss: 2.1029 | BPC: 2.892 | LR: 5.3e-5 | RAM: 498MB
-   📐 MAX GRAD: c_v=9.4847
-➡️  Step 12750 | Global: 172749 | Combined Loss: 2.1027 | BPC: 2.893 | LR: 5.3e-5 | RAM: 499MB
-   📐 MAX GRAD: c_v=8.7217
-➡️  Step 12800 | Global: 172799 | Combined Loss: 2.2222 | BPC: 3.066 | LR: 5.3e-5 | RAM: 500MB
-   📐 MAX GRAD: c_v=7.5367
-➡️  Step 12850 | Global: 172849 | Combined Loss: 1.9444 | BPC: 2.663 | LR: 5.3e-5 | RAM: 501MB
-   📐 MAX GRAD: c_v=9.2221
-➡️  Step 12900 | Global: 172899 | Combined Loss: 2.178 | BPC: 3.002 | LR: 5.3e-5 | RAM: 503MB
-   📐 MAX GRAD: c_v=6.0534
-➡️  Step 12950 | Global: 172949 | Combined Loss: 2.0437 | BPC: 2.807 | LR: 5.3e-5 | RAM: 503MB
-   📐 MAX GRAD: c_v=6.2804
-➡️  Step 13000 | Global: 172999 | Combined Loss: 2.1361 | BPC: 2.941 | LR: 5.3e-5 | RAM: 505MB
-   📐 MAX GRAD: c_v=6.7292
-💾 Auto-Saving Checkpoint...
-➡️  Step 13050 | Global: 173049 | Combined Loss: 2.0971 | BPC: 2.883 | LR: 5.3e-5 | RAM: 506MB
-   📐 MAX GRAD: c_v=8.9498
-➡️  Step 13100 | Global: 173099 | Combined Loss: 2.1028 | BPC: 2.893 | LR: 5.2e-5 | RAM: 507MB
-   📐 MAX GRAD: c_v=7.6506
-➡️  Step 13150 | Global: 173149 | Combined Loss: 2.0885 | BPC: 2.872 | LR: 5.2e-5 | RAM: 508MB
-   📐 MAX GRAD: c_v=9.2103
-➡️  Step 13200 | Global: 173199 | Combined Loss: 1.9876 | BPC: 2.726 | LR: 5.2e-5 | RAM: 510MB
-   📐 MAX GRAD: c_v=7.435
-➡️  Step 13250 | Global: 173249 | Combined Loss: 2.1167 | BPC: 2.914 | LR: 5.2e-5 | RAM: 511MB
-   📐 MAX GRAD: c_v=7.4081
-➡️  Step 13300 | Global: 173299 | Combined Loss: 1.9767 | BPC: 2.71 | LR: 5.2e-5 | RAM: 512MB
-   📐 MAX GRAD: c_v=11.4574
-➡️  Step 13350 | Global: 173349 | Combined Loss: 2.2213 | BPC: 3.065 | LR: 5.2e-5 | RAM: 513MB
-   📐 MAX GRAD: c_v=6.8584
-➡️  Step 13400 | Global: 173399 | Combined Loss: 2.1009 | BPC: 2.89 | LR: 5.2e-5 | RAM: 515MB
-   📐 MAX GRAD: c_v=8.2906
-➡️  Step 13450 | Global: 173449 | Combined Loss: 2.2644 | BPC: 3.126 | LR: 5.2e-5 | RAM: 515MB
-   📐 MAX GRAD: c_v=9.6596
-➡️  Step 13500 | Global: 173499 | Combined Loss: 2.1598 | BPC: 2.977 | LR: 5.2e-5 | RAM: 517MB
-   📐 MAX GRAD: c_v=14.313
-➡️  Step 13550 | Global: 173549 | Combined Loss: 1.9766 | BPC: 2.71 | LR: 5.2e-5 | RAM: 519MB
-   📐 MAX GRAD: d_v=5.9525
-➡️  Step 13600 | Global: 173599 | Combined Loss: 2.1181 | BPC: 2.915 | LR: 5.2e-5 | RAM: 521MB
-   📐 MAX GRAD: c_v=8.2739
-➡️  Step 13650 | Global: 173649 | Combined Loss: 2.1315 | BPC: 2.935 | LR: 5.2e-5 | RAM: 522MB
-   📐 MAX GRAD: d_v=6.729
-➡️  Step 13700 | Global: 173699 | Combined Loss: 2.0048 | BPC: 2.751 | LR: 5.2e-5 | RAM: 523MB
-   📐 MAX GRAD: c_v=7.5838
-➡️  Step 13750 | Global: 173749 | Combined Loss: 2.0159 | BPC: 2.766 | LR: 5.2e-5 | RAM: 524MB
-   📐 MAX GRAD: c_v=6.4236
-➡️  Step 13800 | Global: 173799 | Combined Loss: 2.0091 | BPC: 2.756 | LR: 5.1e-5 | RAM: 526MB
-   📐 MAX GRAD: c_v=7.1158
-➡️  Step 13850 | Global: 173849 | Combined Loss: 2.0569 | BPC: 2.826 | LR: 5.1e-5 | RAM: 526MB
-   📐 MAX GRAD: c_v=6.898
-➡️  Step 13900 | Global: 173899 | Combined Loss: 1.9867 | BPC: 2.724 | LR: 5.1e-5 | RAM: 528MB
-   📐 MAX GRAD: c_v=8.716
-➡️  Step 13950 | Global: 173949 | Combined Loss: 2.1112 | BPC: 2.905 | LR: 5.1e-5 | RAM: 529MB
-   📐 MAX GRAD: d_v=5.4963
-➡️  Step 14000 | Global: 173999 | Combined Loss: 2.0032 | BPC: 2.747 | LR: 5.1e-5 | RAM: 530MB
-   📐 MAX GRAD: c_v=8.0597
-💾 Auto-Saving Checkpoint...
-➡️  Step 14050 | Global: 174049 | Combined Loss: 2.1631 | BPC: 2.981 | LR: 5.1e-5 | RAM: 547MB
-   📐 MAX GRAD: c_v=8.5841
-➡️  Step 14100 | Global: 174099 | Combined Loss: 2.1199 | BPC: 2.917 | LR: 5.1e-5 | RAM: 549MB
-   📐 MAX GRAD: c_v=7.3284
-➡️  Step 14150 | Global: 174149 | Combined Loss: 2.1454 | BPC: 2.955 | LR: 5.1e-5 | RAM: 550MB
-   📐 MAX GRAD: c_v=7.8976
-➡️  Step 14200 | Global: 174199 | Combined Loss: 2.086 | BPC: 2.868 | LR: 5.1e-5 | RAM: 552MB
-   📐 MAX GRAD: c_v=8.856
-➡️  Step 14250 | Global: 174249 | Combined Loss: 2.0611 | BPC: 2.832 | LR: 5.1e-5 | RAM: 552MB
-   📐 MAX GRAD: c_v=5.2676
-➡️  Step 14300 | Global: 174299 | Combined Loss: 2.0014 | BPC: 2.745 | LR: 5.1e-5 | RAM: 554MB
-   📐 MAX GRAD: c_v=7.9332
-➡️  Step 14350 | Global: 174349 | Combined Loss: 2.1021 | BPC: 2.891 | LR: 5.1e-5 | RAM: 555MB
-   📐 MAX GRAD: c_v=8.8817
-➡️  Step 14400 | Global: 174399 | Combined Loss: 2.0305 | BPC: 2.787 | LR: 5.1e-5 | RAM: 556MB
-   📐 MAX GRAD: c_v=6.9164
-➡️  Step 14450 | Global: 174449 | Combined Loss: 2.0243 | BPC: 2.779 | LR: 5.0e-5 | RAM: 557MB
-   📐 MAX GRAD: c_v=8.9277
-➡️  Step 14500 | Global: 174499 | Combined Loss: 2.1137 | BPC: 2.908 | LR: 5.0e-5 | RAM: 559MB
-   📐 MAX GRAD: c_v=15.7598
-➡️  Step 14550 | Global: 174549 | Combined Loss: 2.0293 | BPC: 2.784 | LR: 5.0e-5 | RAM: 559MB
-   📐 MAX GRAD: d_v=8.4438
-➡️  Step 14600 | Global: 174599 | Combined Loss: 2.0079 | BPC: 2.755 | LR: 5.0e-5 | RAM: 561MB
-   📐 MAX GRAD: c_v=7.5756
-➡️  Step 14650 | Global: 174649 | Combined Loss: 2.1474 | BPC: 2.958 | LR: 5.0e-5 | RAM: 562MB
-   📐 MAX GRAD: c_v=8.1395
-➡️  Step 14700 | Global: 174699 | Combined Loss: 2.1959 | BPC: 3.028 | LR: 5.0e-5 | RAM: 564MB
-   📐 MAX GRAD: c_v=7.1124
-➡️  Step 14750 | Global: 174749 | Combined Loss: 2.096 | BPC: 2.882 | LR: 5.0e-5 | RAM: 564MB
-   📐 MAX GRAD: c_v=6.3181
-➡️  Step 14800 | Global: 174799 | Combined Loss: 2.1028 | BPC: 2.892 | LR: 5.0e-5 | RAM: 566MB
-   📐 MAX GRAD: c_v=7.3431
-➡️  Step 14850 | Global: 174849 | Combined Loss: 2.1099 | BPC: 2.903 | LR: 5.0e-5 | RAM: 567MB
-   📐 MAX GRAD: c_v=7.6782
-➡️  Step 14900 | Global: 174899 | Combined Loss: 2.1289 | BPC: 2.928 | LR: 5.0e-5 | RAM: 568MB
-   📐 MAX GRAD: c_v=13.7448
-➡️  Step 14950 | Global: 174949 | Combined Loss: 2.2241 | BPC: 3.067 | LR: 5.0e-5 | RAM: 569MB
-   📐 MAX GRAD: c_v=9.0575
-➡️  Step 15000 | Global: 174999 | Combined Loss: 2.0828 | BPC: 2.864 | LR: 5.0e-5 | RAM: 571MB
-   📐 MAX GRAD: d_v=5.6526
-💾 Auto-Saving Checkpoint...
-➡️  Step 15050 | Global: 175049 | Combined Loss: 2.0406 | BPC: 2.8 | LR: 5.0e-5 | RAM: 571MB
-   📐 MAX GRAD: c_v=10.3477
-➡️  Step 15100 | Global: 175099 | Combined Loss: 2.0503 | BPC: 2.816 | LR: 5.0e-5 | RAM: 573MB
-   📐 MAX GRAD: c_v=7.2652
-➡️  Step 15150 | Global: 175149 | Combined Loss: 2.1555 | BPC: 2.966 | LR: 4.9e-5 | RAM: 574MB
-   📐 MAX GRAD: c_v=7.8386
-➡️  Step 15200 | Global: 175199 | Combined Loss: 2.0317 | BPC: 2.789 | LR: 4.9e-5 | RAM: 576MB
-   📐 MAX GRAD: c_v=8.8823
-➡️  Step 15250 | Global: 175249 | Combined Loss: 1.9883 | BPC: 2.726 | LR: 4.9e-5 | RAM: 576MB
-   📐 MAX GRAD: c_v=10.0433
-➡️  Step 15300 | Global: 175299 | Combined Loss: 2.0236 | BPC: 2.778 | LR: 4.9e-5 | RAM: 578MB
-   📐 MAX GRAD: c_v=10.6678
-➡️  Step 15350 | Global: 175349 | Combined Loss: 1.9924 | BPC: 2.732 | LR: 4.9e-5 | RAM: 579MB
-   📐 MAX GRAD: c_v=6.4746
-➡️  Step 15400 | Global: 175399 | Combined Loss: 2.0472 | BPC: 2.811 | LR: 4.9e-5 | RAM: 580MB
-   📐 MAX GRAD: c_v=7.515
-➡️  Step 15450 | Global: 175449 | Combined Loss: 1.9472 | BPC: 2.666 | LR: 4.9e-5 | RAM: 581MB
-   📐 MAX GRAD: c_v=6.343
-➡️  Step 15500 | Global: 175499 | Combined Loss: 2.0675 | BPC: 2.841 | LR: 4.9e-5 | RAM: 583MB
-   📐 MAX GRAD: c_v=8.4306
-➡️  Step 15550 | Global: 175549 | Combined Loss: 2.1004 | BPC: 2.889 | LR: 4.9e-5 | RAM: 583MB
-   📐 MAX GRAD: c_v=8.1982
-➡️  Step 15600 | Global: 175599 | Combined Loss: 1.8889 | BPC: 2.581 | LR: 4.9e-5 | RAM: 585MB
-   📐 MAX GRAD: c_v=9.6747
-➡️  Step 15650 | Global: 175649 | Combined Loss: 2.0707 | BPC: 2.844 | LR: 4.9e-5 | RAM: 586MB
-   📐 MAX GRAD: c_v=10.3567
-➡️  Step 15700 | Global: 175699 | Combined Loss: 2.0468 | BPC: 2.812 | LR: 4.9e-5 | RAM: 588MB
-   📐 MAX GRAD: c_v=7.3072
-➡️  Step 15750 | Global: 175749 | Combined Loss: 2.0709 | BPC: 2.844 | LR: 4.9e-5 | RAM: 588MB
-   📐 MAX GRAD: c_v=8.672
-➡️  Step 15800 | Global: 175799 | Combined Loss: 2.1439 | BPC: 2.952 | LR: 4.8e-5 | RAM: 590MB
-   📐 MAX GRAD: c_v=8.5204
-➡️  Step 15850 | Global: 175849 | Combined Loss: 1.9546 | BPC: 2.678 | LR: 4.8e-5 | RAM: 591MB
-   📐 MAX GRAD: c_v=8.4033
-➡️  Step 15900 | Global: 175899 | Combined Loss: 1.971 | BPC: 2.7 | LR: 4.8e-5 | RAM: 592MB
-   📐 MAX GRAD: c_v=8.4603
-➡️  Step 15950 | Global: 175949 | Combined Loss: 2.0653 | BPC: 2.838 | LR: 4.8e-5 | RAM: 593MB
-   📐 MAX GRAD: c_v=9.9822
-➡️  Step 16000 | Global: 175999 | Combined Loss: 2.2101 | BPC: 3.047 | LR: 4.8e-5 | RAM: 595MB
-   📐 MAX GRAD: d_v=7.3893
-💾 Auto-Saving Checkpoint...
-➡️  Step 16050 | Global: 176049 | Combined Loss: 2.1036 | BPC: 2.894 | LR: 4.8e-5 | RAM: 595MB
-   📐 MAX GRAD: c_v=11.3458
-➡️  Step 16100 | Global: 176099 | Combined Loss: 1.9297 | BPC: 2.642 | LR: 4.8e-5 | RAM: 597MB
-   📐 MAX GRAD: d_v=6.3287
-➡️  Step 16150 | Global: 176149 | Combined Loss: 2.0494 | BPC: 2.814 | LR: 4.8e-5 | RAM: 598MB
-   📐 MAX GRAD: c_v=8.0872
-➡️  Step 16200 | Global: 176199 | Combined Loss: 2.1071 | BPC: 2.899 | LR: 4.8e-5 | RAM: 600MB
-   📐 MAX GRAD: c_v=6.8183
-➡️  Step 16250 | Global: 176249 | Combined Loss: 2.178 | BPC: 3.002 | LR: 4.8e-5 | RAM: 600MB
-   📐 MAX GRAD: c_v=6.3434
-➡️  Step 16300 | Global: 176299 | Combined Loss: 2.1061 | BPC: 2.897 | LR: 4.8e-5 | RAM: 602MB
-   📐 MAX GRAD: c_v=9.2725
-➡️  Step 16350 | Global: 176349 | Combined Loss: 2.0868 | BPC: 2.868 | LR: 4.8e-5 | RAM: 602MB
-   📐 MAX GRAD: c_v=8.9058
-➡️  Step 16400 | Global: 176399 | Combined Loss: 2.2098 | BPC: 3.047 | LR: 4.8e-5 | RAM: 604MB
-   📐 MAX GRAD: c_v=12.7595
-➡️  Step 16450 | Global: 176449 | Combined Loss: 2.1172 | BPC: 2.913 | LR: 4.8e-5 | RAM: 605MB
-   📐 MAX GRAD: c_v=7.9508
-➡️  Step 16500 | Global: 176499 | Combined Loss: 2.0099 | BPC: 2.756 | LR: 4.7e-5 | RAM: 607MB
-   📐 MAX GRAD: c_v=7.0211
-➡️  Step 16550 | Global: 176549 | Combined Loss: 2.0007 | BPC: 2.744 | LR: 4.7e-5 | RAM: 607MB
-   📐 MAX GRAD: c_v=12.5621
-➡️  Step 16600 | Global: 176599 | Combined Loss: 2.1047 | BPC: 2.896 | LR: 4.7e-5 | RAM: 609MB
-   📐 MAX GRAD: c_v=10.433
-➡️  Step 16650 | Global: 176649 | Combined Loss: 2.1164 | BPC: 2.913 | LR: 4.7e-5 | RAM: 610MB
-   📐 MAX GRAD: c_v=6.375
-➡️  Step 16700 | Global: 176699 | Combined Loss: 2.0638 | BPC: 2.834 | LR: 4.7e-5 | RAM: 612MB
-   📐 MAX GRAD: c_v=11.1555
-➡️  Step 16750 | Global: 176749 | Combined Loss: 1.9454 | BPC: 2.663 | LR: 4.7e-5 | RAM: 612MB
-   📐 MAX GRAD: c_v=9.0325
-➡️  Step 16800 | Global: 176799 | Combined Loss: 1.9882 | BPC: 2.726 | LR: 4.7e-5 | RAM: 614MB
-   📐 MAX GRAD: d_v=5.4106
-➡️  Step 16850 | Global: 176849 | Combined Loss: 2.1421 | BPC: 2.948 | LR: 4.7e-5 | RAM: 614MB
-   📐 MAX GRAD: c_v=10.8253
-➡️  Step 16900 | Global: 176899 | Combined Loss: 2.2007 | BPC: 3.034 | LR: 4.7e-5 | RAM: 616MB
-   📐 MAX GRAD: c_v=8.7083
-➡️  Step 16950 | Global: 176949 | Combined Loss: 2.1765 | BPC: 3.002 | LR: 4.7e-5 | RAM: 617MB
-   📐 MAX GRAD: c_v=9.8029
-➡️  Step 17000 | Global: 176999 | Combined Loss: 2.0287 | BPC: 2.785 | LR: 4.7e-5 | RAM: 619MB
-   📐 MAX GRAD: c_v=7.0503
-💾 Auto-Saving Checkpoint...
-➡️  Step 17050 | Global: 177049 | Combined Loss: 2.2243 | BPC: 3.066 | LR: 4.7e-5 | RAM: 619MB
-   📐 MAX GRAD: c_v=15.6569
-➡️  Step 17100 | Global: 177099 | Combined Loss: 2.2352 | BPC: 3.085 | LR: 4.7e-5 | RAM: 621MB
-   📐 MAX GRAD: d_v=6.1969
-➡️  Step 17150 | Global: 177149 | Combined Loss: 1.941 | BPC: 2.656 | LR: 4.7e-5 | RAM: 622MB
-   📐 MAX GRAD: c_v=8.6961
-➡️  Step 17200 | Global: 177199 | Combined Loss: 2.034 | BPC: 2.792 | LR: 4.6e-5 | RAM: 624MB
-   📐 MAX GRAD: c_v=7.9306
-➡️  Step 17250 | Global: 177249 | Combined Loss: 2.0485 | BPC: 2.815 | LR: 4.6e-5 | RAM: 624MB
-   📐 MAX GRAD: d_v=5.5602
-➡️  Step 17300 | Global: 177299 | Combined Loss: 2.0182 | BPC: 2.768 | LR: 4.6e-5 | RAM: 626MB
-   📐 MAX GRAD: c_v=8.998
-➡️  Step 17350 | Global: 177349 | Combined Loss: 1.8914 | BPC: 2.584 | LR: 4.6e-5 | RAM: 626MB
-   📐 MAX GRAD: c_v=9.2295
-➡️  Step 17400 | Global: 177399 | Combined Loss: 1.9802 | BPC: 2.714 | LR: 4.6e-5 | RAM: 628MB
-   📐 MAX GRAD: c_v=8.3241
-➡️  Step 17450 | Global: 177449 | Combined Loss: 2.1324 | BPC: 2.937 | LR: 4.6e-5 | RAM: 629MB
-   📐 MAX GRAD: c_v=8.9747
-➡️  Step 17500 | Global: 177499 | Combined Loss: 1.9592 | BPC: 2.684 | LR: 4.6e-5 | RAM: 631MB
-   📐 MAX GRAD: c_v=7.6164
-➡️  Step 17550 | Global: 177549 | Combined Loss: 2.1025 | BPC: 2.89 | LR: 4.6e-5 | RAM: 631MB
-   📐 MAX GRAD: c_v=6.6694
-➡️  Step 17600 | Global: 177599 | Combined Loss: 2.1491 | BPC: 2.96 | LR: 4.6e-5 | RAM: 633MB
-   📐 MAX GRAD: c_v=7.0824
-➡️  Step 17650 | Global: 177649 | Combined Loss: 1.9617 | BPC: 2.688 | LR: 4.6e-5 | RAM: 634MB
-   📐 MAX GRAD: c_v=7.6092
-➡️  Step 17700 | Global: 177699 | Combined Loss: 1.9684 | BPC: 2.695 | LR: 4.6e-5 | RAM: 636MB
-   📐 MAX GRAD: c_v=7.4692
-➡️  Step 17750 | Global: 177749 | Combined Loss: 2.0894 | BPC: 2.874 | LR: 4.6e-5 | RAM: 636MB
-   📐 MAX GRAD: c_v=8.3634
-➡️  Step 17800 | Global: 177799 | Combined Loss: 2.1514 | BPC: 2.963 | LR: 4.6e-5 | RAM: 638MB
-   📐 MAX GRAD: c_v=7.6073
-➡️  Step 17850 | Global: 177849 | Combined Loss: 1.9928 | BPC: 2.734 | LR: 4.6e-5 | RAM: 639MB
-   📐 MAX GRAD: c_v=7.3821
-➡️  Step 17900 | Global: 177899 | Combined Loss: 2.0009 | BPC: 2.745 | LR: 4.5e-5 | RAM: 640MB
-   📐 MAX GRAD: c_v=8.6766
-➡️  Step 17950 | Global: 177949 | Combined Loss: 1.9899 | BPC: 2.727 | LR: 4.5e-5 | RAM: 641MB
-   📐 MAX GRAD: d_v=7.5612
-➡️  Step 18000 | Global: 177999 | Combined Loss: 2.2168 | BPC: 3.057 | LR: 4.5e-5 | RAM: 643MB
-   📐 MAX GRAD: c_v=14.5157
-💾 Auto-Saving Checkpoint...
-➡️  Step 18050 | Global: 178049 | Combined Loss: 2.0766 | BPC: 2.854 | LR: 4.5e-5 | RAM: 643MB
-   📐 MAX GRAD: c_v=8.3713
-➡️  Step 18100 | Global: 178099 | Combined Loss: 2.0054 | BPC: 2.751 | LR: 4.5e-5 | RAM: 645MB
-   📐 MAX GRAD: c_v=6.8245
-➡️  Step 18150 | Global: 178149 | Combined Loss: 2.1278 | BPC: 2.929 | LR: 4.5e-5 | RAM: 646MB
-   📐 MAX GRAD: c_v=8.5627
-➡️  Step 18200 | Global: 178199 | Combined Loss: 2.1687 | BPC: 2.988 | LR: 4.5e-5 | RAM: 648MB
-   📐 MAX GRAD: c_v=11.804
-➡️  Step 18250 | Global: 178249 | Combined Loss: 2.0642 | BPC: 2.835 | LR: 4.5e-5 | RAM: 648MB
-   📐 MAX GRAD: c_v=8.3958
-➡️  Step 18300 | Global: 178299 | Combined Loss: 2.0945 | BPC: 2.879 | LR: 4.5e-5 | RAM: 650MB
-   📐 MAX GRAD: c_v=8.6229
-➡️  Step 18350 | Global: 178349 | Combined Loss: 2.0779 | BPC: 2.857 | LR: 4.5e-5 | RAM: 651MB
-   📐 MAX GRAD: c_v=4.9909
-➡️  Step 18400 | Global: 178399 | Combined Loss: 2.1102 | BPC: 2.903 | LR: 4.5e-5 | RAM: 652MB
-   📐 MAX GRAD: c_v=11.222
-➡️  Step 18450 | Global: 178449 | Combined Loss: 2.1989 | BPC: 3.031 | LR: 4.5e-5 | RAM: 653MB
-   📐 MAX GRAD: c_v=9.7159
-➡️  Step 18500 | Global: 178499 | Combined Loss: 2.1485 | BPC: 2.96 | LR: 4.5e-5 | RAM: 655MB
-   📐 MAX GRAD: c_v=7.9332
-➡️  Step 18550 | Global: 178549 | Combined Loss: 1.9839 | BPC: 2.72 | LR: 4.5e-5 | RAM: 655MB
-   📐 MAX GRAD: c_v=8.8565
-➡️  Step 18600 | Global: 178599 | Combined Loss: 2.1069 | BPC: 2.898 | LR: 4.5e-5 | RAM: 657MB
-   📐 MAX GRAD: c_v=8.6281
-➡️  Step 18650 | Global: 178649 | Combined Loss: 2.1197 | BPC: 2.916 | LR: 4.4e-5 | RAM: 658MB
-   📐 MAX GRAD: c_v=11.6525
-➡️  Step 18700 | Global: 178699 | Combined Loss: 1.9773 | BPC: 2.71 | LR: 4.4e-5 | RAM: 659MB
-   📐 MAX GRAD: c_v=8.7308
-➡️  Step 18750 | Global: 178749 | Combined Loss: 2.0263 | BPC: 2.782 | LR: 4.4e-5 | RAM: 660MB
-   📐 MAX GRAD: c_v=5.8512
-➡️  Step 18800 | Global: 178799 | Combined Loss: 2.182 | BPC: 3.007 | LR: 4.4e-5 | RAM: 662MB
-   📐 MAX GRAD: c_v=11.5762
-➡️  Step 18850 | Global: 178849 | Combined Loss: 1.9696 | BPC: 2.7 | LR: 4.4e-5 | RAM: 662MB
-   📐 MAX GRAD: c_v=9.8981
-➡️  Step 18900 | Global: 178899 | Combined Loss: 2.2035 | BPC: 3.038 | LR: 4.4e-5 | RAM: 664MB
-   📐 MAX GRAD: c_v=8.2423
-➡️  Step 18950 | Global: 178949 | Combined Loss: 2.0468 | BPC: 2.81 | LR: 4.4e-5 | RAM: 665MB
-   📐 MAX GRAD: c_v=7.6638
-➡️  Step 19000 | Global: 178999 | Combined Loss: 1.8951 | BPC: 2.591 | LR: 4.4e-5 | RAM: 667MB
-   📐 MAX GRAD: c_v=8.1888
-💾 Auto-Saving Checkpoint...
-➡️  Step 19050 | Global: 179049 | Combined Loss: 2.0851 | BPC: 2.869 | LR: 4.4e-5 | RAM: 667MB
-   📐 MAX GRAD: c_v=9.7284
-➡️  Step 19100 | Global: 179099 | Combined Loss: 2.0692 | BPC: 2.844 | LR: 4.4e-5 | RAM: 669MB
-   📐 MAX GRAD: c_v=7.4131
-➡️  Step 19150 | Global: 179149 | Combined Loss: 2.0686 | BPC: 2.844 | LR: 4.4e-5 | RAM: 670MB
-   📐 MAX GRAD: c_v=7.99
-➡️  Step 19200 | Global: 179199 | Combined Loss: 2.3138 | BPC: 3.197 | LR: 4.4e-5 | RAM: 671MB
-   📐 MAX GRAD: c_v=13.3482
-➡️  Step 19250 | Global: 179249 | Combined Loss: 2.0489 | BPC: 2.813 | LR: 4.4e-5 | RAM: 672MB
-   📐 MAX GRAD: c_v=6.9466
-➡️  Step 19300 | Global: 179299 | Combined Loss: 2.0217 | BPC: 2.775 | LR: 4.4e-5 | RAM: 674MB
-   📐 MAX GRAD: c_v=7.9523
-➡️  Step 19350 | Global: 179349 | Combined Loss: 2.1101 | BPC: 2.903 | LR: 4.3e-5 | RAM: 674MB
-   📐 MAX GRAD: c_v=7.1377
-➡️  Step 19400 | Global: 179399 | Combined Loss: 2.2573 | BPC: 3.116 | LR: 4.3e-5 | RAM: 676MB
-   📐 MAX GRAD: c_v=8.8629
-➡️  Step 19450 | Global: 179449 | Combined Loss: 2.0938 | BPC: 2.881 | LR: 4.3e-5 | RAM: 677MB
-   📐 MAX GRAD: c_v=7.3186
-➡️  Step 19500 | Global: 179499 | Combined Loss: 2.0912 | BPC: 2.876 | LR: 4.3e-5 | RAM: 679MB
-   📐 MAX GRAD: c_v=8.136
-➡️  Step 19550 | Global: 179549 | Combined Loss: 2.2499 | BPC: 3.106 | LR: 4.3e-5 | RAM: 679MB
-   📐 MAX GRAD: c_v=9.5673
-➡️  Step 19600 | Global: 179599 | Combined Loss: 2.0497 | BPC: 2.817 | LR: 4.3e-5 | RAM: 681MB
-   📐 MAX GRAD: c_v=7.7635
-➡️  Step 19650 | Global: 179649 | Combined Loss: 2.1942 | BPC: 3.025 | LR: 4.3e-5 | RAM: 682MB
-   📐 MAX GRAD: c_v=5.3469
-➡️  Step 19700 | Global: 179699 | Combined Loss: 2.0547 | BPC: 2.824 | LR: 4.3e-5 | RAM: 684MB
-   📐 MAX GRAD: c_v=6.7971
-➡️  Step 19750 | Global: 179749 | Combined Loss: 2.1008 | BPC: 2.891 | LR: 4.3e-5 | RAM: 684MB
-   📐 MAX GRAD: d_v=8.4679
-➡️  Step 19800 | Global: 179799 | Combined Loss: 2.1509 | BPC: 2.961 | LR: 4.3e-5 | RAM: 686MB
-   📐 MAX GRAD: c_v=8.1478
-➡️  Step 19850 | Global: 179849 | Combined Loss: 2.164 | BPC: 2.98 | LR: 4.3e-5 | RAM: 686MB
-   📐 MAX GRAD: c_v=10.1776
-➡️  Step 19900 | Global: 179899 | Combined Loss: 2.2927 | BPC: 3.165 | LR: 4.3e-5 | RAM: 688MB
-   📐 MAX GRAD: c_v=9.8875
-➡️  Step 19950 | Global: 179949 | Combined Loss: 2.0106 | BPC: 2.76 | LR: 4.3e-5 | RAM: 689MB
-   📐 MAX GRAD: c_v=10.0534
-➡️  Step 20000 | Global: 179999 | Combined Loss: 2.2355 | BPC: 3.085 | LR: 4.3e-5 | RAM: 691MB
-   📐 MAX GRAD: c_v=10.4615
-💾 Auto-Saving Checkpoint...
-➡️  Step 20050 | Global: 180049 | Combined Loss: 2.1112 | BPC: 2.905 | LR: 4.3e-5 | RAM: 691MB
-   📐 MAX GRAD: c_v=7.9693
-➡️  Step 20100 | Global: 180099 | Combined Loss: 2.1196 | BPC: 2.917 | LR: 4.2e-5 | RAM: 693MB
-   📐 MAX GRAD: c_v=8.215
-➡️  Step 20150 | Global: 180149 | Combined Loss: 2.2266 | BPC: 3.072 | LR: 4.2e-5 | RAM: 694MB
-   📐 MAX GRAD: c_v=7.0121
-➡️  Step 20200 | Global: 180199 | Combined Loss: 2.0905 | BPC: 2.874 | LR: 4.2e-5 | RAM: 696MB
-   📐 MAX GRAD: c_v=9.1135
-➡️  Step 20250 | Global: 180249 | Combined Loss: 2.093 | BPC: 2.877 | LR: 4.2e-5 | RAM: 696MB
-   📐 MAX GRAD: c_v=8.822
-➡️  Step 20300 | Global: 180299 | Combined Loss: 2.0764 | BPC: 2.855 | LR: 4.2e-5 | RAM: 698MB
-   📐 MAX GRAD: c_v=9.9597
-➡️  Step 20350 | Global: 180349 | Combined Loss: 2.0597 | BPC: 2.83 | LR: 4.2e-5 | RAM: 698MB
-   📐 MAX GRAD: c_v=9.677
-➡️  Step 20400 | Global: 180399 | Combined Loss: 2.0726 | BPC: 2.849 | LR: 4.2e-5 | RAM: 700MB
-   📐 MAX GRAD: c_v=7.8357
-➡️  Step 20450 | Global: 180449 | Combined Loss: 2.161 | BPC: 2.978 | LR: 4.2e-5 | RAM: 701MB
-   📐 MAX GRAD: c_v=9.1147
-➡️  Step 20500 | Global: 180499 | Combined Loss: 2.1721 | BPC: 2.991 | LR: 4.2e-5 | RAM: 703MB
-   📐 MAX GRAD: c_v=8.4017
-➡️  Step 20550 | Global: 180549 | Combined Loss: 2.0107 | BPC: 2.756 | LR: 4.2e-5 | RAM: 703MB
-   📐 MAX GRAD: c_v=7.6734
-➡️  Step 20600 | Global: 180599 | Combined Loss: 2.1192 | BPC: 2.917 | LR: 4.2e-5 | RAM: 705MB
-   📐 MAX GRAD: c_v=7.764
-➡️  Step 20650 | Global: 180649 | Combined Loss: 2.1462 | BPC: 2.954 | LR: 4.2e-5 | RAM: 706MB
-   📐 MAX GRAD: c_v=8.8543
-➡️  Step 20700 | Global: 180699 | Combined Loss: 2.0726 | BPC: 2.849 | LR: 4.2e-5 | RAM: 708MB
-   📐 MAX GRAD: c_v=6.9567
-➡️  Step 20750 | Global: 180749 | Combined Loss: 2.1267 | BPC: 2.928 | LR: 4.2e-5 | RAM: 708MB
-   📐 MAX GRAD: c_v=6.0947
-➡️  Step 20800 | Global: 180799 | Combined Loss: 2.0921 | BPC: 2.877 | LR: 4.1e-5 | RAM: 710MB
-   📐 MAX GRAD: c_v=7.8257
-➡️  Step 20850 | Global: 180849 | Combined Loss: 2.1962 | BPC: 3.027 | LR: 4.1e-5 | RAM: 711MB
-   📐 MAX GRAD: d_v=7.57
-➡️  Step 20900 | Global: 180899 | Combined Loss: 2.1226 | BPC: 2.921 | LR: 4.1e-5 | RAM: 712MB
-   📐 MAX GRAD: c_v=7.9969
-➡️  Step 20950 | Global: 180949 | Combined Loss: 1.9278 | BPC: 2.638 | LR: 4.1e-5 | RAM: 713MB
-   📐 MAX GRAD: c_v=6.9035
-➡️  Step 21000 | Global: 180999 | Combined Loss: 2.0153 | BPC: 2.765 | LR: 4.1e-5 | RAM: 715MB
-   📐 MAX GRAD: c_v=7.1439
-💾 Auto-Saving Checkpoint...
-➡️  Step 21050 | Global: 181049 | Combined Loss: 2.0724 | BPC: 2.849 | LR: 4.1e-5 | RAM: 715MB
-   📐 MAX GRAD: c_v=9.0594
-➡️  Step 21100 | Global: 181099 | Combined Loss: 2.0999 | BPC: 2.889 | LR: 4.1e-5 | RAM: 717MB
-   📐 MAX GRAD: c_v=11.1689
-➡️  Step 21150 | Global: 181149 | Combined Loss: 2.0069 | BPC: 2.754 | LR: 4.1e-5 | RAM: 718MB
-   📐 MAX GRAD: c_v=9.59
-➡️  Step 21200 | Global: 181199 | Combined Loss: 1.9869 | BPC: 2.725 | LR: 4.1e-5 | RAM: 719MB
-   📐 MAX GRAD: c_v=11.6126
-➡️  Step 21250 | Global: 181249 | Combined Loss: 2.0114 | BPC: 2.76 | LR: 4.1e-5 | RAM: 720MB
-   📐 MAX GRAD: c_v=7.8953
-➡️  Step 21300 | Global: 181299 | Combined Loss: 2.0953 | BPC: 2.882 | LR: 4.1e-5 | RAM: 722MB
-   📐 MAX GRAD: d_v=6.3203
-➡️  Step 21350 | Global: 181349 | Combined Loss: 2.0464 | BPC: 2.811 | LR: 4.1e-5 | RAM: 722MB
-   📐 MAX GRAD: c_v=9.2935
-➡️  Step 21400 | Global: 181399 | Combined Loss: 2.2108 | BPC: 3.05 | LR: 4.1e-5 | RAM: 724MB
-   📐 MAX GRAD: c_v=10.5469
-➡️  Step 21450 | Global: 181449 | Combined Loss: 2.0986 | BPC: 2.884 | LR: 4.1e-5 | RAM: 725MB
-   📐 MAX GRAD: c_v=12.2512
-➡️  Step 21500 | Global: 181499 | Combined Loss: 2.1306 | BPC: 2.932 | LR: 4.1e-5 | RAM: 727MB
-   📐 MAX GRAD: d_v=6.7098
-➡️  Step 21550 | Global: 181549 | Combined Loss: 2.2115 | BPC: 3.05 | LR: 4.0e-5 | RAM: 727MB
-   📐 MAX GRAD: c_v=9.4426
-➡️  Step 21600 | Global: 181599 | Combined Loss: 2.0062 | BPC: 2.753 | LR: 4.0e-5 | RAM: 729MB
-   📐 MAX GRAD: d_v=7.7019
-➡️  Step 21650 | Global: 181649 | Combined Loss: 2.2621 | BPC: 3.122 | LR: 4.0e-5 | RAM: 730MB
-   📐 MAX GRAD: c_v=10.5162
-➡️  Step 21700 | Global: 181699 | Combined Loss: 2.1017 | BPC: 2.891 | LR: 4.0e-5 | RAM: 731MB
-   📐 MAX GRAD: c_v=6.9569
-➡️  Step 21750 | Global: 181749 | Combined Loss: 2.0785 | BPC: 2.856 | LR: 4.0e-5 | RAM: 732MB
-   📐 MAX GRAD: c_v=7.6281
-➡️  Step 21800 | Global: 181799 | Combined Loss: 2.1868 | BPC: 3.015 | LR: 4.0e-5 | RAM: 734MB
-   📐 MAX GRAD: c_v=7.5702
-➡️  Step 21850 | Global: 181849 | Combined Loss: 2.0179 | BPC: 2.77 | LR: 4.0e-5 | RAM: 734MB
-   📐 MAX GRAD: d_v=7.0811
-➡️  Step 21900 | Global: 181899 | Combined Loss: 2.2138 | BPC: 3.055 | LR: 4.0e-5 | RAM: 736MB
-   📐 MAX GRAD: c_v=8.5691
-➡️  Step 21950 | Global: 181949 | Combined Loss: 2.2029 | BPC: 3.039 | LR: 4.0e-5 | RAM: 737MB
-   📐 MAX GRAD: c_v=10.0559
-➡️  Step 22000 | Global: 181999 | Combined Loss: 2.072 | BPC: 2.849 | LR: 4.0e-5 | RAM: 739MB
-   📐 MAX GRAD: c_v=6.9392
-💾 Auto-Saving Checkpoint...
-➡️  Step 22050 | Global: 182049 | Combined Loss: 2.1467 | BPC: 2.956 | LR: 4.0e-5 | RAM: 739MB
-   📐 MAX GRAD: c_v=9.3139
-➡️  Step 22100 | Global: 182099 | Combined Loss: 2.1056 | BPC: 2.899 | LR: 4.0e-5 | RAM: 741MB
-   📐 MAX GRAD: c_v=7.8577
-➡️  Step 22150 | Global: 182149 | Combined Loss: 2.1256 | BPC: 2.924 | LR: 4.0e-5 | RAM: 742MB
-   📐 MAX GRAD: c_v=7.8481
-➡️  Step 22200 | Global: 182199 | Combined Loss: 2.0672 | BPC: 2.84 | LR: 4.0e-5 | RAM: 743MB
-   📐 MAX GRAD: c_v=6.2745
-➡️  Step 22250 | Global: 182249 | Combined Loss: 2.0525 | BPC: 2.82 | LR: 4.0e-5 | RAM: 744MB
-   📐 MAX GRAD: d_v=4.25
-➡️  Step 22300 | Global: 182299 | Combined Loss: 2.1025 | BPC: 2.893 | LR: 3.9e-5 | RAM: 746MB
-   📐 MAX GRAD: c_v=9.5419
-➡️  Step 22350 | Global: 182349 | Combined Loss: 2.2315 | BPC: 3.079 | LR: 3.9e-5 | RAM: 746MB
-   📐 MAX GRAD: c_v=10.8744
-➡️  Step 22400 | Global: 182399 | Combined Loss: 1.9679 | BPC: 2.698 | LR: 3.9e-5 | RAM: 748MB
-   📐 MAX GRAD: d_v=5.0908
-➡️  Step 22450 | Global: 182449 | Combined Loss: 2.1144 | BPC: 2.91 | LR: 3.9e-5 | RAM: 749MB
-   📐 MAX GRAD: c_v=7.4129
-➡️  Step 22500 | Global: 182499 | Combined Loss: 2.0693 | BPC: 2.842 | LR: 3.9e-5 | RAM: 751MB
-   📐 MAX GRAD: c_v=10.8592
-➡️  Step 22550 | Global: 182549 | Combined Loss: 2.0582 | BPC: 2.827 | LR: 3.9e-5 | RAM: 751MB
-   📐 MAX GRAD: c_v=7.6261
-➡️  Step 22600 | Global: 182599 | Combined Loss: 2.1305 | BPC: 2.933 | LR: 3.9e-5 | RAM: 753MB
-   📐 MAX GRAD: c_v=8.8869
-➡️  Step 22650 | Global: 182649 | Combined Loss: 2.0893 | BPC: 2.875 | LR: 3.9e-5 | RAM: 754MB
-   📐 MAX GRAD: c_v=12.5443
-➡️  Step 22700 | Global: 182699 | Combined Loss: 2.0739 | BPC: 2.852 | LR: 3.9e-5 | RAM: 755MB
-   📐 MAX GRAD: c_v=7.6857
-➡️  Step 22750 | Global: 182749 | Combined Loss: 2.0642 | BPC: 2.836 | LR: 3.9e-5 | RAM: 756MB
-   📐 MAX GRAD: c_v=8.9982
-➡️  Step 22800 | Global: 182799 | Combined Loss: 1.9095 | BPC: 2.611 | LR: 3.9e-5 | RAM: 758MB
-   📐 MAX GRAD: d_v=5.8713
-➡️  Step 22850 | Global: 182849 | Combined Loss: 2.1014 | BPC: 2.89 | LR: 3.9e-5 | RAM: 758MB
-   📐 MAX GRAD: c_v=7.8957
-➡️  Step 22900 | Global: 182899 | Combined Loss: 2.1402 | BPC: 2.946 | LR: 3.9e-5 | RAM: 760MB
-   📐 MAX GRAD: d_v=6.0298
-➡️  Step 22950 | Global: 182949 | Combined Loss: 2.0983 | BPC: 2.884 | LR: 3.9e-5 | RAM: 761MB
-   📐 MAX GRAD: d_v=9.6018
-➡️  Step 23000 | Global: 182999 | Combined Loss: 1.9622 | BPC: 2.688 | LR: 3.9e-5 | RAM: 763MB
-   📐 MAX GRAD: c_v=6.4979
-💾 Auto-Saving Checkpoint...
-➡️  Step 23050 | Global: 183049 | Combined Loss: 2.1503 | BPC: 2.961 | LR: 3.8e-5 | RAM: 763MB
-   📐 MAX GRAD: c_v=7.0795
-➡️  Step 23100 | Global: 183099 | Combined Loss: 2.0995 | BPC: 2.887 | LR: 3.8e-5 | RAM: 765MB
-   📐 MAX GRAD: c_v=9.6605
-➡️  Step 23150 | Global: 183149 | Combined Loss: 2.0592 | BPC: 2.829 | LR: 3.8e-5 | RAM: 766MB
-   📐 MAX GRAD: c_v=6.5662
-➡️  Step 23200 | Global: 183199 | Combined Loss: 2.2161 | BPC: 3.058 | LR: 3.8e-5 | RAM: 767MB
-   📐 MAX GRAD: c_v=8.4642
-➡️  Step 23250 | Global: 183249 | Combined Loss: 2.1311 | BPC: 2.932 | LR: 3.8e-5 | RAM: 768MB
-   📐 MAX GRAD: c_v=10.2401
-➡️  Step 23300 | Global: 183299 | Combined Loss: 2.0891 | BPC: 2.873 | LR: 3.8e-5 | RAM: 770MB
-   📐 MAX GRAD: c_v=7.3718
-➡️  Step 23350 | Global: 183349 | Combined Loss: 2.2387 | BPC: 3.089 | LR: 3.8e-5 | RAM: 770MB
-   📐 MAX GRAD: c_v=9.7089
-➡️  Step 23400 | Global: 183399 | Combined Loss: 2.1376 | BPC: 2.942 | LR: 3.8e-5 | RAM: 772MB
-   📐 MAX GRAD: c_v=10.3143
-➡️  Step 23450 | Global: 183449 | Combined Loss: 1.9929 | BPC: 2.733 | LR: 3.8e-5 | RAM: 773MB
-   📐 MAX GRAD: c_v=10.9464
-➡️  Step 23500 | Global: 183499 | Combined Loss: 2.2376 | BPC: 3.088 | LR: 3.8e-5 | RAM: 775MB
-   📐 MAX GRAD: c_v=7.5066
-➡️  Step 23550 | Global: 183549 | Combined Loss: 2.0622 | BPC: 2.835 | LR: 3.8e-5 | RAM: 775MB
-   📐 MAX GRAD: c_v=7.2685
-➡️  Step 23600 | Global: 183599 | Combined Loss: 2.1633 | BPC: 2.98 | LR: 3.8e-5 | RAM: 777MB
-   📐 MAX GRAD: c_v=8.911
-➡️  Step 23650 | Global: 183649 | Combined Loss: 2.1664 | BPC: 2.983 | LR: 3.8e-5 | RAM: 778MB
-   📐 MAX GRAD: c_v=8.0506
-➡️  Step 23700 | Global: 183699 | Combined Loss: 2.0561 | BPC: 2.825 | LR: 3.8e-5 | RAM: 779MB
-   📐 MAX GRAD: c_v=9.3031
-➡️  Step 23750 | Global: 183749 | Combined Loss: 2.1161 | BPC: 2.911 | LR: 3.8e-5 | RAM: 780MB
-   📐 MAX GRAD: c_v=8.577
-➡️  Step 23800 | Global: 183799 | Combined Loss: 1.9979 | BPC: 2.74 | LR: 3.8e-5 | RAM: 782MB
-   📐 MAX GRAD: c_v=7.5727
-➡️  Step 23850 | Global: 183849 | Combined Loss: 2.0532 | BPC: 2.82 | LR: 3.7e-5 | RAM: 782MB
-   📐 MAX GRAD: c_v=9.7764
-➡️  Step 23900 | Global: 183899 | Combined Loss: 2.2093 | BPC: 3.047 | LR: 3.7e-5 | RAM: 784MB
-   📐 MAX GRAD: c_v=11.4239
-➡️  Step 23950 | Global: 183949 | Combined Loss: 2.1349 | BPC: 2.941 | LR: 3.7e-5 | RAM: 785MB
-   📐 MAX GRAD: c_v=7.9682
-➡️  Step 24000 | Global: 183999 | Combined Loss: 2.0688 | BPC: 2.843 | LR: 3.7e-5 | RAM: 787MB
-   📐 MAX GRAD: c_v=15.0526
-💾 Auto-Saving Checkpoint...
-➡️  Step 24050 | Global: 184049 | Combined Loss: 2.1202 | BPC: 2.917 | LR: 3.7e-5 | RAM: 787MB
-   📐 MAX GRAD: c_v=6.2653
-➡️  Step 24100 | Global: 184099 | Combined Loss: 2.1239 | BPC: 2.922 | LR: 3.7e-5 | RAM: 789MB
-   📐 MAX GRAD: c_v=10.7127
-➡️  Step 24150 | Global: 184149 | Combined Loss: 2.0143 | BPC: 2.765 | LR: 3.7e-5 | RAM: 790MB
-   📐 MAX GRAD: c_v=6.6761
-➡️  Step 24200 | Global: 184199 | Combined Loss: 2.1139 | BPC: 2.909 | LR: 3.7e-5 | RAM: 792MB
-   📐 MAX GRAD: c_v=6.4282
-➡️  Step 24250 | Global: 184249 | Combined Loss: 1.9956 | BPC: 2.737 | LR: 3.7e-5 | RAM: 792MB
-   📐 MAX GRAD: c_v=9.0165
-➡️  Step 24300 | Global: 184299 | Combined Loss: 2.0688 | BPC: 2.842 | LR: 3.7e-5 | RAM: 794MB
-   📐 MAX GRAD: c_v=11.0522
-➡️  Step 24350 | Global: 184349 | Combined Loss: 2.0753 | BPC: 2.852 | LR: 3.7e-5 | RAM: 795MB
-   📐 MAX GRAD: c_v=8.6209
-➡️  Step 24400 | Global: 184399 | Combined Loss: 2.0733 | BPC: 2.85 | LR: 3.7e-5 | RAM: 796MB
-   📐 MAX GRAD: d_v=7.555
-➡️  Step 24450 | Global: 184449 | Combined Loss: 2.1903 | BPC: 3.02 | LR: 3.7e-5 | RAM: 797MB
-   📐 MAX GRAD: c_v=10.2888
-➡️  Step 24500 | Global: 184499 | Combined Loss: 2.0501 | BPC: 2.816 | LR: 3.7e-5 | RAM: 799MB
-   📐 MAX GRAD: c_v=8.2783
-➡️  Step 24550 | Global: 184549 | Combined Loss: 2.0684 | BPC: 2.844 | LR: 3.7e-5 | RAM: 800MB
-   📐 MAX GRAD: c_v=5.944
-➡️  Step 24600 | Global: 184599 | Combined Loss: 2.1189 | BPC: 2.916 | LR: 3.6e-5 | RAM: 801MB
-   📐 MAX GRAD: c_v=8.0744
-➡️  Step 24650 | Global: 184649 | Combined Loss: 2.2453 | BPC: 3.098 | LR: 3.6e-5 | RAM: 802MB
-   📐 MAX GRAD: d_v=7.7999
-➡️  Step 24700 | Global: 184699 | Combined Loss: 2.1507 | BPC: 2.961 | LR: 3.6e-5 | RAM: 804MB
-   📐 MAX GRAD: d_v=4.8858
-➡️  Step 24750 | Global: 184749 | Combined Loss: 2.08 | BPC: 2.86 | LR: 3.6e-5 | RAM: 804MB
-   📐 MAX GRAD: c_v=7.4832
-➡️  Step 24800 | Global: 184799 | Combined Loss: 2.0931 | BPC: 2.879 | LR: 3.6e-5 | RAM: 806MB
-   📐 MAX GRAD: c_v=8.8204
-➡️  Step 24850 | Global: 184849 | Combined Loss: 2.0858 | BPC: 2.869 | LR: 3.6e-5 | RAM: 807MB
-   📐 MAX GRAD: c_v=8.8953
-💾 Saving Completed Epoch 7 State...
+🧊 Loading Frozen Micro-Diffusion Tokenizer...
+
+08:55:34.228 [info] XLA service 0x73db60020a40 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+08:55:34.230 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+08:55:34.230 [info] Using BFC allocator.
+
+08:55:34.230 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+08:55:34.230 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+🧊 Loading Frozen Language Physics Engine...
+🧠 Loading 128seqlen Curriculum into CPU Memory...
+💾 Resuming from checkpoint: v28_sinkhorn_step111000.bin
+🚀 IGNITION: Starting V28 DNI at Epoch 5, Global Step 111000...
+✅ All tensors materialized, entering training loop...
 ==================================================
-🌊 EPOCH 8 / 9
+🌊 EPOCH 5 / 9
 🔀 Shuffling dataset...
-➡️  Step 50 | Global: 184933 | Combined Loss: 2.0309 | BPC: 2.789 | LR: 3.6e-5 | RAM: 809MB
-   📐 MAX GRAD: c_v=7.7169
-➡️  Step 100 | Global: 184983 | Combined Loss: 2.1313 | BPC: 2.932 | LR: 3.6e-5 | RAM: 810MB
-   📐 MAX GRAD: c_v=6.5282
+
+08:55:37.651 [info] Merging Dots in computation: region_1.3
+
+08:55:47.936 [info] Merging Dots in computation: region_12.18.clone.clone.clone
+
+08:55:47.936 [info] Merging Dots in computation: main.21
+
+08:56:16.452 [info] Merging Dots in computation: region_1.2
+
+08:56:16.452 [info] Merging Dots in computation: region_4.5
+
+08:56:16.452 [info] Merging Dots in computation: region_7.8
+
+08:56:16.452 [info] Merging Dots in computation: region_10.11
+
+08:56:16.452 [info] Merging Dots in computation: region_13.14
+
+08:56:16.452 [info] Merging Dots in computation: region_16.17
+
+08:56:16.452 [info] Merging Dots in computation: region_19.20
+
+08:56:16.452 [info] Merging Dots in computation: region_22.23
+
+08:56:16.452 [info] Merging Dots in computation: region_25.26
+
+08:56:16.452 [info] Merging Dots in computation: region_28.29
 💾 Auto-Saving Checkpoint...
-➡️  Step 150 | Global: 185033 | Combined Loss: 2.2321 | BPC: 3.08 | LR: 3.6e-5 | RAM: 811MB
-   📐 MAX GRAD: c_v=11.4297
-➡️  Step 200 | Global: 185083 | Combined Loss: 2.0115 | BPC: 2.759 | LR: 3.6e-5 | RAM: 812MB
-   📐 MAX GRAD: c_v=7.8318
-➡️  Step 250 | Global: 185133 | Combined Loss: 1.9771 | BPC: 2.709 | LR: 3.6e-5 | RAM: 813MB
-   📐 MAX GRAD: c_v=10.2606
-➡️  Step 300 | Global: 185183 | Combined Loss: 2.0478 | BPC: 2.814 | LR: 3.6e-5 | RAM: 814MB
-   📐 MAX GRAD: c_v=11.4084
+➡️  Step 50 | Global: 111049 | Combined Loss: 2.8264 | BPC: 4.058 | LR: 1.66e-4 | RAM: 173MB
+   📐 MAX GRAD: d_v=23.6498
+➡️  Step 100 | Global: 111099 | Combined Loss: 2.7706 | BPC: 3.977 | LR: 1.66e-4 | RAM: 174MB
+   📐 MAX GRAD: d_v=32.0611
+➡️  Step 150 | Global: 111149 | Combined Loss: 2.7829 | BPC: 3.995 | LR: 1.66e-4 | RAM: 176MB
+   📐 MAX GRAD: d_v=35.5951
+➡️  Step 200 | Global: 111199 | Combined Loss: 2.8208 | BPC: 4.049 | LR: 1.66e-4 | RAM: 177MB
+   📐 MAX GRAD: d_v=28.3055
+➡️  Step 250 | Global: 111249 | Combined Loss: 2.7105 | BPC: 3.888 | LR: 1.66e-4 | RAM: 178MB
+   📐 MAX GRAD: d_v=36.2426
+➡️  Step 300 | Global: 111299 | Combined Loss: 2.8705 | BPC: 4.121 | LR: 1.66e-4 | RAM: 181MB
+   📐 MAX GRAD: d_v=35.1539
+➡️  Step 350 | Global: 111349 | Combined Loss: 2.8662 | BPC: 4.114 | LR: 1.66e-4 | RAM: 182MB
+   📐 MAX GRAD: d_v=30.4432
+➡️  Step 400 | Global: 111399 | Combined Loss: 2.7037 | BPC: 3.878 | LR: 1.66e-4 | RAM: 183MB
+   📐 MAX GRAD: d_v=23.731
+➡️  Step 450 | Global: 111449 | Combined Loss: 2.8051 | BPC: 4.026 | LR: 1.66e-4 | RAM: 184MB
+   📐 MAX GRAD: d_v=31.4427
+➡️  Step 500 | Global: 111499 | Combined Loss: 2.7211 | BPC: 3.905 | LR: 1.66e-4 | RAM: 185MB
+   📐 MAX GRAD: d_v=53.4495
+➡️  Step 550 | Global: 111549 | Combined Loss: 2.8361 | BPC: 4.071 | LR: 1.65e-4 | RAM: 187MB
+   📐 MAX GRAD: d_v=29.1306
+➡️  Step 600 | Global: 111599 | Combined Loss: 2.7418 | BPC: 3.934 | LR: 1.65e-4 | RAM: 187MB
+   📐 MAX GRAD: d_v=30.7186
+➡️  Step 650 | Global: 111649 | Combined Loss: 2.7446 | BPC: 3.938 | LR: 1.65e-4 | RAM: 189MB
+   📐 MAX GRAD: d_v=24.6511
+➡️  Step 700 | Global: 111699 | Combined Loss: 2.7875 | BPC: 4.0 | LR: 1.65e-4 | RAM: 190MB
+   📐 MAX GRAD: d_v=43.9754
+➡️  Step 750 | Global: 111749 | Combined Loss: 2.8023 | BPC: 4.023 | LR: 1.65e-4 | RAM: 191MB
+   📐 MAX GRAD: d_v=32.8024
+➡️  Step 800 | Global: 111799 | Combined Loss: 2.7911 | BPC: 4.007 | LR: 1.65e-4 | RAM: 193MB
+   📐 MAX GRAD: d_v=45.715
+➡️  Step 850 | Global: 111849 | Combined Loss: 2.8054 | BPC: 4.025 | LR: 1.65e-4 | RAM: 194MB
+   📐 MAX GRAD: d_v=35.731
+➡️  Step 900 | Global: 111899 | Combined Loss: 2.8244 | BPC: 4.054 | LR: 1.65e-4 | RAM: 195MB
+   📐 MAX GRAD: d_v=17.3952
+➡️  Step 950 | Global: 111949 | Combined Loss: 2.8545 | BPC: 4.097 | LR: 1.65e-4 | RAM: 196MB
+   📐 MAX GRAD: d_v=40.0539
+➡️  Step 1000 | Global: 111999 | Combined Loss: 2.8792 | BPC: 4.133 | LR: 1.65e-4 | RAM: 197MB
+   📐 MAX GRAD: d_v=40.9524
+💾 Auto-Saving Checkpoint...
+➡️  Step 1050 | Global: 112049 | Combined Loss: 2.7613 | BPC: 3.963 | LR: 1.64e-4 | RAM: 199MB
+   📐 MAX GRAD: d_v=41.9793
+➡️  Step 1100 | Global: 112099 | Combined Loss: 2.7929 | BPC: 4.008 | LR: 1.64e-4 | RAM: 201MB
+   📐 MAX GRAD: d_v=22.4909
+➡️  Step 1150 | Global: 112149 | Combined Loss: 2.881 | BPC: 4.135 | LR: 1.64e-4 | RAM: 206MB
+   📐 MAX GRAD: d_u=32.069
+➡️  Step 1200 | Global: 112199 | Combined Loss: 2.7909 | BPC: 4.006 | LR: 1.64e-4 | RAM: 207MB
+   📐 MAX GRAD: d_v=24.3316
+➡️  Step 1250 | Global: 112249 | Combined Loss: 2.9123 | BPC: 4.182 | LR: 1.64e-4 | RAM: 209MB
+   📐 MAX GRAD: d_v=41.9451
+➡️  Step 1300 | Global: 112299 | Combined Loss: 2.8944 | BPC: 4.155 | LR: 1.64e-4 | RAM: 210MB
+   📐 MAX GRAD: d_v=37.2085
+➡️  Step 1350 | Global: 112349 | Combined Loss: 2.7148 | BPC: 3.895 | LR: 1.64e-4 | RAM: 211MB
+   📐 MAX GRAD: d_v=44.715
+➡️  Step 1400 | Global: 112399 | Combined Loss: 2.8362 | BPC: 4.072 | LR: 1.64e-4 | RAM: 212MB
+   📐 MAX GRAD: d_v=38.0427
+➡️  Step 1450 | Global: 112449 | Combined Loss: 2.8371 | BPC: 4.073 | LR: 1.64e-4 | RAM: 213MB
+   📐 MAX GRAD: d_v=25.1533
+➡️  Step 1500 | Global: 112499 | Combined Loss: 2.8127 | BPC: 4.036 | LR: 1.64e-4 | RAM: 215MB
+   📐 MAX GRAD: d_v=42.0926
+➡️  Step 1550 | Global: 112549 | Combined Loss: 2.8599 | BPC: 4.106 | LR: 1.63e-4 | RAM: 216MB
+   📐 MAX GRAD: d_v=40.8853
+➡️  Step 1600 | Global: 112599 | Combined Loss: 2.8184 | BPC: 4.046 | LR: 1.63e-4 | RAM: 217MB
+   📐 MAX GRAD: d_v=47.625
+➡️  Step 1650 | Global: 112649 | Combined Loss: 2.7318 | BPC: 3.919 | LR: 1.63e-4 | RAM: 218MB
+   📐 MAX GRAD: d_v=33.2531
+➡️  Step 1700 | Global: 112699 | Combined Loss: 2.7938 | BPC: 4.009 | LR: 1.63e-4 | RAM: 219MB
+   📐 MAX GRAD: d_v=33.6189
+➡️  Step 1750 | Global: 112749 | Combined Loss: 2.8033 | BPC: 4.023 | LR: 1.63e-4 | RAM: 221MB
+   📐 MAX GRAD: d_v=30.5522
+➡️  Step 1800 | Global: 112799 | Combined Loss: 2.7198 | BPC: 3.903 | LR: 1.63e-4 | RAM: 222MB
+   📐 MAX GRAD: d_v=36.1831
+➡️  Step 1850 | Global: 112849 | Combined Loss: 2.7129 | BPC: 3.892 | LR: 1.63e-4 | RAM: 223MB
+   📐 MAX GRAD: d_v=33.5935
+➡️  Step 1900 | Global: 112899 | Combined Loss: 2.7903 | BPC: 4.006 | LR: 1.63e-4 | RAM: 224MB
+   📐 MAX GRAD: d_v=48.6455
+➡️  Step 1950 | Global: 112949 | Combined Loss: 2.6862 | BPC: 3.854 | LR: 1.63e-4 | RAM: 225MB
+   📐 MAX GRAD: d_v=30.8918
+➡️  Step 2000 | Global: 112999 | Combined Loss: 2.8245 | BPC: 4.055 | LR: 1.63e-4 | RAM: 227MB
+   📐 MAX GRAD: d_v=35.6576
+💾 Auto-Saving Checkpoint...
+➡️  Step 2050 | Global: 113049 | Combined Loss: 2.7619 | BPC: 3.963 | LR: 1.62e-4 | RAM: 228MB
+   📐 MAX GRAD: d_v=28.8589
+➡️  Step 2100 | Global: 113099 | Combined Loss: 2.8382 | BPC: 4.074 | LR: 1.62e-4 | RAM: 229MB
+   📐 MAX GRAD: d_v=36.7982
+➡️  Step 2150 | Global: 113149 | Combined Loss: 2.8895 | BPC: 4.148 | LR: 1.62e-4 | RAM: 230MB
+   📐 MAX GRAD: d_v=37.6382
+➡️  Step 2200 | Global: 113199 | Combined Loss: 2.8124 | BPC: 4.037 | LR: 1.62e-4 | RAM: 232MB
+   📐 MAX GRAD: d_v=22.8969
+➡️  Step 2250 | Global: 113249 | Combined Loss: 2.8654 | BPC: 4.113 | LR: 1.62e-4 | RAM: 233MB
+   📐 MAX GRAD: d_v=33.7632
+➡️  Step 2300 | Global: 113299 | Combined Loss: 2.7622 | BPC: 3.963 | LR: 1.62e-4 | RAM: 234MB
+   📐 MAX GRAD: d_v=26.6166
+➡️  Step 2350 | Global: 113349 | Combined Loss: 2.9115 | BPC: 4.178 | LR: 1.62e-4 | RAM: 235MB
+   📐 MAX GRAD: d_v=49.0379
+➡️  Step 2400 | Global: 113399 | Combined Loss: 2.8751 | BPC: 4.128 | LR: 1.62e-4 | RAM: 236MB
+   📐 MAX GRAD: d_v=49.5084
+➡️  Step 2450 | Global: 113449 | Combined Loss: 2.8509 | BPC: 4.092 | LR: 1.62e-4 | RAM: 238MB
+   📐 MAX GRAD: d_v=22.6431
+➡️  Step 2500 | Global: 113499 | Combined Loss: 2.6887 | BPC: 3.857 | LR: 1.62e-4 | RAM: 239MB
+   📐 MAX GRAD: d_v=40.2117
+➡️  Step 2550 | Global: 113549 | Combined Loss: 2.7571 | BPC: 3.956 | LR: 1.61e-4 | RAM: 240MB
+   📐 MAX GRAD: d_v=34.5914
+➡️  Step 2600 | Global: 113599 | Combined Loss: 2.7667 | BPC: 3.97 | LR: 1.61e-4 | RAM: 241MB
+   📐 MAX GRAD: d_v=25.7382
+➡️  Step 2650 | Global: 113649 | Combined Loss: 2.7644 | BPC: 3.967 | LR: 1.61e-4 | RAM: 243MB
+   📐 MAX GRAD: d_v=38.2205
+➡️  Step 2700 | Global: 113699 | Combined Loss: 2.9087 | BPC: 4.172 | LR: 1.61e-4 | RAM: 243MB
+   📐 MAX GRAD: d_v=58.7697
+➡️  Step 2750 | Global: 113749 | Combined Loss: 2.7942 | BPC: 4.01 | LR: 1.61e-4 | RAM: 245MB
+   📐 MAX GRAD: d_v=37.9247
+➡️  Step 2800 | Global: 113799 | Combined Loss: 2.8241 | BPC: 4.054 | LR: 1.61e-4 | RAM: 246MB
+   📐 MAX GRAD: d_v=18.96
+➡️  Step 2850 | Global: 113849 | Combined Loss: 2.8181 | BPC: 4.044 | LR: 1.61e-4 | RAM: 247MB
+   📐 MAX GRAD: d_v=37.3358
+➡️  Step 2900 | Global: 113899 | Combined Loss: 2.769 | BPC: 3.975 | LR: 1.61e-4 | RAM: 248MB
+   📐 MAX GRAD: d_v=34.0993
+➡️  Step 2950 | Global: 113949 | Combined Loss: 2.7647 | BPC: 3.967 | LR: 1.61e-4 | RAM: 249MB
+   📐 MAX GRAD: d_v=26.3658
+➡️  Step 3000 | Global: 113999 | Combined Loss: 2.7961 | BPC: 4.011 | LR: 1.61e-4 | RAM: 251MB
+   📐 MAX GRAD: d_v=23.015
+💾 Auto-Saving Checkpoint...
+➡️  Step 3050 | Global: 114049 | Combined Loss: 2.8527 | BPC: 4.095 | LR: 1.61e-4 | RAM: 252MB
+   📐 MAX GRAD: d_v=36.2114
+➡️  Step 3100 | Global: 114099 | Combined Loss: 2.8193 | BPC: 4.046 | LR: 1.6e-4 | RAM: 253MB
+   📐 MAX GRAD: d_v=37.1539
+➡️  Step 3150 | Global: 114149 | Combined Loss: 2.8598 | BPC: 4.105 | LR: 1.6e-4 | RAM: 254MB
+   📐 MAX GRAD: d_v=34.2164
+➡️  Step 3200 | Global: 114199 | Combined Loss: 2.8111 | BPC: 4.034 | LR: 1.6e-4 | RAM: 256MB
+   📐 MAX GRAD: d_v=36.4088
+➡️  Step 3250 | Global: 114249 | Combined Loss: 2.7245 | BPC: 3.908 | LR: 1.6e-4 | RAM: 257MB
+   📐 MAX GRAD: d_v=35.8907
+➡️  Step 3300 | Global: 114299 | Combined Loss: 2.7337 | BPC: 3.923 | LR: 1.6e-4 | RAM: 258MB
+   📐 MAX GRAD: d_v=41.9941
+➡️  Step 3350 | Global: 114349 | Combined Loss: 2.678 | BPC: 3.841 | LR: 1.6e-4 | RAM: 259MB
+   📐 MAX GRAD: d_v=38.2164
+➡️  Step 3400 | Global: 114399 | Combined Loss: 2.8106 | BPC: 4.033 | LR: 1.6e-4 | RAM: 260MB
+   📐 MAX GRAD: d_v=24.6665
+➡️  Step 3450 | Global: 114449 | Combined Loss: 2.8766 | BPC: 4.13 | LR: 1.6e-4 | RAM: 261MB
+   📐 MAX GRAD: d_v=34.3712
+➡️  Step 3500 | Global: 114499 | Combined Loss: 2.7883 | BPC: 4.001 | LR: 1.6e-4 | RAM: 263MB
+   📐 MAX GRAD: d_v=31.3788
+➡️  Step 3550 | Global: 114549 | Combined Loss: 2.8343 | BPC: 4.066 | LR: 1.6e-4 | RAM: 264MB
+   📐 MAX GRAD: d_v=21.1223
+➡️  Step 3600 | Global: 114599 | Combined Loss: 2.7583 | BPC: 3.958 | LR: 1.59e-4 | RAM: 265MB
+   📐 MAX GRAD: d_v=34.1286
+➡️  Step 3650 | Global: 114649 | Combined Loss: 2.7549 | BPC: 3.954 | LR: 1.59e-4 | RAM: 266MB
+   📐 MAX GRAD: d_v=27.3797
+➡️  Step 3700 | Global: 114699 | Combined Loss: 2.8575 | BPC: 4.101 | LR: 1.59e-4 | RAM: 268MB
+   📐 MAX GRAD: d_v=29.3847
+➡️  Step 3750 | Global: 114749 | Combined Loss: 2.7881 | BPC: 4.002 | LR: 1.59e-4 | RAM: 269MB
+   📐 MAX GRAD: d_v=19.712
+➡️  Step 3800 | Global: 114799 | Combined Loss: 2.7752 | BPC: 3.98 | LR: 1.59e-4 | RAM: 270MB
+   📐 MAX GRAD: d_v=37.3362
+➡️  Step 3850 | Global: 114849 | Combined Loss: 2.7906 | BPC: 4.005 | LR: 1.59e-4 | RAM: 271MB
+   📐 MAX GRAD: d_v=32.292
+➡️  Step 3900 | Global: 114899 | Combined Loss: 2.8227 | BPC: 4.052 | LR: 1.59e-4 | RAM: 273MB
+   📐 MAX GRAD: d_v=46.9727
+➡️  Step 3950 | Global: 114949 | Combined Loss: 2.8721 | BPC: 4.122 | LR: 1.59e-4 | RAM: 274MB
+   📐 MAX GRAD: d_v=33.1292
+➡️  Step 4000 | Global: 114999 | Combined Loss: 2.8674 | BPC: 4.117 | LR: 1.59e-4 | RAM: 275MB
+   📐 MAX GRAD: d_v=46.7659
+💾 Auto-Saving Checkpoint...
+➡️  Step 4050 | Global: 115049 | Combined Loss: 2.8102 | BPC: 4.033 | LR: 1.59e-4 | RAM: 276MB
+   📐 MAX GRAD: d_v=28.4021
+➡️  Step 4100 | Global: 115099 | Combined Loss: 2.8048 | BPC: 4.027 | LR: 1.58e-4 | RAM: 277MB
+   📐 MAX GRAD: d_v=30.8897
+➡️  Step 4150 | Global: 115149 | Combined Loss: 2.7438 | BPC: 3.937 | LR: 1.58e-4 | RAM: 278MB
+   📐 MAX GRAD: d_v=38.987
+➡️  Step 4200 | Global: 115199 | Combined Loss: 2.7974 | BPC: 4.014 | LR: 1.58e-4 | RAM: 280MB
+   📐 MAX GRAD: d_v=26.2323
+➡️  Step 4250 | Global: 115249 | Combined Loss: 2.7918 | BPC: 4.007 | LR: 1.58e-4 | RAM: 281MB
+   📐 MAX GRAD: d_v=42.873
+➡️  Step 4300 | Global: 115299 | Combined Loss: 2.8072 | BPC: 4.029 | LR: 1.58e-4 | RAM: 282MB
+   📐 MAX GRAD: d_v=38.8144
+➡️  Step 4350 | Global: 115349 | Combined Loss: 2.857 | BPC: 4.101 | LR: 1.58e-4 | RAM: 283MB
+   📐 MAX GRAD: d_v=35.9644
+➡️  Step 4400 | Global: 115399 | Combined Loss: 2.8092 | BPC: 4.032 | LR: 1.58e-4 | RAM: 284MB
+   📐 MAX GRAD: d_v=23.8181
+➡️  Step 4450 | Global: 115449 | Combined Loss: 2.8932 | BPC: 4.153 | LR: 1.58e-4 | RAM: 286MB
+   📐 MAX GRAD: d_v=17.8992
+➡️  Step 4500 | Global: 115499 | Combined Loss: 2.7455 | BPC: 3.94 | LR: 1.58e-4 | RAM: 287MB
+   📐 MAX GRAD: d_v=28.1369
+➡️  Step 4550 | Global: 115549 | Combined Loss: 2.6228 | BPC: 3.761 | LR: 1.58e-4 | RAM: 289MB
+   📐 MAX GRAD: d_v=38.8629
+➡️  Step 4600 | Global: 115599 | Combined Loss: 2.7811 | BPC: 3.991 | LR: 1.57e-4 | RAM: 289MB
+   📐 MAX GRAD: d_v=42.5764
+➡️  Step 4650 | Global: 115649 | Combined Loss: 2.7712 | BPC: 3.977 | LR: 1.57e-4 | RAM: 294MB
+   📐 MAX GRAD: d_v=35.0092
+➡️  Step 4700 | Global: 115699 | Combined Loss: 2.7324 | BPC: 3.92 | LR: 1.57e-4 | RAM: 295MB
+   📐 MAX GRAD: d_v=36.2012
+➡️  Step 4750 | Global: 115749 | Combined Loss: 2.8738 | BPC: 4.125 | LR: 1.57e-4 | RAM: 296MB
+   📐 MAX GRAD: d_v=41.1146
+➡️  Step 4800 | Global: 115799 | Combined Loss: 2.7473 | BPC: 3.943 | LR: 1.57e-4 | RAM: 297MB
+   📐 MAX GRAD: d_v=42.4457
+➡️  Step 4850 | Global: 115849 | Combined Loss: 2.8594 | BPC: 4.105 | LR: 1.57e-4 | RAM: 298MB
+   📐 MAX GRAD: d_v=28.9201
+➡️  Step 4900 | Global: 115899 | Combined Loss: 2.7617 | BPC: 3.963 | LR: 1.57e-4 | RAM: 300MB
+   📐 MAX GRAD: d_v=41.6356
+➡️  Step 4950 | Global: 115949 | Combined Loss: 2.7499 | BPC: 3.946 | LR: 1.57e-4 | RAM: 301MB
+   📐 MAX GRAD: d_v=30.6791
+➡️  Step 5000 | Global: 115999 | Combined Loss: 2.7785 | BPC: 3.988 | LR: 1.57e-4 | RAM: 302MB
+   📐 MAX GRAD: d_v=33.1526
+💾 Auto-Saving Checkpoint...
+➡️  Step 5050 | Global: 116049 | Combined Loss: 2.7769 | BPC: 3.985 | LR: 1.57e-4 | RAM: 303MB
+   📐 MAX GRAD: d_v=33.5765
+➡️  Step 5100 | Global: 116099 | Combined Loss: 2.82 | BPC: 4.048 | LR: 1.56e-4 | RAM: 305MB
+   📐 MAX GRAD: d_v=52.8993
+➡️  Step 5150 | Global: 116149 | Combined Loss: 2.7973 | BPC: 4.015 | LR: 1.56e-4 | RAM: 306MB
+   📐 MAX GRAD: d_v=47.0401
+➡️  Step 5200 | Global: 116199 | Combined Loss: 2.8259 | BPC: 4.055 | LR: 1.56e-4 | RAM: 307MB
+   📐 MAX GRAD: d_v=33.9765
+➡️  Step 5250 | Global: 116249 | Combined Loss: 2.8258 | BPC: 4.055 | LR: 1.56e-4 | RAM: 308MB
+   📐 MAX GRAD: d_v=30.6003
+➡️  Step 5300 | Global: 116299 | Combined Loss: 2.6729 | BPC: 3.834 | LR: 1.56e-4 | RAM: 309MB
+   📐 MAX GRAD: d_v=41.0096
+➡️  Step 5350 | Global: 116349 | Combined Loss: 2.7355 | BPC: 3.924 | LR: 1.56e-4 | RAM: 310MB
+   📐 MAX GRAD: d_v=24.8387
+➡️  Step 5400 | Global: 116399 | Combined Loss: 2.6845 | BPC: 3.851 | LR: 1.56e-4 | RAM: 312MB
+   📐 MAX GRAD: d_v=36.4263
+➡️  Step 5450 | Global: 116449 | Combined Loss: 2.7308 | BPC: 3.918 | LR: 1.56e-4 | RAM: 313MB
+   📐 MAX GRAD: d_u=39.1586
+➡️  Step 5500 | Global: 116499 | Combined Loss: 2.7963 | BPC: 4.012 | LR: 1.56e-4 | RAM: 314MB
+   📐 MAX GRAD: d_v=44.6913
+➡️  Step 5550 | Global: 116549 | Combined Loss: 2.8665 | BPC: 4.115 | LR: 1.56e-4 | RAM: 315MB
+   📐 MAX GRAD: d_v=30.9338
+➡️  Step 5600 | Global: 116599 | Combined Loss: 2.7766 | BPC: 3.984 | LR: 1.55e-4 | RAM: 316MB
+   📐 MAX GRAD: d_v=43.3518
+➡️  Step 5650 | Global: 116649 | Combined Loss: 2.729 | BPC: 3.915 | LR: 1.55e-4 | RAM: 317MB
+   📐 MAX GRAD: d_v=31.0884
+➡️  Step 5700 | Global: 116699 | Combined Loss: 2.8263 | BPC: 4.057 | LR: 1.55e-4 | RAM: 319MB
+   📐 MAX GRAD: d_v=32.7536
+➡️  Step 5750 | Global: 116749 | Combined Loss: 2.9195 | BPC: 4.19 | LR: 1.55e-4 | RAM: 320MB
+   📐 MAX GRAD: d_v=37.5381
+➡️  Step 5800 | Global: 116799 | Combined Loss: 2.8042 | BPC: 4.025 | LR: 1.55e-4 | RAM: 321MB
+   📐 MAX GRAD: d_v=33.2178
+➡️  Step 5850 | Global: 116849 | Combined Loss: 2.7517 | BPC: 3.949 | LR: 1.55e-4 | RAM: 322MB
+   📐 MAX GRAD: d_v=34.6471
+➡️  Step 5900 | Global: 116899 | Combined Loss: 2.8931 | BPC: 4.152 | LR: 1.55e-4 | RAM: 324MB
+   📐 MAX GRAD: d_v=47.6639
+➡️  Step 5950 | Global: 116949 | Combined Loss: 2.7009 | BPC: 3.875 | LR: 1.55e-4 | RAM: 325MB
+   📐 MAX GRAD: d_v=41.0687
+➡️  Step 6000 | Global: 116999 | Combined Loss: 2.7962 | BPC: 4.012 | LR: 1.55e-4 | RAM: 327MB
+   📐 MAX GRAD: d_v=32.4978
+💾 Auto-Saving Checkpoint...
+➡️  Step 6050 | Global: 117049 | Combined Loss: 2.6826 | BPC: 3.848 | LR: 1.55e-4 | RAM: 328MB
+   📐 MAX GRAD: d_v=42.2369
+➡️  Step 6100 | Global: 117099 | Combined Loss: 2.9476 | BPC: 4.23 | LR: 1.54e-4 | RAM: 329MB
+   📐 MAX GRAD: d_v=46.7129
+➡️  Step 6150 | Global: 117149 | Combined Loss: 2.817 | BPC: 4.043 | LR: 1.54e-4 | RAM: 330MB
+   📐 MAX GRAD: d_v=36.5873
+➡️  Step 6200 | Global: 117199 | Combined Loss: 2.9138 | BPC: 4.183 | LR: 1.54e-4 | RAM: 331MB
+   📐 MAX GRAD: d_v=40.9732
+➡️  Step 6250 | Global: 117249 | Combined Loss: 2.8829 | BPC: 4.139 | LR: 1.54e-4 | RAM: 332MB
+   📐 MAX GRAD: d_v=36.7813
+➡️  Step 6300 | Global: 117299 | Combined Loss: 2.7824 | BPC: 3.994 | LR: 1.54e-4 | RAM: 333MB
+   📐 MAX GRAD: d_v=48.6072
+➡️  Step 6350 | Global: 117349 | Combined Loss: 2.8242 | BPC: 4.054 | LR: 1.54e-4 | RAM: 335MB
+   📐 MAX GRAD: d_v=33.2384
+➡️  Step 6400 | Global: 117399 | Combined Loss: 2.8345 | BPC: 4.068 | LR: 1.54e-4 | RAM: 336MB
+   📐 MAX GRAD: d_v=51.084
+➡️  Step 6450 | Global: 117449 | Combined Loss: 2.7681 | BPC: 3.972 | LR: 1.54e-4 | RAM: 337MB
+   📐 MAX GRAD: d_v=27.6592
+➡️  Step 6500 | Global: 117499 | Combined Loss: 2.8852 | BPC: 4.142 | LR: 1.54e-4 | RAM: 338MB
+   📐 MAX GRAD: d_v=24.1798
+➡️  Step 6550 | Global: 117549 | Combined Loss: 2.7181 | BPC: 3.9 | LR: 1.54e-4 | RAM: 339MB
+   📐 MAX GRAD: d_v=35.9136
+➡️  Step 6600 | Global: 117599 | Combined Loss: 2.7377 | BPC: 3.927 | LR: 1.53e-4 | RAM: 340MB
+   📐 MAX GRAD: d_v=42.0643
+➡️  Step 6650 | Global: 117649 | Combined Loss: 2.7225 | BPC: 3.906 | LR: 1.53e-4 | RAM: 342MB
+   📐 MAX GRAD: d_v=30.1649
+➡️  Step 6700 | Global: 117699 | Combined Loss: 2.6548 | BPC: 3.808 | LR: 1.53e-4 | RAM: 343MB
+   📐 MAX GRAD: d_v=44.7806
+➡️  Step 6750 | Global: 117749 | Combined Loss: 2.8154 | BPC: 4.041 | LR: 1.53e-4 | RAM: 344MB
+   📐 MAX GRAD: d_v=33.2431
+➡️  Step 6800 | Global: 117799 | Combined Loss: 2.8077 | BPC: 4.03 | LR: 1.53e-4 | RAM: 345MB
+   📐 MAX GRAD: d_u=48.3246
+➡️  Step 6850 | Global: 117849 | Combined Loss: 2.8 | BPC: 4.019 | LR: 1.53e-4 | RAM: 346MB
+   📐 MAX GRAD: d_v=46.9821
+➡️  Step 6900 | Global: 117899 | Combined Loss: 2.733 | BPC: 3.92 | LR: 1.53e-4 | RAM: 348MB
+   📐 MAX GRAD: d_v=23.1641
+➡️  Step 6950 | Global: 117949 | Combined Loss: 2.88 | BPC: 4.134 | LR: 1.53e-4 | RAM: 349MB
+   📐 MAX GRAD: d_v=50.0657
+➡️  Step 7000 | Global: 117999 | Combined Loss: 2.8483 | BPC: 4.087 | LR: 1.53e-4 | RAM: 351MB
+   📐 MAX GRAD: d_v=35.905
+💾 Auto-Saving Checkpoint...
+➡️  Step 7050 | Global: 118049 | Combined Loss: 2.8869 | BPC: 4.143 | LR: 1.53e-4 | RAM: 352MB
+   📐 MAX GRAD: d_v=20.8679
+➡️  Step 7100 | Global: 118099 | Combined Loss: 2.8187 | BPC: 4.045 | LR: 1.52e-4 | RAM: 353MB
+   📐 MAX GRAD: d_v=59.0298
+➡️  Step 7150 | Global: 118149 | Combined Loss: 2.8306 | BPC: 4.062 | LR: 1.52e-4 | RAM: 361MB
+   📐 MAX GRAD: d_v=41.8236
+➡️  Step 7200 | Global: 118199 | Combined Loss: 2.7633 | BPC: 3.966 | LR: 1.52e-4 | RAM: 363MB
+   📐 MAX GRAD: d_v=31.514
+➡️  Step 7250 | Global: 118249 | Combined Loss: 2.7046 | BPC: 3.88 | LR: 1.52e-4 | RAM: 364MB
+   📐 MAX GRAD: d_v=42.3581
+➡️  Step 7300 | Global: 118299 | Combined Loss: 2.794 | BPC: 4.01 | LR: 1.52e-4 | RAM: 365MB
+   📐 MAX GRAD: d_v=34.029
+➡️  Step 7350 | Global: 118349 | Combined Loss: 2.8072 | BPC: 4.029 | LR: 1.52e-4 | RAM: 366MB
+   📐 MAX GRAD: d_v=35.727
+➡️  Step 7400 | Global: 118399 | Combined Loss: 2.7176 | BPC: 3.898 | LR: 1.52e-4 | RAM: 367MB
+   📐 MAX GRAD: d_v=34.4015
+➡️  Step 7450 | Global: 118449 | Combined Loss: 2.8017 | BPC: 4.021 | LR: 1.52e-4 | RAM: 368MB
+   📐 MAX GRAD: d_v=32.6222
+➡️  Step 7500 | Global: 118499 | Combined Loss: 2.7736 | BPC: 3.98 | LR: 1.52e-4 | RAM: 370MB
+   📐 MAX GRAD: d_v=49.4179
+➡️  Step 7550 | Global: 118549 | Combined Loss: 2.785 | BPC: 3.996 | LR: 1.52e-4 | RAM: 371MB
+   📐 MAX GRAD: d_v=30.7708
+➡️  Step 7600 | Global: 118599 | Combined Loss: 2.8042 | BPC: 4.025 | LR: 1.51e-4 | RAM: 373MB
+   📐 MAX GRAD: d_v=25.5142
+➡️  Step 7650 | Global: 118649 | Combined Loss: 2.7195 | BPC: 3.901 | LR: 1.51e-4 | RAM: 374MB
+   📐 MAX GRAD: d_v=29.6293
+➡️  Step 7700 | Global: 118699 | Combined Loss: 2.7798 | BPC: 3.99 | LR: 1.51e-4 | RAM: 375MB
+   📐 MAX GRAD: d_v=42.9318
+➡️  Step 7750 | Global: 118749 | Combined Loss: 2.8574 | BPC: 4.101 | LR: 1.51e-4 | RAM: 376MB
+   📐 MAX GRAD: d_v=25.3927
+➡️  Step 7800 | Global: 118799 | Combined Loss: 2.8247 | BPC: 4.053 | LR: 1.51e-4 | RAM: 377MB
+   📐 MAX GRAD: d_v=46.1264
+➡️  Step 7850 | Global: 118849 | Combined Loss: 2.8311 | BPC: 4.064 | LR: 1.51e-4 | RAM: 378MB
+   📐 MAX GRAD: d_v=34.0385
+➡️  Step 7900 | Global: 118899 | Combined Loss: 2.8133 | BPC: 4.038 | LR: 1.51e-4 | RAM: 380MB
+   📐 MAX GRAD: d_v=44.1716
+➡️  Step 7950 | Global: 118949 | Combined Loss: 2.7193 | BPC: 3.902 | LR: 1.51e-4 | RAM: 381MB
+   📐 MAX GRAD: d_v=47.1298
+➡️  Step 8000 | Global: 118999 | Combined Loss: 2.762 | BPC: 3.963 | LR: 1.51e-4 | RAM: 382MB
+   📐 MAX GRAD: d_v=47.6611
+💾 Auto-Saving Checkpoint...
+➡️  Step 8050 | Global: 119049 | Combined Loss: 2.8082 | BPC: 4.03 | LR: 1.51e-4 | RAM: 383MB
+   📐 MAX GRAD: d_v=39.2321
+➡️  Step 8100 | Global: 119099 | Combined Loss: 2.7898 | BPC: 4.003 | LR: 1.51e-4 | RAM: 384MB
+   📐 MAX GRAD: d_v=41.0915
+➡️  Step 8150 | Global: 119149 | Combined Loss: 2.7779 | BPC: 3.986 | LR: 1.5e-4 | RAM: 386MB
+   📐 MAX GRAD: d_v=35.1307
+➡️  Step 8200 | Global: 119199 | Combined Loss: 2.7666 | BPC: 3.97 | LR: 1.5e-4 | RAM: 386MB
+   📐 MAX GRAD: d_v=36.8804
+➡️  Step 8250 | Global: 119249 | Combined Loss: 2.7948 | BPC: 4.011 | LR: 1.5e-4 | RAM: 388MB
+   📐 MAX GRAD: d_v=39.0642
+➡️  Step 8300 | Global: 119299 | Combined Loss: 2.8174 | BPC: 4.043 | LR: 1.5e-4 | RAM: 389MB
+   📐 MAX GRAD: d_v=32.2472
+➡️  Step 8350 | Global: 119349 | Combined Loss: 2.8039 | BPC: 4.024 | LR: 1.5e-4 | RAM: 390MB
+   📐 MAX GRAD: d_u=41.1491
+➡️  Step 8400 | Global: 119399 | Combined Loss: 2.7105 | BPC: 3.889 | LR: 1.5e-4 | RAM: 392MB
+   📐 MAX GRAD: d_v=37.9813
+➡️  Step 8450 | Global: 119449 | Combined Loss: 2.7126 | BPC: 3.891 | LR: 1.5e-4 | RAM: 393MB
+   📐 MAX GRAD: d_v=37.7157
+➡️  Step 8500 | Global: 119499 | Combined Loss: 2.8472 | BPC: 4.086 | LR: 1.5e-4 | RAM: 393MB
+   📐 MAX GRAD: d_v=43.1586
+➡️  Step 8550 | Global: 119549 | Combined Loss: 2.8791 | BPC: 4.133 | LR: 1.5e-4 | RAM: 395MB
+   📐 MAX GRAD: d_v=38.8344
+➡️  Step 8600 | Global: 119599 | Combined Loss: 2.6974 | BPC: 3.869 | LR: 1.5e-4 | RAM: 396MB
+   📐 MAX GRAD: d_v=41.5102
+➡️  Step 8650 | Global: 119649 | Combined Loss: 2.7507 | BPC: 3.946 | LR: 1.49e-4 | RAM: 397MB
+   📐 MAX GRAD: d_v=38.5363
+➡️  Step 8700 | Global: 119699 | Combined Loss: 2.8328 | BPC: 4.066 | LR: 1.49e-4 | RAM: 399MB
+   📐 MAX GRAD: d_v=37.0861
+➡️  Step 8750 | Global: 119749 | Combined Loss: 2.7197 | BPC: 3.902 | LR: 1.49e-4 | RAM: 400MB
+   📐 MAX GRAD: d_v=45.455
+➡️  Step 8800 | Global: 119799 | Combined Loss: 2.8232 | BPC: 4.05 | LR: 1.49e-4 | RAM: 401MB
+   📐 MAX GRAD: d_v=36.8487
+➡️  Step 8850 | Global: 119849 | Combined Loss: 2.6571 | BPC: 3.811 | LR: 1.49e-4 | RAM: 402MB
+   📐 MAX GRAD: d_v=33.4799
+➡️  Step 8900 | Global: 119899 | Combined Loss: 2.8248 | BPC: 4.053 | LR: 1.49e-4 | RAM: 403MB
+   📐 MAX GRAD: d_v=47.8397
+➡️  Step 8950 | Global: 119949 | Combined Loss: 2.8633 | BPC: 4.109 | LR: 1.49e-4 | RAM: 404MB
+   📐 MAX GRAD: d_v=27.4383
+➡️  Step 9000 | Global: 119999 | Combined Loss: 2.7485 | BPC: 3.944 | LR: 1.49e-4 | RAM: 405MB
+   📐 MAX GRAD: d_v=31.7599
+💾 Auto-Saving Checkpoint...
+➡️  Step 9050 | Global: 120049 | Combined Loss: 2.7 | BPC: 3.874 | LR: 1.49e-4 | RAM: 407MB
+   📐 MAX GRAD: d_v=23.1061
+➡️  Step 9100 | Global: 120099 | Combined Loss: 2.8294 | BPC: 4.061 | LR: 1.49e-4 | RAM: 408MB
+   📐 MAX GRAD: d_v=33.8872
+➡️  Step 9150 | Global: 120149 | Combined Loss: 2.7783 | BPC: 3.987 | LR: 1.48e-4 | RAM: 409MB
+   📐 MAX GRAD: d_v=28.9522
+➡️  Step 9200 | Global: 120199 | Combined Loss: 2.6894 | BPC: 3.859 | LR: 1.48e-4 | RAM: 410MB
+   📐 MAX GRAD: d_v=43.584
+➡️  Step 9250 | Global: 120249 | Combined Loss: 2.6921 | BPC: 3.861 | LR: 1.48e-4 | RAM: 411MB
+   📐 MAX GRAD: d_v=31.1234
+➡️  Step 9300 | Global: 120299 | Combined Loss: 2.8131 | BPC: 4.038 | LR: 1.48e-4 | RAM: 413MB
+   📐 MAX GRAD: d_v=49.5331
+➡️  Step 9350 | Global: 120349 | Combined Loss: 2.8579 | BPC: 4.102 | LR: 1.48e-4 | RAM: 414MB
+   📐 MAX GRAD: d_v=24.5415
+➡️  Step 9400 | Global: 120399 | Combined Loss: 2.788 | BPC: 4.001 | LR: 1.48e-4 | RAM: 415MB
+   📐 MAX GRAD: d_v=39.8057
+➡️  Step 9450 | Global: 120449 | Combined Loss: 2.7619 | BPC: 3.962 | LR: 1.48e-4 | RAM: 416MB
+   📐 MAX GRAD: d_v=39.8585
+➡️  Step 9500 | Global: 120499 | Combined Loss: 2.86 | BPC: 4.106 | LR: 1.48e-4 | RAM: 418MB
+   📐 MAX GRAD: d_v=42.5439
+➡️  Step 9550 | Global: 120549 | Combined Loss: 2.8416 | BPC: 4.077 | LR: 1.48e-4 | RAM: 419MB
+   📐 MAX GRAD: d_v=27.4817
+➡️  Step 9600 | Global: 120599 | Combined Loss: 2.8249 | BPC: 4.054 | LR: 1.48e-4 | RAM: 420MB
+   📐 MAX GRAD: d_v=34.2335
+➡️  Step 9650 | Global: 120649 | Combined Loss: 2.8066 | BPC: 4.028 | LR: 1.47e-4 | RAM: 421MB
+   📐 MAX GRAD: d_v=47.8728
+➡️  Step 9700 | Global: 120699 | Combined Loss: 2.7557 | BPC: 3.953 | LR: 1.47e-4 | RAM: 422MB
+   📐 MAX GRAD: d_v=39.3208
+➡️  Step 9750 | Global: 120749 | Combined Loss: 2.7007 | BPC: 3.875 | LR: 1.47e-4 | RAM: 424MB
+   📐 MAX GRAD: d_v=46.8802
+➡️  Step 9800 | Global: 120799 | Combined Loss: 2.8317 | BPC: 4.065 | LR: 1.47e-4 | RAM: 425MB
+   📐 MAX GRAD: d_v=22.6099
+➡️  Step 9850 | Global: 120849 | Combined Loss: 2.7814 | BPC: 3.991 | LR: 1.47e-4 | RAM: 426MB
+   📐 MAX GRAD: d_v=41.377
+➡️  Step 9900 | Global: 120899 | Combined Loss: 2.8481 | BPC: 4.087 | LR: 1.47e-4 | RAM: 427MB
+   📐 MAX GRAD: d_v=14.0107
+➡️  Step 9950 | Global: 120949 | Combined Loss: 2.8816 | BPC: 4.135 | LR: 1.47e-4 | RAM: 429MB
+   📐 MAX GRAD: d_v=41.5549
+➡️  Step 10000 | Global: 120999 | Combined Loss: 2.7656 | BPC: 3.968 | LR: 1.47e-4 | RAM: 429MB
+   📐 MAX GRAD: d_v=37.7265
+💾 Auto-Saving Checkpoint...
+➡️  Step 10050 | Global: 121049 | Combined Loss: 2.827 | BPC: 4.057 | LR: 1.47e-4 | RAM: 431MB
+   📐 MAX GRAD: d_v=39.2059
+➡️  Step 10100 | Global: 121099 | Combined Loss: 2.7389 | BPC: 3.929 | LR: 1.47e-4 | RAM: 432MB
+   📐 MAX GRAD: d_v=39.7608
+➡️  Step 10150 | Global: 121149 | Combined Loss: 2.7776 | BPC: 3.985 | LR: 1.46e-4 | RAM: 433MB
+   📐 MAX GRAD: d_v=20.9461
+➡️  Step 10200 | Global: 121199 | Combined Loss: 2.8536 | BPC: 4.096 | LR: 1.46e-4 | RAM: 435MB
+   📐 MAX GRAD: d_v=35.3519
+➡️  Step 10250 | Global: 121249 | Combined Loss: 2.7779 | BPC: 3.986 | LR: 1.46e-4 | RAM: 436MB
+   📐 MAX GRAD: d_v=62.0317
+➡️  Step 10300 | Global: 121299 | Combined Loss: 2.9582 | BPC: 4.246 | LR: 1.46e-4 | RAM: 437MB
+   📐 MAX GRAD: d_v=39.2489
+➡️  Step 10350 | Global: 121349 | Combined Loss: 2.7028 | BPC: 3.877 | LR: 1.46e-4 | RAM: 438MB
+   📐 MAX GRAD: d_v=41.1363
+➡️  Step 10400 | Global: 121399 | Combined Loss: 2.7553 | BPC: 3.954 | LR: 1.46e-4 | RAM: 439MB
+   📐 MAX GRAD: d_v=49.1477
+➡️  Step 10450 | Global: 121449 | Combined Loss: 2.912 | BPC: 4.176 | LR: 1.46e-4 | RAM: 441MB
+   📐 MAX GRAD: d_u=65.9101
+➡️  Step 10500 | Global: 121499 | Combined Loss: 2.8354 | BPC: 4.07 | LR: 1.46e-4 | RAM: 442MB
+   📐 MAX GRAD: d_v=30.8304
+➡️  Step 10550 | Global: 121549 | Combined Loss: 2.7905 | BPC: 4.004 | LR: 1.46e-4 | RAM: 443MB
+   📐 MAX GRAD: d_v=52.2814
+➡️  Step 10600 | Global: 121599 | Combined Loss: 2.7917 | BPC: 4.006 | LR: 1.46e-4 | RAM: 444MB
+   📐 MAX GRAD: d_v=34.7781
+➡️  Step 10650 | Global: 121649 | Combined Loss: 2.7851 | BPC: 3.996 | LR: 1.45e-4 | RAM: 445MB
+   📐 MAX GRAD: d_v=36.8333
+➡️  Step 10700 | Global: 121699 | Combined Loss: 2.6395 | BPC: 3.784 | LR: 1.45e-4 | RAM: 446MB
+   📐 MAX GRAD: d_v=34.8403
+➡️  Step 10750 | Global: 121749 | Combined Loss: 2.7553 | BPC: 3.953 | LR: 1.45e-4 | RAM: 447MB
+   📐 MAX GRAD: d_v=43.1181
+➡️  Step 10800 | Global: 121799 | Combined Loss: 2.7796 | BPC: 3.989 | LR: 1.45e-4 | RAM: 449MB
+   📐 MAX GRAD: d_v=38.1622
+➡️  Step 10850 | Global: 121849 | Combined Loss: 2.7503 | BPC: 3.945 | LR: 1.45e-4 | RAM: 450MB
+   📐 MAX GRAD: d_v=46.5944
+➡️  Step 10900 | Global: 121899 | Combined Loss: 2.8191 | BPC: 4.045 | LR: 1.45e-4 | RAM: 451MB
+   📐 MAX GRAD: d_v=25.8983
+➡️  Step 10950 | Global: 121949 | Combined Loss: 2.741 | BPC: 3.932 | LR: 1.45e-4 | RAM: 453MB
+   📐 MAX GRAD: d_v=48.4151
+➡️  Step 11000 | Global: 121999 | Combined Loss: 2.7842 | BPC: 3.995 | LR: 1.45e-4 | RAM: 454MB
+   📐 MAX GRAD: d_v=37.7258
+💾 Auto-Saving Checkpoint...
+➡️  Step 11050 | Global: 122049 | Combined Loss: 2.7149 | BPC: 3.895 | LR: 1.45e-4 | RAM: 455MB
+   📐 MAX GRAD: d_v=42.495
+➡️  Step 11100 | Global: 122099 | Combined Loss: 2.7913 | BPC: 4.004 | LR: 1.45e-4 | RAM: 457MB
+   📐 MAX GRAD: d_v=20.912
+➡️  Step 11150 | Global: 122149 | Combined Loss: 2.8467 | BPC: 4.085 | LR: 1.44e-4 | RAM: 458MB
+   📐 MAX GRAD: d_v=44.5714
+➡️  Step 11200 | Global: 122199 | Combined Loss: 2.7788 | BPC: 3.987 | LR: 1.44e-4 | RAM: 459MB
+   📐 MAX GRAD: d_v=27.9683
+➡️  Step 11250 | Global: 122249 | Combined Loss: 2.8262 | BPC: 4.055 | LR: 1.44e-4 | RAM: 460MB
+   📐 MAX GRAD: d_v=52.3287
+➡️  Step 11300 | Global: 122299 | Combined Loss: 2.8455 | BPC: 4.084 | LR: 1.44e-4 | RAM: 461MB
+   📐 MAX GRAD: d_v=37.5738
+➡️  Step 11350 | Global: 122349 | Combined Loss: 2.9289 | BPC: 4.202 | LR: 1.44e-4 | RAM: 462MB
+   📐 MAX GRAD: d_v=57.7729
+➡️  Step 11400 | Global: 122399 | Combined Loss: 2.9512 | BPC: 4.236 | LR: 1.44e-4 | RAM: 464MB
+   📐 MAX GRAD: d_v=45.8038
+➡️  Step 11450 | Global: 122449 | Combined Loss: 2.7356 | BPC: 3.925 | LR: 1.44e-4 | RAM: 465MB
+   📐 MAX GRAD: d_u=43.374
+➡️  Step 11500 | Global: 122499 | Combined Loss: 2.7404 | BPC: 3.932 | LR: 1.44e-4 | RAM: 466MB
+   📐 MAX GRAD: d_v=31.9372
+➡️  Step 11550 | Global: 122549 | Combined Loss: 2.7625 | BPC: 3.963 | LR: 1.44e-4 | RAM: 468MB
+   📐 MAX GRAD: d_v=33.5232
+➡️  Step 11600 | Global: 122599 | Combined Loss: 2.9004 | BPC: 4.163 | LR: 1.44e-4 | RAM: 469MB
+   📐 MAX GRAD: d_v=53.3388
+➡️  Step 11650 | Global: 122649 | Combined Loss: 2.8953 | BPC: 4.156 | LR: 1.43e-4 | RAM: 470MB
+   📐 MAX GRAD: d_v=51.565
+➡️  Step 11700 | Global: 122699 | Combined Loss: 2.8332 | BPC: 4.066 | LR: 1.43e-4 | RAM: 472MB
+   📐 MAX GRAD: d_v=29.5685
+➡️  Step 11750 | Global: 122749 | Combined Loss: 2.8361 | BPC: 4.069 | LR: 1.43e-4 | RAM: 473MB
+   📐 MAX GRAD: d_v=44.7077
+➡️  Step 11800 | Global: 122799 | Combined Loss: 2.7605 | BPC: 3.961 | LR: 1.43e-4 | RAM: 475MB
+   📐 MAX GRAD: d_v=40.2334
+➡️  Step 11850 | Global: 122849 | Combined Loss: 2.8403 | BPC: 4.075 | LR: 1.43e-4 | RAM: 475MB
+   📐 MAX GRAD: d_v=47.9176
+➡️  Step 11900 | Global: 122899 | Combined Loss: 2.7366 | BPC: 3.926 | LR: 1.43e-4 | RAM: 476MB
+   📐 MAX GRAD: d_v=32.2266
+➡️  Step 11950 | Global: 122949 | Combined Loss: 2.7737 | BPC: 3.979 | LR: 1.43e-4 | RAM: 490MB
+   📐 MAX GRAD: d_v=39.1762
+➡️  Step 12000 | Global: 122999 | Combined Loss: 2.9137 | BPC: 4.182 | LR: 1.43e-4 | RAM: 491MB
+   📐 MAX GRAD: d_v=45.6338
+💾 Auto-Saving Checkpoint...
+➡️  Step 12050 | Global: 123049 | Combined Loss: 2.7561 | BPC: 3.954 | LR: 1.43e-4 | RAM: 493MB
+   📐 MAX GRAD: d_v=44.172
+➡️  Step 12100 | Global: 123099 | Combined Loss: 2.9848 | BPC: 4.284 | LR: 1.43e-4 | RAM: 493MB
+   📐 MAX GRAD: d_v=58.2669
 ```
