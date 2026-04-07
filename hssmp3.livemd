@@ -1,0 +1,2544 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# HSSMP3
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN for Rank 2 Tensors)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # pred and target are {batch_size, dim}
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    # 1. Batched Dot Product: {batch, dim} x {dim, batch} -> {batch, batch}
+    # This creates a similarity matrix comparing every pred to every target in the batch
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 2. Create Identity Targets -> {batch, batch}
+    batch_size = Nx.axis_size(pred, 0)
+    # ⚡ THE FIX: Pass a 2D tuple {32, 32} instead of a 1D tuple {32}
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    # 3. Manual Dense Log-Softmax
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))ozen_w2,
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 27, ...>>, true}
+```
+
+```elixir
+defmodule DLM.SinkhornOT do
+  import Nx.Defn
+
+  defn cost_matrix(pred, target) do
+    p_exp = Nx.new_axis(pred, 1)
+    t_exp = Nx.new_axis(target, 0)
+    diff = Nx.subtract(p_exp, t_exp)
+    Nx.sum(Nx.pow(diff, 2), axes: [-1])
+  end
+
+  # ⚡ FIX 1: Bump the default epsilon up to 10.0 to handle your 512D spatial scale
+  defn compute(pred, target, epsilon \\ 10.0, max_iters \\ 5) do
+    c = cost_matrix(pred, target)
+    k = Nx.exp(Nx.divide(Nx.negate(c), epsilon))
+    
+    batch_size = Nx.axis_size(pred, 0)
+    mass = 1.0 / batch_size
+    mu = Nx.broadcast(mass, {batch_size})
+    nu = Nx.broadcast(mass, {batch_size})
+
+    {_final_k, u_final, v_final, _mu, _nu, _i} =
+      while {k_mat = k, 
+             u = Nx.broadcast(1.0, {batch_size}), 
+             _v = Nx.broadcast(1.0, {batch_size}), 
+             m = mu, n = nu, i = 0},
+            Nx.less(i, max_iters) do
+            
+        # ⚡ FIX 2: Add 1.0e-8 to the denominator to mathematically prevent NaN crashes
+        denom_v = Nx.add(Nx.dot(Nx.transpose(k_mat), u), 1.0e-8)
+        v_new = Nx.divide(n, denom_v)
+        
+        denom_u = Nx.add(Nx.dot(k_mat, v_new), 1.0e-8)
+        u_new = Nx.divide(m, denom_u)
+
+        {k_mat, u_new, v_new, m, n, i + 1}
+      end
+
+    u_exp = Nx.new_axis(u_final, 1)
+    v_exp = Nx.new_axis(v_final, 0)
+    p = Nx.multiply(Nx.multiply(u_exp, k), v_exp)
+
+    Nx.sum(Nx.multiply(p, c))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SinkhornOT, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Main SSM
+
+```elixir
+defmodule DLM.Main_SSM do
+  import Nx.Defn
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn softplus(x) do
+    # ⚡ UNBREAKABLE SOFTPLUS: Guaranteed stable in forward AND backward passes
+    Nx.max(x, 0.0) + Nx.log1p(Nx.exp(-Nx.abs(x)))
+  end
+
+  defn apply_svd_weight(x, u, v) do
+    x |> Nx.dot(u) |> softplus() |> Nx.dot(v)
+  end
+
+  # ⚡ The core physics step (Used heavily by the new Master Loop)
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2) do
+    # 1. Local Mixers
+    mix1 = apply_svd_weight(x_p2, mu1, mv1)
+    mix2 = apply_svd_weight(x_p1, mu2, mv2)
+    x_mixed = Nx.add(x_t, Nx.add(mix1, mix2))
+    
+    # 2. Input Force
+    b_proj = apply_svd_weight(x_mixed, bu, bv)
+    delta = Nx.tensor(0.1, type: :f32)
+    
+    # 3. Friction
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    b_bar = Nx.multiply(delta, b_proj)
+    
+    # 4. Momentum Update
+    h_new = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    
+    # 5. Output Velocity
+    out_proj = apply_svd_weight(h_new, cu, cv)
+    
+    # 6. Skip Connection
+    skip = apply_svd_weight(x_t, du, dv)
+    
+    y_t = Nx.add(out_proj, skip)
+    
+    {y_t, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM, <<70, 79, 82, 49, 0, 0, 29, ...>>, true}
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  defn newton_schulz(g, iters \\ 5) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) + 1.0e-7
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, iters) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_update(grad, lr) do
+    Nx.subtract(0.0, Nx.multiply(lr, newton_schulz(grad)))
+  end
+
+  defn adam_update(param, grad, m, v, step, lr) do
+    safe_step = step + 1.0
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  defn step(params, grads, ms, vs, step_count, lr) do
+    # ⚡ Unpack EXACTLY 13 elements!
+    {p_a, p_bu, p_bv, p_cu, p_cv, p_du, p_dv,
+      p_mu1, p_mv1, p_mu2, p_mv2, p_lmw, p_lmb, p_gw, p_gb} = params
+  
+    {g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv,
+      g_mu1, g_mv1, g_mu2, g_mv2, g_lmw, g_lmb, g_gw, g_gb} = grads
+  
+    {m_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+      m_mu1, m_mv1, m_mu2, m_mv2, m_lmw, m_lmb, m_gw, m_gb} = ms
+  
+    {v_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+      v_mu1, v_mv1, v_mu2, v_mv2, v_lmw, v_lmb, v_gw, v_gb} = vs
+  
+    # Adam for scalars and output head
+    {up_a,   nm_a,   nv_a}   = adam_update(p_a,   g_a,   m_a,   v_a,   step_count, lr)
+    {up_lmw, nm_lmw, nv_lmw} = adam_update(p_lmw, g_lmw, m_lmw, v_lmw, step_count, lr)
+    {up_lmb, nm_lmb, nv_lmb} = adam_update(p_lmb, g_lmb, m_lmb, v_lmb, step_count, lr)
+    {up_gw, nm_gw, nv_gw} = adam_update(p_gw, g_gw, m_gw, v_gw, step_count, lr)
+    {up_gb, nm_gb, nv_gb} = adam_update(p_gb, g_gb, m_gb, v_gb, step_count, lr)
+    
+    
+    # Muon for SVD matrices
+    up_bu  = p_bu  + muon_update(g_bu,  lr)
+    up_bv  = p_bv  + muon_update(g_bv,  lr)
+    up_cu  = p_cu  + muon_update(g_cu,  lr)
+    up_cv  = p_cv  + muon_update(g_cv,  lr)
+    up_du  = p_du  + muon_update(g_du,  lr)
+    up_dv  = p_dv  + muon_update(g_dv,  lr)
+    up_mu1 = p_mu1 + muon_update(g_mu1, lr)
+    up_mv1 = p_mv1 + muon_update(g_mv1, lr)
+    up_mu2 = p_mu2 + muon_update(g_mu2, lr)
+    up_mv2 = p_mv2 + muon_update(g_mv2, lr)
+  
+    # Repack 13 elements
+    new_params = {up_a, up_bu, up_bv, up_cu, up_cv, up_du, up_dv,
+                  up_mu1, up_mv1, up_mu2, up_mv2, up_lmw, up_lmb, up_gw, up_gb}
+  
+    new_ms = {nm_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv,
+              m_mu1, m_mv1, m_mu2, m_mv2, nm_lmw, nm_lmb, nm_gw, nm_gb}
+  
+    new_vs = {nv_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv,
+              v_mu1, v_mv1, v_mu2, v_mv2, nv_lmw, nv_lmb, nv_gw, nv_gb}
+  
+    {new_params, new_ms, new_vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.MuonHybrid, <<70, 79, 82, 49, 0, 0, 42, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Main_SSM_Genesis do
+  @vocab_size 128
+  @dim 512
+  @rank 64
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    
+    {a_diag, key} = Nx.Random.normal(key, -2.0, 0.1, shape: {@dim})
+    {b_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {b_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {c_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {c_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {d_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {d_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    
+    # Output Head
+    {lm_w,   key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @vocab_size})
+    {lm_b,   key} = Nx.Random.normal(key, 0.0, 0.0,  shape: {@vocab_size})
+    
+    # ⚡ NEW: The Boundary Gate Weights (Projects 512D -> 1D scalar)
+    {gate_w, _key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, 1})
+
+    
+    # ⚡ THE NEW SPRING: Force the gate closed at initialization
+    gate_b = Nx.tensor([-3.0], type: :f32)
+
+    # 15 Parameters Total
+    {a_diag, b_u, b_v, c_u, c_v, d_u, d_v, mx_u1, mx_v1, mx_u2, mx_v2, lm_w, lm_b, gate_w, gate_b}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = DLM.Tree.map(params, zero_like)
+    vs = DLM.Tree.map(params, zero_like)
+    {ms, vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM_Genesis, <<70, 79, 82, 49, 0, 0, 16, ...>>, {:init_optimizer, 1}}
+```
+
+```elixir
+defmodule DLM.TinySSM do
+  import Nx.Defn
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    activated = gelu(hidden) 
+    Nx.dot(activated, v)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn forward(x_t, h_prev, params) do
+    # ⚡ Unpack the 7 parameters
+    {a, bu, bv, cu, cv, du, dv} = params
+
+    b_proj = apply_svd(x_t, bu, bv)
+    
+    # ⚡ The Dynamic Gate
+    gate_proj = apply_svd(x_t, du, dv)
+    delta = Nx.max(softplus(gate_proj), 1.0e-4) # Minimum step size for stability
+    
+    # Dynamic Friction & Force
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    b_bar = Nx.multiply(delta, b_proj)
+    
+    h_new = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    
+    predicted_vector = apply_svd(h_new, cu, cv)
+    
+    {predicted_vector, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
+```
+
+## Layer 2
+
+```elixir
+defmodule DLM.Surgery do
+  def upgrade_to_tier3(old_ckpt_path, new_prefix, gpu) do
+    IO.puts("🔪 Performing Tensor Surgery on #{old_ckpt_path}...")
+    ckpt = File.read!(old_ckpt_path) |> :erlang.binary_to_term()
+    
+    # 1. Unpack the 15 Phase 3 parameters
+    {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, _old_lmw, _old_lmb, g1_w, g1_b} = ckpt.params
+    
+    # 2. Re-pack the 13 parameters for the Mid Level (Discarding the old head)
+    mid_p = {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, g1_w, g1_b}
+    
+    # 3. Initialize a brand new Top Level (15 parameters, including g2 and the new head)
+    key = Nx.Random.key(42)
+    {top_p, _} = DLM.Main_SSM_Genesis.init_phase3(key) 
+    # (Assuming your init function generates the a...mv2, lm_w, lm_b, g2_w, and -3.0 g2_b)
+    
+    # 4. Initialize fresh optimizer states for the paired {mid, top} tuple
+    zero_mid = DLM.Tree.map(mid_p, fn t -> Nx.broadcast(0.0, Nx.shape(t)) end)
+    zero_top = DLM.Tree.map(top_p, fn t -> Nx.broadcast(0.0, Nx.shape(t)) end)
+    
+    # 5. Save the new 3-Tier Genesis Checkpoint
+    state = %{
+      params: {mid_p, top_p},
+      ms: {zero_mid, zero_top},
+      vs: {zero_mid, zero_top},
+      step: 0,
+      h_base: Nx.broadcast(0.0, {1, 512}),
+      h_mid: Nx.broadcast(0.0, {1, 512}), # The old h_top is now h_mid
+      h_top: Nx.broadcast(0.0, {1, 512})  # Brand new grammatical memory
+    }
+    
+    File.write!("#{new_prefix}_checkpoint_step_0.bin", :erlang.term_to_binary(state))
+    IO.puts("✅ Surgery Complete. Ready for Phase 4.")
+  end
+end
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+DLM.Surgery.upgrade_to_tier3("v34_DLM_Phase_3_Top_Biased_checkpoint_step_80000.bin", "v35_level_2", gpu)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inferece
+
+```elixir
+defmodule DLM.Generator do
+  import Nx.Defn
+
+  # ⚡ 1. The Single Forward Step
+  defn step(char_idx, h_base, h_top, xp1, xp2, frozen_base_p, top_p, f_map) do
+    # Unpack params
+    {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, lm_w, lm_b, gate_w, gate_b} = top_p
+
+    # Get the continuous 512D coordinate for this discrete character
+    coord = Nx.take(f_map, Nx.reshape(char_idx, {1})) |> Nx.reshape({1, 512})
+
+    # Physics Engine Step
+    {_y_b, h_b_new} = DLM.TinySSM.forward(coord, h_base, frozen_base_p)
+
+    # The Boundary Gate
+    gate_logit = Nx.add(Nx.dot(h_b_new, gate_w), gate_b)
+    g = Nx.sigmoid(gate_logit)
+
+    # Top Level Logic Step
+    {y_t, h_t_cand} = DLM.Main_SSM.ssm_recurrence(
+      h_b_new, xp1, xp2, h_top, 
+      a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+    )
+
+    # Continuous Interpolation & Memory Flush
+    h_t_new = Nx.add(Nx.multiply(g, h_t_cand), Nx.multiply(Nx.subtract(1.0, g), h_top))
+    h_b_flushed = Nx.multiply(h_b_new, Nx.subtract(1.0, g))
+
+    # Output Head
+    y_final = DLM.Main_SSM.rms_norm(y_t)
+    logits = Nx.add(Nx.dot(y_final, lm_w), lm_b) |> Nx.squeeze()
+
+    # Return logits, the updated states, the shift register (xp1/xp2), and the gate value
+    {logits, h_b_flushed, h_t_new, h_b_new, xp1, Nx.squeeze(g)}
+  end
+
+  # ⚡ 2. The Gumbel Sampler
+  defn sample(logits, key, temperature) do
+    scaled = Nx.divide(logits, Nx.add(temperature, 1.0e-5))
+    {u, next_key} = Nx.Random.uniform(key, 0.0, 1.0, shape: Nx.shape(scaled))
+    
+    # Gumbel noise distribution
+    gumbel = Nx.negate(Nx.log(Nx.negate(Nx.log(Nx.add(u, 1.0e-7)))))
+    noisy = Nx.add(scaled, gumbel)
+    
+    {Nx.argmax(noisy), next_key}
+  end
+
+  # ⚡ 3. The Generation Loop (Runs in standard Elixir)
+  def generate(prompt, num_tokens, temp, f_base_p, t_p, f_map, gpu) do
+    prompt_tokens = to_charlist(prompt)
+    key = Nx.Random.key(System.system_time(:second)) |> Nx.backend_copy(gpu)
+    
+    # Initialize blank states
+    h_b = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+    h_t = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+    xp1 = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+    xp2 = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+
+    # Warmup Phase (Feed the prompt in without sampling)
+    IO.puts("🔥 Warming up semantic context...")
+    {warm_hb, warm_ht, warm_xp1, warm_xp2} = Enum.reduce(prompt_tokens, {h_b, h_t, xp1, xp2}, 
+      fn char, {cb, ct, cx1, cx2} ->
+        char_tensor = Nx.tensor(char, type: :s32) |> Nx.backend_copy(gpu)
+        {_logits, nb, nt, nx1, nx2, _g} = step(char_tensor, cb, ct, cx1, cx2, f_base_p, t_p, f_map)
+        {nb, nt, nx1, nx2}
+      end
+    )
+
+    # Generation Phase
+    IO.puts("\n🚀 Generating...\n")
+    IO.write(prompt)
+
+    last_char = List.last(prompt_tokens)
+
+    Enum.reduce(1..num_tokens, {last_char, warm_hb, warm_ht, warm_xp1, warm_xp2, key}, 
+      fn _i, {curr_char, cb, ct, cx1, cx2, cur_key} ->
+        
+        char_tensor = Nx.tensor(curr_char, type: :s32) |> Nx.backend_copy(gpu)
+        
+        # Step the network
+        {logits, nb, nt, nx1, nx2, g_tensor} = step(char_tensor, cb, ct, cx1, cx2, f_base_p, t_p, f_map)
+        
+        # Sample the next character
+        {next_char_tensor, next_key} = sample(logits, cur_key, Nx.tensor(temp, type: :f32))
+        next_char = Nx.to_number(next_char_tensor)
+        
+        # Pull the gate value for visualization
+        g_val = Nx.to_number(g_tensor)
+        
+        # If the gate spikes above 0.5, we'll visually mark it with a pipe |
+        marker = if g_val > 0.5, do: "|", else: ""
+        IO.write("#{marker}#{List.to_string([next_char])}")
+
+        {next_char, nb, nt, nx1, nx2, next_key}
+      end
+    )
+    IO.puts("\n\n✅ Done.")
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Generator, <<70, 79, 82, 49, 0, 0, 37, ...>>, {:generate, 7}}
+```
+
+```elixir
+defmodule DLM.BLiMP do
+  import Nx.Defn
+
+  # ⚡ 1. The Evaluation Forward Pass
+  defn eval_loss(tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p) do
+    seq_len = Nx.axis_size(tokens, 1) - 1
+    
+    input_tokens = Nx.slice_along_axis(tokens, 0, seq_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(tokens, 1, seq_len, axis: 1)
+
+    # Map to coordinates
+    clean_coords = Nx.take(frozen_map, Nx.flatten(input_tokens))
+                   |> Nx.reshape({1, seq_len, 512})
+                   
+    in_t = Nx.transpose(clean_coords, axes: [1, 0, 2])
+    targ_t = Nx.transpose(target_tokens, axes: [1, 0])
+
+    zero_frame = Nx.broadcast(0.0, {1, 512})
+
+    result =
+      while {i = 0, total_loss = 0.0, 
+             h_base = h_base_init, h_top = h_top_init,
+             xp1 = zero_frame, xp2 = zero_frame,
+             x_in = in_t, y_targ = targ_t,
+             b_p = frozen_base_p, t_p = top_p, f_map = frozen_map}, 
+            Nx.less(i, seq_len) do
+            
+        x_curr = x_in[i]
+
+        # 1. Base SSM
+        {_y_base, h_base_new} = DLM.TinySSM.forward(x_curr, h_base, b_p)
+
+        # ⚡ Unpack 15 Top Params (Added gate_b)
+        {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, lm_w, lm_b, gate_w, gate_b} = t_p
+
+        # ⚡ 2. Boundary Gate (Added the spring bias)
+        gate_logit = Nx.add(Nx.dot(h_base_new, gate_w), gate_b)
+        g = Nx.sigmoid(gate_logit) 
+
+        # 3. Top SSM
+        {y_top, h_top_candidate} = DLM.Main_SSM.ssm_recurrence(
+          h_base_new, xp1, xp2, h_top, 
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+        )
+
+        # 4. Continuous Update
+        h_top_new = Nx.add(Nx.multiply(g, h_top_candidate), Nx.multiply(Nx.subtract(1.0, g), h_top))
+        h_base_flushed = Nx.multiply(h_base_new, Nx.subtract(1.0, g))
+
+        # 5. Output Head & Cross Entropy
+        y_final = DLM.Main_SSM.rms_norm(y_top)
+        logits = Nx.add(Nx.dot(y_final, lm_w), lm_b)
+        
+        step_loss = DLM.Loss.cross_entropy(logits, y_targ[i])
+
+        {i + 1, total_loss + step_loss, h_base_flushed, h_top_new, h_base_new, xp1, x_in, y_targ, b_p, t_p, f_map}
+      end
+      
+    # Return average sequence loss
+    Nx.divide(elem(result, 1), seq_len)
+  end
+
+  # ⚡ 2. The Elixir Wrapper
+  def evaluate_sentence(sentence, frozen_base_p, frozen_map, top_p, gpu) do
+    # Convert string to {1, seq_len} tensor
+    tokens = sentence |> to_charlist() |> Nx.tensor(type: :s32) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+    
+    # Initialize blank memory for a single batch
+    h_base = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+    h_top  = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+
+    # Run the compiled XLA graph
+    loss_tensor = eval_loss(tokens, h_base, h_top, frozen_base_p, frozen_map, top_p)
+    Nx.to_number(loss_tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.BLiMP, <<70, 79, 82, 49, 0, 0, 29, ...>>, {:evaluate_sentence, 5}}
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+blimp_file = "./data/determiner_noun_agreement_1.jsonl" # 👈 Change this to your specific BLiMP file
+
+# ==============================================================================
+# 1. LOAD WEIGHTS
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1, 2, and 3 Weights...")
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+frozen_map = elem(phase1_p, 0) |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+frozen_base_p = File.read!("v33_DLM_Phase_2_cos_checkpoint_step_13000.bin") |> :erlang.binary_to_term()
+
+# Load your best Phase 3 Top Level weights (Adjust filename as needed)
+top_ckpt = File.read!("v34_DLM_Phase_3_Top_Biased_checkpoint_step_80000.bin") |> :erlang.binary_to_term()
+top_p = DLM.Tree.map(top_ckpt.params, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# 2. RUN BLIMP EVALUATION
+# ==============================================================================
+IO.puts("📖 Reading BLiMP Dataset: #{blimp_file}")
+
+# Parse the JSON Lines
+pairs = 
+  File.read!(blimp_file)
+  |> String.split("\n", trim: true)
+  |> Enum.map(&Jason.decode!/1)
+
+total_pairs = length(pairs)
+IO.puts("⚖️ Evaluating #{total_pairs} minimalist pairs...")
+
+# Tally the results
+{passes, total_loss_diff} = 
+  Enum.reduce(pairs, {0, 0.0}, fn pair, {pass_count, diff_acc} ->
+    good_sentence = pair["sentence_good"]
+    bad_sentence = pair["sentence_bad"]
+
+    # Calculate losses
+    good_loss = DLM.BLiMP.evaluate_sentence(good_sentence, frozen_base_p, frozen_map, top_p, gpu)
+    bad_loss  = DLM.BLiMP.evaluate_sentence(bad_sentence, frozen_base_p, frozen_map, top_p, gpu)
+
+    # Did the model assign a lower loss (higher probability) to the grammatically correct sentence?
+    is_pass? = good_loss < bad_loss
+    
+    new_pass_count = if is_pass?, do: pass_count + 1, else: pass_count
+
+    {new_pass_count, diff_acc + (bad_loss - good_loss)}
+  end)
+
+# Calculate final metrics
+accuracy = (passes / total_pairs) * 100.0
+avg_margin = total_loss_diff / total_pairs
+
+IO.puts(String.duplicate("=", 50))
+IO.puts("🏆 BLiMP EVALUATION RESULTS")
+IO.puts(String.duplicate("=", 50))
+IO.puts("Dataset:   #{blimp_file}")
+IO.puts("Accuracy:  #{Float.round(accuracy, 2)}% (#{passes}/#{total_pairs})")
+IO.puts("Margin:    #{Float.round(avg_margin, 4)} (Avg loss difference)")
+IO.puts(String.duplicate("=", 50))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Phase 1, 2, and 3 Weights...
+📖 Reading BLiMP Dataset: ./data/determiner_noun_agreement_1.jsonl
+⚖️ Evaluating 1000 minimalist pairs...
+==================================================
+🏆 BLiMP EVALUATION RESULTS
+==================================================
+Dataset:   ./data/determiner_noun_agreement_1.jsonl
+Accuracy:  52.7% (527/1000)
+Margin:    0.002 (Avg loss difference)
+==================================================
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# ==============================================================================
+# 1. LOAD WEIGHTS
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1, 2, and 3 Weights...")
+gpu = {EXLA.Backend, client: :rocm}
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+frozen_map = elem(phase1_p, 0) |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+frozen_base_p = File.read!("v33_DLM_Phase_2_cos_checkpoint_step_13000.bin") |> :erlang.binary_to_term()
+
+# Load your best Phase 3 Top Level weights (Adjust filename as needed)
+top_ckpt = File.read!("v34_DLM_Phase_3_Top_Biased_checkpoint_step_16000.bin") |> :erlang.binary_to_term()
+top_p = DLM.Tree.map(top_ckpt.params, &Nx.backend_copy(&1, gpu))
+
+prompt = "Hello, my name is "
+
+tokens_to_generate = 128 - String.length(prompt)
+
+
+DLM.Generator.generate(prompt, tokens_to_generate, 0.65, frozen_base_p, top_p, frozen_map, gpu)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Phase 1, 2, and 3 Weights...
+
+10:42:32.060 [info] XLA service 0x7e08a409ab70 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+10:42:32.062 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+10:42:32.062 [info] Using BFC allocator.
+
+10:42:32.062 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+10:42:32.062 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+🔥 Warming up semantic context...
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+** (UndefinedFunctionError) function DLM.TinySSM.forward/3 is undefined (module DLM.TinySSM is not available)
+    DLM.TinySSM.forward(#Nx.Tensor<
+  f32[1][512]
+  
+  Nx.Defn.Expr
+  parameter a:27           f32[128][512]
+  parameter b:0            s32
+  c = reshape b            s32[1]
+  d = take a, c, axis: 0   f32[1][512]
+>, #Nx.Tensor<
+  f32[1][512]
+  
+  Nx.Defn.Expr
+  parameter a:1   f32[1][512]
+>, {#Nx.Tensor<
+   f32[512]
+   
+   Nx.Defn.Expr
+   parameter a:5   f32[512]
+ >, #Nx.Tensor<
+   f32[512][256]
+   
+   Nx.Defn.Expr
+   parameter a:6   f32[512][256]
+ >, #Nx.Tensor<
+   f32[256][512]
+   
+   Nx.Defn.Expr
+   parameter a:7   f32[256][512]
+ >, #Nx.Tensor<
+   f32[512][256]
+   
+   Nx.Defn.Expr
+   parameter a:8   f32[512][256]
+ >, #Nx.Tensor<
+   f32[256][512]
+   
+   Nx.Defn.Expr
+   parameter a:9   f32[256][512]
+ >, #Nx.Tensor<
+   f32[512][256]
+   
+   Nx.Defn.Expr
+   parameter a:10   f32[512][256]
+ >, #Nx.Tensor<
+   f32[256][512]
+   
+   Nx.Defn.Expr
+   parameter a:11   f32[256][512]
+ >})
+    #cell:jowzjq3lsg7lgi63:13: DLM.Generator."__defn:step__"/8
+    (nx 0.11.0) lib/nx/defn/compiler.ex:190: Nx.Defn.Compiler.runtime_fun/3
+    (exla 0.11.0) lib/exla/defn.ex:377: anonymous fn/4 in EXLA.Defn.compile/8
+    (exla 0.11.0) lib/exla/defn/locked_cache.ex:36: EXLA.Defn.LockedCache.run/2
+    (stdlib 6.2.2) timer.erl:595: :timer.tc/2
+    #cell:a4gyninsclvsoeku:20: (file)
+```
+
+```elixir
+# defmodule DLM.Probe do
+#   import Nx.Defn
+
+#   # Run the sequence and extract ONLY the gate values
+#   defn extract_gates(tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p) do
+#     seq_len = Nx.axis_size(tokens, 1)
+#     clean_coords = Nx.take(frozen_map, Nx.flatten(tokens)) |> Nx.reshape({1, seq_len, 512})
+#     x_in = Nx.transpose(clean_coords, axes: [1, 0, 2])
+#     zero_frame = Nx.broadcast(0.0, {1, 512})
+#     g_out_init = Nx.broadcast(0.0, {seq_len})
+
+#     result =
+#       while {i = 0, h_b = h_base_init, h_t = h_top_init, xp1 = zero_frame, xp2 = zero_frame, 
+#              gates = g_out_init, x_t = x_in, b_p = frozen_base_p, t_p = top_p}, 
+#             Nx.less(i, seq_len) do
+            
+#         x_curr = x_t[i]
+#         {_y_base, h_b_new} = DLM.TinySSM.forward(x_curr, h_b, b_p)
+#         {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, _lmw, _lmb, gate_w} = t_p
+
+#         # ⚡ Calculate the Gate
+#         gate_logit = Nx.dot(h_b_new, gate_w)
+#         g = Nx.sigmoid(gate_logit) |> Nx.squeeze()
+
+#         # Step the top layer to keep the math accurate
+#         {_y_top, h_t_cand} = DLM.Main_SSM.ssm_recurrence(h_b_new, xp1, xp2, h_t, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2)
+#         h_t_new = Nx.add(Nx.multiply(g, h_t_cand), Nx.multiply(Nx.subtract(1.0, g), h_t))
+#         h_b_flushed = Nx.multiply(h_b_new, Nx.subtract(1.0, g))
+
+#         updated_gates = Nx.put_slice(gates, [i], Nx.new_axis(g, 0))
+
+#         {i + 1, h_b_flushed, h_t_new, h_b_new, xp1, updated_gates, x_t, b_p, t_p}
+#       end
+      
+#     elem(result, 5)
+#   end
+
+#   def watch_the_heartbeat(sentence, frozen_base_p, frozen_map, top_p, gpu) do
+#     chars = String.graphemes(sentence)
+#     tokens = sentence |> to_charlist() |> Nx.tensor(type: :s32) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+    
+#     h_b = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+#     h_t = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+
+#     gates = extract_gates(tokens, h_b, h_t, frozen_base_p, frozen_map, top_p) 
+#             |> Nx.backend_transfer() 
+#             |> Nx.to_flat_list()
+
+#     IO.puts("🌊 BOUNDARY GATE RHYTHM")
+#     IO.puts("-----------------------")
+#     Enum.zip(chars, gates)
+#     |> Enum.each(fn {char, g} -> 
+#       # Create a simple visual bar based on the gate value
+#       bar_length = trunc(g * 20)
+#       bar = String.duplicate("█", bar_length)
+#       display_char = if char == " ", do: "[space]", else: char
+#       IO.puts("#{String.pad_trailing(display_char, 7)} | #{Float.round(g, 3)} | #{bar}")
+#     end)
+#   end
+# end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Probe, <<70, 79, 82, 49, 0, 0, 31, ...>>, {:watch_the_heartbeat, 5}}
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+blimp_file = "./data/regular_plural_subject_verb_agreement_1.jsonl" # 👈 Change this to your specific BLiMP file
+
+# ==============================================================================
+# 1. LOAD WEIGHTS
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1, 2, and 3 Weights...")
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+frozen_map = elem(phase1_p, 0) |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+frozen_base_p = File.read!("v33_DLM_Phase_2_cos_checkpoint_step_13000.bin") |> :erlang.binary_to_term()
+
+# Load your best Phase 3 Top Level weights (Adjust filename as needed)
+top_ckpt = File.read!("v34_DLM_Phase_3_Top_Biased_checkpoint_step_16000.bin") |> :erlang.binary_to_term()
+top_p = DLM.Tree.map(top_ckpt.params, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# 2. RUN BLIMP EVALUATION
+# ==============================================================================
+IO.puts("📖 Reading BLiMP Dataset: #{blimp_file}")
+
+# Parse the JSON Lines
+pairs = 
+  File.read!(blimp_file)
+  |> String.split("\n", trim: true)
+  |> Enum.map(&Jason.decode!/1)
+
+total_pairs = length(pairs)
+IO.puts("⚖️ Evaluating #{total_pairs} minimalist pairs...")
+
+# Tally the results
+{passes, total_loss_diff} = 
+  Enum.reduce(pairs, {0, 0.0}, fn pair, {pass_count, diff_acc} ->
+    good_sentence = pair["sentence_good"]
+    bad_sentence = pair["sentence_bad"]
+
+    # Calculate losses
+    good_loss = DLM.BLiMP.evaluate_sentence(good_sentence, frozen_base_p, frozen_map, top_p, gpu)
+    bad_loss  = DLM.BLiMP.evaluate_sentence(bad_sentence, frozen_base_p, frozen_map, top_p, gpu)
+
+    # Did the model assign a lower loss (higher probability) to the grammatically correct sentence?
+    is_pass? = good_loss < bad_loss
+    
+    new_pass_count = if is_pass?, do: pass_count + 1, else: pass_count
+
+    {new_pass_count, diff_acc + (bad_loss - good_loss)}
+  end)
+
+# Calculate final metrics
+accuracy = (passes / total_pairs) * 100.0
+avg_margin = total_loss_diff / total_pairs
+
+IO.puts(String.duplicate("=", 50))
+IO.puts("🏆 BLiMP EVALUATION RESULTS")
+IO.puts(String.duplicate("=", 50))
+IO.puts("Dataset:   #{blimp_file}")
+IO.puts("Accuracy:  #{Float.round(accuracy, 2)}% (#{passes}/#{total_pairs})")
+IO.puts("Margin:    #{Float.round(avg_margin, 4)} (Avg loss difference)")
+IO.puts(String.duplicate("=", 50))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Phase 1, 2, and 3 Weights...
+📖 Reading BLiMP Dataset: ./data/regular_plural_subject_verb_agreement_1.jsonl
+⚖️ Evaluating 1000 minimalist pairs...
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+** (MatchError) no match of right hand side value: {#Nx.Tensor<
+   f32[512]
+   
+   Nx.Defn.Expr
+   parameter a:15   f32[512]
+ >, #Nx.Tensor<
+   f32[512][64]
+   
+   Nx.Defn.Expr
+   parameter a:16   f32[512][64]
+ >, #Nx.Tensor<
+   f32[64][512]
+   
+   Nx.Defn.Expr
+   parameter a:17   f32[64][512]
+ >, #Nx.Tensor<
+   f32[512][64]
+   
+   Nx.Defn.Expr
+   parameter a:18   f32[512][64]
+ >, #Nx.Tensor<
+   f32[64][512]
+   
+   Nx.Defn.Expr
+   parameter a:19   f32[64][512]
+ >, #Nx.Tensor<
+   f32[512][64]
+   
+   Nx.Defn.Expr
+   parameter a:20   f32[512][64]
+ >, #Nx.Tensor<
+   f32[64][512]
+   
+   Nx.Defn.Expr
+   parameter a:21   f32[64][512]
+ >, #Nx.Tensor<
+   f32[512][64]
+   
+   Nx.Defn.Expr
+   parameter a:22   f32[512][64]
+ >, #Nx.Tensor<
+   f32[64][512]
+   
+   Nx.Defn.Expr
+   parameter a:23   f32[64][512]
+ >, #Nx.Tensor<
+   f32[512][64]
+   
+   Nx.Defn.Expr
+   parameter a:24   f32[512][64]
+ >, #Nx.Tensor<
+   f32[64][512]
+   
+   Nx.Defn.Expr
+   parameter a:25   f32[64][512]
+ >, #Nx.Tensor<
+   f32[512][128]
+   
+   Nx.Defn.Expr
+   parameter a:26   f32[512][128]
+ >, #Nx.Tensor<
+   f32[128]
+   
+   Nx.Defn.Expr
+   parameter a:27   f32[128]
+ >, #Nx.Tensor<
+   f32[512][1]
+   
+   Nx.Defn.Expr
+   parameter a:28   f32[512][1]
+ >, #Nx.Tensor<
+   f32[1]
+   
+   Nx.Defn.Expr
+   parameter a:29   f32[1]
+ >}
+    #cell:lfbfrue6mc255axz:35: anonymous fn/3 in DLM.BLiMP."__defn:eval_loss__"/6
+    (nx 0.11.0) lib/nx/defn/expr.ex:530: Nx.Defn.Expr.while_vectorized/7
+    #cell:lfbfrue6mc255axz:22: DLM.BLiMP."__defn:eval_loss__"/6
+    (nx 0.11.0) lib/nx/defn/compiler.ex:190: Nx.Defn.Compiler.runtime_fun/3
+    (exla 0.11.0) lib/exla/defn.ex:377: anonymous fn/4 in EXLA.Defn.compile/8
+    (exla 0.11.0) lib/exla/defn/locked_cache.ex:36: EXLA.Defn.LockedCache.run/2
+    (stdlib 6.2.2) timer.erl:595: :timer.tc/2
+    #cell:iqhd5oaj6cbvkwag:33: (file)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.HierarchyBridge do
+  import Nx.Defn
+
+  # Assume we have the base state and the previous top state
+  defn bridge_step(h_base, h_top_prev, top_params, boundary_weights) do
+    # 1. ⚡ Calculate the Boundary Gate (g)
+    # Project 512D -> 1D, then Sigmoid to force it between 0.0 and 1.0
+    boundary_logit = Nx.dot(h_base, boundary_weights)
+    g = Nx.sigmoid(boundary_logit) 
+
+    # 2. ⚡ Calculate the potential next state for the Top Level
+    # We feed the Base's 512D summary into the Top Level as its "input"
+    {_predicted_chunk, h_top_candidate} = DLM.TinySSM.forward(h_base, h_top_prev, top_params)
+
+    # 3. ⚡ The Continuous Update (Linear Interpolation)
+    # If g=0 (mid-word), it ignores the input and keeps h_top_prev.
+    # If g=1 (word end), it fully updates to h_top_candidate.
+    h_top_new = Nx.add(
+      Nx.multiply(g, h_top_candidate),
+      Nx.multiply(Nx.subtract(1.0, g), h_top_prev)
+    )
+
+    # 4. ⚡ The Soft Reset (Crucial)
+    # If the base layer just passed a completed concept up to the top, 
+    # it needs to flush its own memory to start building the next concept.
+    h_base_flushed = Nx.multiply(h_base, Nx.subtract(1.0, g))
+
+    {h_top_new, h_base_flushed, g}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.HierarchyBridge, <<70, 79, 82, 49, 0, 0, 13, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Main_SSM_Trainer do
+  import Nx.Defn
+
+  # 1. Maps discrete tokens to their perfect 512D spatial coordinates
+  defn get_real_coordinates(batch_tokens, frozen_embeds) do
+    Nx.take(frozen_embeds, Nx.flatten(batch_tokens))
+      |> Nx.reshape({Nx.axis_size(batch_tokens, 0), Nx.axis_size(batch_tokens, 1), 512})
+      |> stop_grad()
+  end
+
+  # 2. THE MASTER SEQUENCE LOOP (Now with Gate Tracking!)
+  defn compute_sequence_loss(input_tokens, target_tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+    
+    clean_coords = get_real_coordinates(input_tokens, frozen_map)
+    inputs_time = Nx.transpose(clean_coords, axes: [1, 0, 2])
+    targets_time = Nx.transpose(target_tokens, axes: [1, 0])
+
+    zero_frame = Nx.broadcast(0.0, Nx.shape(h_top_init))
+
+    result =
+      while {i = 0, total_loss = 0.0, total_g = 0.0, # ⚡ Added total_g accumulator
+             h_base = h_base_init, h_top = h_top_init,
+             xp1 = zero_frame, xp2 = zero_frame,
+             in_t = inputs_time, targ_t = targets_time,
+             b_p = frozen_base_p, t_p = top_p, f_map = frozen_map}, 
+            Nx.less(i, seq_len) do
+            
+        x_curr = in_t[i]
+        {_y_base, h_base_new} = DLM.TinySSM.forward(x_curr, h_base, b_p)
+
+        # Unpack 15 Top Params
+        {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, lm_w, lm_b, gate_w, gate_b} = t_p
+
+        # ⚡ 2. THE BOUNDARY GATE
+        gate_logit = Nx.add(Nx.dot(h_base_new, gate_w), gate_b)
+        g = Nx.sigmoid(gate_logit) 
+        
+        # ⚡ Track the average gate openness across the batch for this step
+        batch_avg_g = Nx.mean(g)
+
+        # 3. STEP THE TOP LEVEL
+        {y_top, h_top_candidate} = DLM.Main_SSM.ssm_recurrence(
+          h_base_new, xp1, xp2, h_top, 
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+        )
+
+        h_top_new = Nx.add(Nx.multiply(g, h_top_candidate), Nx.multiply(Nx.subtract(1.0, g), h_top))
+        h_base_flushed = Nx.multiply(h_base_new, Nx.subtract(1.0, g))
+
+        y_final = DLM.Main_SSM.rms_norm(y_top)
+        logits = Nx.add(Nx.dot(y_final, lm_w), lm_b)
+        step_loss = DLM.Loss.cross_entropy(logits, targ_t[i])
+
+        {i + 1, total_loss + step_loss, total_g + batch_avg_g, h_base_flushed, h_top_new, h_base_new, xp1, in_t, targ_t, b_p, t_p, f_map}
+      end
+      
+    # ⚡ Return Average Loss AND Average Gate value
+    {Nx.divide(elem(result, 1), seq_len), elem(result, 3), elem(result, 4), Nx.divide(elem(result, 2), seq_len)}
+  end
+
+  # 3. GRADIENT TAPE
+  defn compute_grad_and_step(batch_tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p) do
+    seq_len = Nx.axis_size(batch_tokens, 1) - 1
+    input_tokens = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+
+    {loss, raw_grads} = value_and_grad(top_p, fn p ->
+      {avg_loss, _h_base_final, _h_top_final, avg_g} = 
+        compute_sequence_loss(input_tokens, target_tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, p)
+      
+      # ⚡ THE TARGETED SPARSITY PENALTY
+      target_openness = Nx.tensor(0.16, type: :f32) 
+      lambda = Nx.tensor(2.0, type: :f32) # The penalty weight
+
+      # Penalty = lambda * (avg_g - target_openness)^2
+      sparsity_penalty = Nx.multiply(lambda, Nx.pow(Nx.subtract(avg_g, target_openness), 2))
+
+      # The network now has to balance predicting the right character AND hitting the 16% rhythm
+      Nx.add(avg_loss, sparsity_penalty)
+    end)
+    
+    # Run a clean pass to get states AND the average gate value for telemetry
+    {_loss, final_h_base, final_h_top, avg_g} = 
+        compute_sequence_loss(input_tokens, target_tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p)
+
+    {loss, raw_grads, final_h_base, final_h_top, avg_g}
+  end
+
+  # ⚡ 4. TELEMETRY HELPER (Unpacks all 15 Phase 3 Params)
+  def grad_norms(grads) do
+    {g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv, g_mu1, g_mv1, g_mu2, g_mv2, g_lmw, g_lmb, g_gw, g_gb} = grads
+    
+    calc = fn g -> g |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4) end
+    
+    [
+      a_diag: calc.(g_a), b_u: calc.(g_bu), b_v: calc.(g_bv),
+      c_u: calc.(g_cu), c_v: calc.(g_cv), d_u: calc.(g_du), d_v: calc.(g_dv),
+      mx_u1: calc.(g_mu1), mx_v1: calc.(g_mv1), mx_u2: calc.(g_mu2), mx_v2: calc.(g_mv2),
+      lm_w: calc.(g_lmw), lm_b: calc.(g_lmb), gate_w: calc.(g_gw), gate_b: calc.(g_gb)
+    ]
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM_Trainer, <<70, 79, 82, 49, 0, 0, 47, ...>>, {:grad_norms, 1}}
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Handles resuming and saving states for the Hierarchical DLM.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("✨ Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("✨ No checkpoints found for '#{run_prefix}'. Starting FRESH.")
+        {:fresh, 0}
+      end
+    else
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("🚀 Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+
+  # ⚡ NEW: Clean, centralized saving logic
+  def save_checkpoint(prefix, step, p, m, v, h_base, h_top) do
+    IO.puts("💾 Auto-Saving Checkpoint Step #{step}...")
+    
+    state = %{
+      params: DLM.Tree.map(p, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      ms: DLM.Tree.map(m, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      vs: DLM.Tree.map(v, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      step: step,
+      h_base: Nx.backend_copy(h_base, Nx.BinaryBackend),
+      h_top: Nx.backend_copy(h_top, Nx.BinaryBackend)
+    }
+    
+    File.write!("#{prefix}_checkpoint_step_#{step}.bin", :erlang.term_to_binary(state))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.CheckpointManager, <<70, 79, 82, 49, 0, 0, 23, ...>>, {:save_checkpoint, 7}}
+```
+
+```elixir
+run_prefix  = "v34_DLM_Phase_3_Top_Biased"  
+total_steps = 100000
+batch_size = 32
+seq_len = 128
+save_interval = 1000
+
+# ==============================================================================
+# 1. LOAD FROZEN FOUNDATIONS (Manifold + Physics Engine)
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1 Frozen Manifold...")
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+{cpu_embeds, _w1, _w2, _key} = phase1_p
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+IO.puts("⚙️ Loading Phase 2 Base SSM (Physics Engine)...")
+base_checkpoint = File.read!("v33_DLM_Phase_2_cos_checkpoint_step_13000.bin") |> :erlang.binary_to_term()
+frozen_base_p = DLM.Tree.map(base_checkpoint, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# 2. INITIALIZE / RESUME TOP LEVEL
+# ==============================================================================
+{load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
+
+{starting_p, starting_m, starting_v, start_h_base, start_h_top} =
+  if load_path == :fresh do
+    IO.puts("✨ Igniting brand new Phase 3 Genesis weights...")
+    raw_p = DLM.Main_SSM_Genesis.init_params(42)
+    {raw_m, raw_v} = DLM.Main_SSM_Genesis.init_optimizer(raw_p)
+    
+    blank_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+    
+    {raw_p, raw_m, raw_v, blank_h, blank_h}
+  else
+    ckpt = File.read!(load_path) |> :erlang.binary_to_term()
+    blank_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+    
+    {
+      ckpt.params, 
+      ckpt.ms, 
+      ckpt.vs, 
+      Map.get(ckpt, :h_base, blank_h), 
+      Map.get(ckpt, :h_top, blank_h)
+    }
+  end
+
+# Push standard optimizer states to GPU
+p = DLM.Tree.map(starting_p, &Nx.backend_copy(&1, gpu))
+m = DLM.Tree.map(starting_m, &Nx.backend_copy(&1, gpu))
+v = DLM.Tree.map(starting_v, &Nx.backend_copy(&1, gpu))
+h_base = Nx.backend_copy(start_h_base, gpu)
+h_top = Nx.backend_copy(start_h_top, gpu)
+
+# ==============================================================================
+# 3. DATA STREAM
+# ==============================================================================
+IO.puts("🧠 Loading Curriculum...")
+dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+dataset = Nx.flatten(dataset_2d)
+data_stream = DLM.DataStreamer.build_infinite_stream(dataset, batch_size, seq_len)
+
+# ==============================================================================
+# 4. THE MASTER LOOP
+# ==============================================================================
+if start_step != :completed do
+  IO.puts("🚀 Entering Continuous Hierarchy Loop...")
+
+  {final_p, _m, _v, _hb, _ht} =
+    Enum.reduce(Enum.zip(start_step..(total_steps - 1), data_stream), {p, m, v, h_base, h_top}, 
+      fn {step, cpu_batch}, {cp, cm, cv, ch_base, ch_top} ->
+        
+        gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+
+        # ⚡ 1. Learning Rate Schedule
+        base_lr = 3.0e-4
+        min_lr = 3.0e-5
+        warmup_steps = 1000
+        
+        current_lr = 
+          if step < warmup_steps do
+            base_lr * (step / warmup_steps)
+          else
+            progress = min(max((step - warmup_steps) / (total_steps - warmup_steps), 0.0), 1.0)
+            min_lr + 0.5 * (base_lr - min_lr) * (1.0 + :math.cos(:math.pi() * progress))
+          end
+
+        # ⚡ 2. The Unified Gradient Tape
+        {loss_tensor, grads, next_h_base, next_h_top, avg_g_tensor} = 
+          DLM.Main_SSM_Trainer.compute_grad_and_step(
+            gpu_batch, ch_base, ch_top, frozen_base_p, frozen_map, cp
+          )
+
+        loss_val = Nx.to_number(loss_tensor)
+        g_val = Nx.to_number(avg_g_tensor)
+
+        # ⚡ 3. Safety Check
+        if loss_val == :nan or loss_val > 20.0 do
+          IO.puts("⚠️ Step #{step}: NaN/Spike detected! Flushing Hidden States.")
+          clean_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+          {cp, cm, cv, clean_h, clean_h} # Skip update, flush memory
+        else
+          # ⚡ 4. Optimizer Step
+          lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+          step_tensor = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
+          
+          {up_p, up_m, up_v} = DLM.MuonHybrid.step(cp, grads, cm, cv, step_tensor, lr_tensor)
+
+          # ⚡ 5. Telemetry
+          if rem(step, 50) == 0 do
+            bpc = loss_val / 0.69314718
+            mem = :erlang.memory(:total) |> div(1024 * 1024)
+            
+            # Transfer grads to CPU for inspection to avoid slowing down the GPU tape
+            cpu_grads = DLM.Tree.map(grads, &Nx.backend_copy(&1, Nx.BinaryBackend))
+            norms = DLM.Main_SSM_Trainer.grad_norms(cpu_grads)
+            
+            # Sort to find the hottest gradients
+            sorted_norms = Enum.sort_by(norms, fn {_k, v} -> v end, :desc)
+            {max_name, max_norm} = hd(sorted_norms)
+            
+            # Specifically check on your areas of concern
+            a_norm = Keyword.get(norms, :a_diag)
+            gb_norm = Keyword.get(norms, :gate_b)
+
+            IO.puts("➡️  Step #{step} | Loss: #{Float.round(loss_val, 4)} | BPC: #{Float.round(bpc, 3)} | Gate Openness: #{Float.round(g_val * 100, 2)}% | LR: #{Float.round(current_lr, 6)}")
+            IO.puts("   📐 GRADS -> Max: [#{max_name}: #{max_norm}] | Friction a_diag: #{a_norm} | Gate Bias: #{gb_norm} | RAM: #{mem}MB")
+          end
+
+          # ⚡ 6. Auto-Save
+          if rem(step, save_interval) == 0 and step > 0 do
+            DLM.CheckpointManager.save_checkpoint(run_prefix, step, up_p, up_m, up_v, next_h_base, next_h_top)
+            :erlang.garbage_collect(self())
+          end
+
+          {up_p, up_m, up_v, next_h_base, next_h_top}
+        end
+    end)
+
+  IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
+  DLM.CheckpointManager.save_checkpoint("#{run_prefix}_final", total_steps, final_p, m, v, h_base, h_top)
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+...
+➡️  Step 55900 | Loss: 2.0585 | BPC: 2.97 | Gate Openness: 31.81% | LR: 1.42e-4
+   📐 GRADS -> Max: [d_v: 4.6275] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 233MB
+➡️  Step 55950 | Loss: 2.0891 | BPC: 3.014 | Gate Openness: 31.31% | LR: 1.42e-4
+   📐 GRADS -> Max: [d_v: 4.8273] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 234MB
+➡️  Step 56000 | Loss: 2.0087 | BPC: 2.898 | Gate Openness: 30.52% | LR: 1.42e-4
+   📐 GRADS -> Max: [d_v: 6.4286] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 236MB
+💾 Auto-Saving Checkpoint Step 56000...
+➡️  Step 56050 | Loss: 1.9791 | BPC: 2.855 | Gate Openness: 32.87% | LR: 1.41e-4
+   📐 GRADS -> Max: [d_v: 4.4612] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 198MB
+➡️  Step 56100 | Loss: 2.0061 | BPC: 2.894 | Gate Openness: 31.53% | LR: 1.41e-4
+   📐 GRADS -> Max: [d_v: 6.7413] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 198MB
+➡️  Step 56150 | Loss: 1.894 | BPC: 2.733 | Gate Openness: 30.35% | LR: 1.41e-4
+   📐 GRADS -> Max: [d_v: 5.1023] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 198MB
+➡️  Step 56200 | Loss: 1.9829 | BPC: 2.861 | Gate Openness: 33.18% | LR: 1.41e-4
+   📐 GRADS -> Max: [d_v: 3.8663] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 199MB
+➡️  Step 56250 | Loss: 1.986 | BPC: 2.865 | Gate Openness: 31.69% | LR: 1.41e-4
+   📐 GRADS -> Max: [d_u: 3.2055] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 207MB
+➡️  Step 56300 | Loss: 2.0114 | BPC: 2.902 | Gate Openness: 31.16% | LR: 1.4e-4
+   📐 GRADS -> Max: [d_v: 5.2642] | Friction a_diag: 0.0006 | Gate Bias: 0.0 | RAM: 208MB
+➡️  Step 56350 | Loss: 1.8928 | BPC: 2.731 | Gate Openness: 30.89% | LR: 1.4e-4
+   📐 GRADS -> Max: [d_v: 5.4796] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 205MB
+➡️  Step 56400 | Loss: 2.0562 | BPC: 2.966 | Gate Openness: 31.94% | LR: 1.4e-4
+   📐 GRADS -> Max: [d_v: 5.0741] | Friction a_diag: 0.0007 | Gate Bias: 0.0016 | RAM: 200MB
+➡️  Step 56450 | Loss: 1.9519 | BPC: 2.816 | Gate Openness: 31.71% | LR: 1.4e-4
+   📐 GRADS -> Max: [d_v: 5.6543] | Friction a_diag: 0.0006 | Gate Bias: 0.0014 | RAM: 201MB
+➡️  Step 56500 | Loss: 1.9308 | BPC: 2.786 | Gate Openness: 31.86% | LR: 1.39e-4
+   📐 GRADS -> Max: [d_v: 5.425] | Friction a_diag: 0.0006 | Gate Bias: 0.0015 | RAM: 201MB
+➡️  Step 56550 | Loss: 2.0227 | BPC: 2.918 | Gate Openness: 31.21% | LR: 1.39e-4
+   📐 GRADS -> Max: [d_v: 5.62] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 202MB
+➡️  Step 56600 | Loss: 1.8855 | BPC: 2.72 | Gate Openness: 32.02% | LR: 1.39e-4
+   📐 GRADS -> Max: [d_v: 4.3476] | Friction a_diag: 0.0006 | Gate Bias: 0.002 | RAM: 202MB
+➡️  Step 56650 | Loss: 1.9436 | BPC: 2.804 | Gate Openness: 31.08% | LR: 1.39e-4
+   📐 GRADS -> Max: [d_v: 6.4497] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 211MB
+➡️  Step 56700 | Loss: 1.9974 | BPC: 2.882 | Gate Openness: 31.7% | LR: 1.39e-4
+   📐 GRADS -> Max: [d_v: 5.3357] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 211MB
+➡️  Step 56750 | Loss: 2.0316 | BPC: 2.931 | Gate Openness: 32.0% | LR: 1.38e-4
+   📐 GRADS -> Max: [d_v: 5.0048] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 211MB
+➡️  Step 56800 | Loss: 2.07 | BPC: 2.986 | Gate Openness: 32.17% | LR: 1.38e-4
+   📐 GRADS -> Max: [d_v: 3.6569] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 212MB
+➡️  Step 56850 | Loss: 1.8833 | BPC: 2.717 | Gate Openness: 31.78% | LR: 1.38e-4
+   📐 GRADS -> Max: [d_v: 3.9931] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 212MB
+➡️  Step 56900 | Loss: 2.0296 | BPC: 2.928 | Gate Openness: 31.69% | LR: 1.38e-4
+   📐 GRADS -> Max: [d_v: 5.4237] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 204MB
+➡️  Step 56950 | Loss: 1.9757 | BPC: 2.85 | Gate Openness: 32.31% | LR: 1.38e-4
+   📐 GRADS -> Max: [d_v: 5.1238] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 205MB
+➡️  Step 57000 | Loss: 2.0775 | BPC: 2.997 | Gate Openness: 32.17% | LR: 1.37e-4
+   📐 GRADS -> Max: [d_v: 4.6513] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 205MB
+💾 Auto-Saving Checkpoint Step 57000...
+➡️  Step 57050 | Loss: 2.015 | BPC: 2.907 | Gate Openness: 32.12% | LR: 1.37e-4
+   📐 GRADS -> Max: [d_v: 3.5238] | Friction a_diag: 0.0006 | Gate Bias: 0.0015 | RAM: 219MB
+➡️  Step 57100 | Loss: 2.0047 | BPC: 2.892 | Gate Openness: 32.56% | LR: 1.37e-4
+   📐 GRADS -> Max: [d_v: 5.7879] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 219MB
+➡️  Step 57150 | Loss: 2.0509 | BPC: 2.959 | Gate Openness: 31.13% | LR: 1.37e-4
+   📐 GRADS -> Max: [d_v: 7.452] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 220MB
+➡️  Step 57200 | Loss: 2.0369 | BPC: 2.939 | Gate Openness: 32.83% | LR: 1.37e-4
+   📐 GRADS -> Max: [d_v: 4.2299] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 222MB
+➡️  Step 57250 | Loss: 1.9932 | BPC: 2.876 | Gate Openness: 32.0% | LR: 1.36e-4
+   📐 GRADS -> Max: [d_v: 3.878] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 224MB
+➡️  Step 57300 | Loss: 1.9463 | BPC: 2.808 | Gate Openness: 31.27% | LR: 1.36e-4
+   📐 GRADS -> Max: [d_v: 6.456] | Friction a_diag: 0.0008 | Gate Bias: 0.0004 | RAM: 225MB
+➡️  Step 57350 | Loss: 1.8937 | BPC: 2.732 | Gate Openness: 31.5% | LR: 1.36e-4
+   📐 GRADS -> Max: [d_v: 6.8691] | Friction a_diag: 0.0009 | Gate Bias: 0.0008 | RAM: 227MB
+➡️  Step 57400 | Loss: 1.9742 | BPC: 2.848 | Gate Openness: 31.97% | LR: 1.36e-4
+   📐 GRADS -> Max: [d_v: 7.1482] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 229MB
+➡️  Step 57450 | Loss: 1.9015 | BPC: 2.743 | Gate Openness: 31.0% | LR: 1.35e-4
+   📐 GRADS -> Max: [d_v: 5.8493] | Friction a_diag: 0.0006 | Gate Bias: 0.0011 | RAM: 231MB
+➡️  Step 57500 | Loss: 2.038 | BPC: 2.94 | Gate Openness: 32.39% | LR: 1.35e-4
+   📐 GRADS -> Max: [d_v: 4.315] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 233MB
+➡️  Step 57550 | Loss: 2.0169 | BPC: 2.91 | Gate Openness: 31.78% | LR: 1.35e-4
+   📐 GRADS -> Max: [d_v: 4.2977] | Friction a_diag: 0.0006 | Gate Bias: 0.0015 | RAM: 235MB
+➡️  Step 57600 | Loss: 1.9058 | BPC: 2.749 | Gate Openness: 30.65% | LR: 1.35e-4
+   📐 GRADS -> Max: [d_v: 7.2205] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 237MB
+➡️  Step 57650 | Loss: 2.04 | BPC: 2.943 | Gate Openness: 31.06% | LR: 1.35e-4
+   📐 GRADS -> Max: [d_v: 4.5896] | Friction a_diag: 0.0007 | Gate Bias: 0.0014 | RAM: 239MB
+➡️  Step 57700 | Loss: 1.9686 | BPC: 2.84 | Gate Openness: 34.18% | LR: 1.34e-4
+   📐 GRADS -> Max: [d_v: 6.2698] | Friction a_diag: 0.0007 | Gate Bias: 0.0018 | RAM: 241MB
+➡️  Step 57750 | Loss: 2.0467 | BPC: 2.953 | Gate Openness: 31.49% | LR: 1.34e-4
+   📐 GRADS -> Max: [d_v: 3.7616] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 243MB
+➡️  Step 57800 | Loss: 2.0585 | BPC: 2.97 | Gate Openness: 32.42% | LR: 1.34e-4
+   📐 GRADS -> Max: [d_v: 4.6152] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 245MB
+➡️  Step 57850 | Loss: 2.0167 | BPC: 2.909 | Gate Openness: 31.72% | LR: 1.34e-4
+   📐 GRADS -> Max: [d_v: 6.5193] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 247MB
+➡️  Step 57900 | Loss: 1.9567 | BPC: 2.823 | Gate Openness: 31.33% | LR: 1.34e-4
+   📐 GRADS -> Max: [d_v: 5.6079] | Friction a_diag: 0.0008 | Gate Bias: 0.0011 | RAM: 249MB
+➡️  Step 57950 | Loss: 1.9664 | BPC: 2.837 | Gate Openness: 30.02% | LR: 1.33e-4
+   📐 GRADS -> Max: [d_v: 4.0303] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 251MB
+➡️  Step 58000 | Loss: 1.9476 | BPC: 2.81 | Gate Openness: 30.1% | LR: 1.33e-4
+   📐 GRADS -> Max: [d_v: 5.9035] | Friction a_diag: 0.0005 | Gate Bias: 0.0004 | RAM: 252MB
+💾 Auto-Saving Checkpoint Step 58000...
+➡️  Step 58050 | Loss: 1.9722 | BPC: 2.845 | Gate Openness: 31.59% | LR: 1.33e-4
+   📐 GRADS -> Max: [d_v: 4.3852] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 222MB
+➡️  Step 58100 | Loss: 1.9661 | BPC: 2.836 | Gate Openness: 32.14% | LR: 1.33e-4
+   📐 GRADS -> Max: [d_v: 4.4992] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 222MB
+➡️  Step 58150 | Loss: 1.9591 | BPC: 2.826 | Gate Openness: 32.12% | LR: 1.33e-4
+   📐 GRADS -> Max: [d_v: 7.0221] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 219MB
+➡️  Step 58200 | Loss: 1.9449 | BPC: 2.806 | Gate Openness: 31.35% | LR: 1.32e-4
+   📐 GRADS -> Max: [d_v: 4.5399] | Friction a_diag: 0.0007 | Gate Bias: 0.0 | RAM: 223MB
+➡️  Step 58250 | Loss: 1.9796 | BPC: 2.856 | Gate Openness: 30.86% | LR: 1.32e-4
+   📐 GRADS -> Max: [d_v: 5.4441] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 223MB
+➡️  Step 58300 | Loss: 1.9626 | BPC: 2.832 | Gate Openness: 32.06% | LR: 1.32e-4
+   📐 GRADS -> Max: [d_v: 4.1413] | Friction a_diag: 0.0005 | Gate Bias: 0.0017 | RAM: 220MB
+➡️  Step 58350 | Loss: 1.9397 | BPC: 2.798 | Gate Openness: 33.78% | LR: 1.32e-4
+   📐 GRADS -> Max: [d_v: 5.3297] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 224MB
+➡️  Step 58400 | Loss: 2.012 | BPC: 2.903 | Gate Openness: 32.38% | LR: 1.32e-4
+   📐 GRADS -> Max: [d_v: 5.0025] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 224MB
+➡️  Step 58450 | Loss: 2.1028 | BPC: 3.034 | Gate Openness: 31.51% | LR: 1.31e-4
+   📐 GRADS -> Max: [d_v: 4.0006] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 217MB
+➡️  Step 58500 | Loss: 1.8765 | BPC: 2.707 | Gate Openness: 32.64% | LR: 1.31e-4
+   📐 GRADS -> Max: [d_v: 4.1463] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 217MB
+➡️  Step 58550 | Loss: 1.9172 | BPC: 2.766 | Gate Openness: 33.11% | LR: 1.31e-4
+   📐 GRADS -> Max: [d_v: 4.7623] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 217MB
+➡️  Step 58600 | Loss: 1.9338 | BPC: 2.79 | Gate Openness: 32.75% | LR: 1.31e-4
+   📐 GRADS -> Max: [d_v: 5.9366] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 218MB
+➡️  Step 58650 | Loss: 1.997 | BPC: 2.881 | Gate Openness: 33.49% | LR: 1.3e-4
+   📐 GRADS -> Max: [d_v: 8.1121] | Friction a_diag: 0.0007 | Gate Bias: 0.0018 | RAM: 218MB
+➡️  Step 58700 | Loss: 2.0313 | BPC: 2.931 | Gate Openness: 31.49% | LR: 1.3e-4
+   📐 GRADS -> Max: [d_v: 4.057] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 219MB
+➡️  Step 58750 | Loss: 1.8866 | BPC: 2.722 | Gate Openness: 32.21% | LR: 1.3e-4
+   📐 GRADS -> Max: [d_v: 5.0761] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 219MB
+➡️  Step 58800 | Loss: 2.0647 | BPC: 2.979 | Gate Openness: 32.83% | LR: 1.3e-4
+   📐 GRADS -> Max: [d_v: 5.9238] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 219MB
+➡️  Step 58850 | Loss: 2.0604 | BPC: 2.973 | Gate Openness: 30.78% | LR: 1.3e-4
+   📐 GRADS -> Max: [d_v: 6.1129] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 228MB
+➡️  Step 58900 | Loss: 1.9086 | BPC: 2.754 | Gate Openness: 31.41% | LR: 1.29e-4
+   📐 GRADS -> Max: [d_v: 5.8472] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 229MB
+➡️  Step 58950 | Loss: 1.9716 | BPC: 2.844 | Gate Openness: 32.7% | LR: 1.29e-4
+   📐 GRADS -> Max: [d_v: 5.7138] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 229MB
+➡️  Step 59000 | Loss: 1.9629 | BPC: 2.832 | Gate Openness: 32.47% | LR: 1.29e-4
+   📐 GRADS -> Max: [d_v: 4.1861] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 229MB
+💾 Auto-Saving Checkpoint Step 59000...
+➡️  Step 59050 | Loss: 2.068 | BPC: 2.984 | Gate Openness: 30.56% | LR: 1.29e-4
+   📐 GRADS -> Max: [d_v: 6.2649] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 221MB
+➡️  Step 59100 | Loss: 1.9737 | BPC: 2.847 | Gate Openness: 32.59% | LR: 1.29e-4
+   📐 GRADS -> Max: [d_v: 3.8458] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 222MB
+➡️  Step 59150 | Loss: 2.0524 | BPC: 2.961 | Gate Openness: 32.45% | LR: 1.28e-4
+   📐 GRADS -> Max: [d_v: 5.7128] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 230MB
+➡️  Step 59200 | Loss: 1.9034 | BPC: 2.746 | Gate Openness: 33.19% | LR: 1.28e-4
+   📐 GRADS -> Max: [d_v: 5.1294] | Friction a_diag: 0.0006 | Gate Bias: 0.0017 | RAM: 231MB
+➡️  Step 59250 | Loss: 1.9382 | BPC: 2.796 | Gate Openness: 31.72% | LR: 1.28e-4
+   📐 GRADS -> Max: [d_v: 4.6224] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 228MB
+➡️  Step 59300 | Loss: 1.9914 | BPC: 2.873 | Gate Openness: 31.81% | LR: 1.28e-4
+   📐 GRADS -> Max: [d_v: 5.0337] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 231MB
+➡️  Step 59350 | Loss: 1.9951 | BPC: 2.878 | Gate Openness: 33.78% | LR: 1.28e-4
+   📐 GRADS -> Max: [d_v: 5.1874] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 224MB
+➡️  Step 59400 | Loss: 2.0156 | BPC: 2.908 | Gate Openness: 31.69% | LR: 1.27e-4
+   📐 GRADS -> Max: [d_u: 4.0242] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 224MB
+➡️  Step 59450 | Loss: 2.0196 | BPC: 2.914 | Gate Openness: 31.73% | LR: 1.27e-4
+   📐 GRADS -> Max: [d_v: 4.4829] | Friction a_diag: 0.0006 | Gate Bias: 0.0021 | RAM: 225MB
+➡️  Step 59500 | Loss: 2.0881 | BPC: 3.013 | Gate Openness: 31.8% | LR: 1.27e-4
+   📐 GRADS -> Max: [d_v: 5.4019] | Friction a_diag: 0.0007 | Gate Bias: 0.0017 | RAM: 225MB
+➡️  Step 59550 | Loss: 1.912 | BPC: 2.758 | Gate Openness: 32.74% | LR: 1.27e-4
+   📐 GRADS -> Max: [d_v: 4.4953] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 234MB
+➡️  Step 59600 | Loss: 1.9136 | BPC: 2.761 | Gate Openness: 31.69% | LR: 1.27e-4
+   📐 GRADS -> Max: [d_v: 5.5731] | Friction a_diag: 0.0007 | Gate Bias: 0.0026 | RAM: 234MB
+➡️  Step 59650 | Loss: 1.9641 | BPC: 2.834 | Gate Openness: 32.2% | LR: 1.26e-4
+   📐 GRADS -> Max: [d_v: 7.9469] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 231MB
+➡️  Step 59700 | Loss: 1.8349 | BPC: 2.647 | Gate Openness: 30.57% | LR: 1.26e-4
+   📐 GRADS -> Max: [d_v: 5.8133] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 227MB
+➡️  Step 59750 | Loss: 2.0407 | BPC: 2.944 | Gate Openness: 32.99% | LR: 1.26e-4
+   📐 GRADS -> Max: [d_v: 5.1275] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 227MB
+➡️  Step 59800 | Loss: 2.0134 | BPC: 2.905 | Gate Openness: 29.52% | LR: 1.26e-4
+   📐 GRADS -> Max: [d_v: 6.9533] | Friction a_diag: 0.0006 | Gate Bias: 0.0008 | RAM: 227MB
+➡️  Step 59850 | Loss: 1.9477 | BPC: 2.81 | Gate Openness: 31.37% | LR: 1.26e-4
+   📐 GRADS -> Max: [d_v: 5.7312] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 233MB
+➡️  Step 59900 | Loss: 2.0106 | BPC: 2.901 | Gate Openness: 30.68% | LR: 1.25e-4
+   📐 GRADS -> Max: [d_v: 4.6454] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 237MB
+➡️  Step 59950 | Loss: 1.9689 | BPC: 2.84 | Gate Openness: 31.41% | LR: 1.25e-4
+   📐 GRADS -> Max: [d_v: 5.9887] | Friction a_diag: 0.0006 | Gate Bias: 0.0024 | RAM: 237MB
+➡️  Step 60000 | Loss: 1.9963 | BPC: 2.88 | Gate Openness: 33.92% | LR: 1.25e-4
+   📐 GRADS -> Max: [d_v: 4.7616] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 229MB
+💾 Auto-Saving Checkpoint Step 60000...
+➡️  Step 60050 | Loss: 2.0071 | BPC: 2.896 | Gate Openness: 31.69% | LR: 1.25e-4
+   📐 GRADS -> Max: [d_v: 5.289] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 238MB
+➡️  Step 60100 | Loss: 1.9749 | BPC: 2.849 | Gate Openness: 33.21% | LR: 1.25e-4
+   📐 GRADS -> Max: [d_v: 4.7741] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 238MB
+➡️  Step 60150 | Loss: 1.9416 | BPC: 2.801 | Gate Openness: 30.9% | LR: 1.24e-4
+   📐 GRADS -> Max: [d_v: 4.0799] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 240MB
+➡️  Step 60200 | Loss: 2.0139 | BPC: 2.905 | Gate Openness: 31.69% | LR: 1.24e-4
+   📐 GRADS -> Max: [d_v: 5.2322] | Friction a_diag: 0.0008 | Gate Bias: 0.0004 | RAM: 242MB
+➡️  Step 60250 | Loss: 1.9331 | BPC: 2.789 | Gate Openness: 31.68% | LR: 1.24e-4
+   📐 GRADS -> Max: [d_v: 4.266] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 244MB
+➡️  Step 60300 | Loss: 2.0166 | BPC: 2.909 | Gate Openness: 31.38% | LR: 1.24e-4
+   📐 GRADS -> Max: [d_v: 6.9862] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 246MB
+➡️  Step 60350 | Loss: 1.9011 | BPC: 2.743 | Gate Openness: 31.68% | LR: 1.23e-4
+   📐 GRADS -> Max: [d_v: 3.3846] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 248MB
+➡️  Step 60400 | Loss: 2.0464 | BPC: 2.952 | Gate Openness: 31.89% | LR: 1.23e-4
+   📐 GRADS -> Max: [d_v: 4.1416] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 249MB
+➡️  Step 60450 | Loss: 1.9079 | BPC: 2.753 | Gate Openness: 32.95% | LR: 1.23e-4
+   📐 GRADS -> Max: [d_v: 4.7698] | Friction a_diag: 0.0007 | Gate Bias: 0.002 | RAM: 251MB
+➡️  Step 60500 | Loss: 2.0683 | BPC: 2.984 | Gate Openness: 32.63% | LR: 1.23e-4
+   📐 GRADS -> Max: [d_v: 5.6736] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 253MB
+➡️  Step 60550 | Loss: 1.965 | BPC: 2.835 | Gate Openness: 32.42% | LR: 1.23e-4
+   📐 GRADS -> Max: [d_v: 4.0419] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 255MB
+➡️  Step 60600 | Loss: 2.0006 | BPC: 2.886 | Gate Openness: 33.12% | LR: 1.22e-4
+   📐 GRADS -> Max: [d_v: 4.2263] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 257MB
+➡️  Step 60650 | Loss: 1.9683 | BPC: 2.84 | Gate Openness: 30.28% | LR: 1.22e-4
+   📐 GRADS -> Max: [d_v: 6.8093] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 259MB
+➡️  Step 60700 | Loss: 1.9592 | BPC: 2.826 | Gate Openness: 30.79% | LR: 1.22e-4
+   📐 GRADS -> Max: [d_v: 5.2998] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 261MB
+➡️  Step 60750 | Loss: 1.889 | BPC: 2.725 | Gate Openness: 32.26% | LR: 1.22e-4
+   📐 GRADS -> Max: [d_v: 5.0225] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 263MB
+➡️  Step 60800 | Loss: 1.8869 | BPC: 2.722 | Gate Openness: 30.86% | LR: 1.22e-4
+   📐 GRADS -> Max: [d_v: 5.4296] | Friction a_diag: 0.0006 | Gate Bias: 0.0009 | RAM: 265MB
+➡️  Step 60850 | Loss: 2.0143 | BPC: 2.906 | Gate Openness: 31.69% | LR: 1.21e-4
+   📐 GRADS -> Max: [d_v: 9.0309] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 267MB
+➡️  Step 60900 | Loss: 1.9458 | BPC: 2.807 | Gate Openness: 31.76% | LR: 1.21e-4
+   📐 GRADS -> Max: [d_v: 4.3089] | Friction a_diag: 0.0006 | Gate Bias: 0.0037 | RAM: 269MB
+➡️  Step 60950 | Loss: 1.9291 | BPC: 2.783 | Gate Openness: 33.06% | LR: 1.21e-4
+   📐 GRADS -> Max: [d_v: 4.2814] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 270MB
+➡️  Step 61000 | Loss: 1.9941 | BPC: 2.877 | Gate Openness: 31.22% | LR: 1.21e-4
+   📐 GRADS -> Max: [d_v: 5.5026] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 272MB
+💾 Auto-Saving Checkpoint Step 61000...
+➡️  Step 61050 | Loss: 2.0516 | BPC: 2.96 | Gate Openness: 31.95% | LR: 1.21e-4
+   📐 GRADS -> Max: [d_v: 5.7622] | Friction a_diag: 0.0006 | Gate Bias: 0.0009 | RAM: 242MB
+➡️  Step 61100 | Loss: 1.9151 | BPC: 2.763 | Gate Openness: 31.68% | LR: 1.2e-4
+   📐 GRADS -> Max: [d_v: 4.3275] | Friction a_diag: 0.0006 | Gate Bias: 0.0 | RAM: 243MB
+➡️  Step 61150 | Loss: 2.0347 | BPC: 2.935 | Gate Openness: 32.72% | LR: 1.2e-4
+   📐 GRADS -> Max: [d_v: 6.2292] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 245MB
+➡️  Step 61200 | Loss: 1.9987 | BPC: 2.883 | Gate Openness: 31.62% | LR: 1.2e-4
+   📐 GRADS -> Max: [d_v: 3.77] | Friction a_diag: 0.0006 | Gate Bias: 0.0 | RAM: 246MB
+➡️  Step 61250 | Loss: 1.9802 | BPC: 2.857 | Gate Openness: 32.47% | LR: 1.2e-4
+   📐 GRADS -> Max: [d_u: 3.0635] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 248MB
+➡️  Step 61300 | Loss: 1.9625 | BPC: 2.831 | Gate Openness: 32.54% | LR: 1.2e-4
+   📐 GRADS -> Max: [d_v: 4.5626] | Friction a_diag: 0.0009 | Gate Bias: 0.0011 | RAM: 250MB
+➡️  Step 61350 | Loss: 1.9761 | BPC: 2.851 | Gate Openness: 31.82% | LR: 1.19e-4
+   📐 GRADS -> Max: [d_v: 8.1127] | Friction a_diag: 0.0009 | Gate Bias: 0.0012 | RAM: 252MB
+➡️  Step 61400 | Loss: 1.9702 | BPC: 2.842 | Gate Openness: 33.01% | LR: 1.19e-4
+   📐 GRADS -> Max: [d_v: 4.9798] | Friction a_diag: 0.0007 | Gate Bias: 0.0031 | RAM: 254MB
+➡️  Step 61450 | Loss: 2.0276 | BPC: 2.925 | Gate Openness: 30.29% | LR: 1.19e-4
+   📐 GRADS -> Max: [d_v: 5.6932] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 256MB
+➡️  Step 61500 | Loss: 1.8784 | BPC: 2.71 | Gate Openness: 32.07% | LR: 1.19e-4
+   📐 GRADS -> Max: [d_v: 6.9811] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 241MB
+➡️  Step 61550 | Loss: 1.9947 | BPC: 2.878 | Gate Openness: 32.41% | LR: 1.19e-4
+   📐 GRADS -> Max: [d_v: 4.7805] | Friction a_diag: 0.0008 | Gate Bias: 0.0012 | RAM: 249MB
+➡️  Step 61600 | Loss: 2.0439 | BPC: 2.949 | Gate Openness: 31.38% | LR: 1.18e-4
+   📐 GRADS -> Max: [d_v: 5.2441] | Friction a_diag: 0.0006 | Gate Bias: 0.0008 | RAM: 242MB
+➡️  Step 61650 | Loss: 1.8912 | BPC: 2.728 | Gate Openness: 32.19% | LR: 1.18e-4
+   📐 GRADS -> Max: [d_v: 5.666] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 242MB
+➡️  Step 61700 | Loss: 1.9581 | BPC: 2.825 | Gate Openness: 32.86% | LR: 1.18e-4
+   📐 GRADS -> Max: [d_v: 3.8515] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 251MB
+➡️  Step 61750 | Loss: 1.9868 | BPC: 2.866 | Gate Openness: 32.64% | LR: 1.18e-4
+   📐 GRADS -> Max: [d_v: 5.1332] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 243MB
+➡️  Step 61800 | Loss: 2.0315 | BPC: 2.931 | Gate Openness: 31.19% | LR: 1.18e-4
+   📐 GRADS -> Max: [d_v: 4.2596] | Friction a_diag: 0.0009 | Gate Bias: 0.0018 | RAM: 243MB
+➡️  Step 61850 | Loss: 1.9245 | BPC: 2.776 | Gate Openness: 32.53% | LR: 1.17e-4
+   📐 GRADS -> Max: [d_v: 3.6232] | Friction a_diag: 0.0008 | Gate Bias: 0.0004 | RAM: 244MB
+➡️  Step 61900 | Loss: 2.0784 | BPC: 2.999 | Gate Openness: 30.6% | LR: 1.17e-4
+   📐 GRADS -> Max: [d_v: 5.4481] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 252MB
+➡️  Step 61950 | Loss: 1.9377 | BPC: 2.796 | Gate Openness: 31.49% | LR: 1.17e-4
+   📐 GRADS -> Max: [d_v: 3.7287] | Friction a_diag: 0.0009 | Gate Bias: 0.0014 | RAM: 245MB
+➡️  Step 62000 | Loss: 1.8315 | BPC: 2.642 | Gate Openness: 32.24% | LR: 1.17e-4
+   📐 GRADS -> Max: [d_v: 6.6827] | Friction a_diag: 0.0008 | Gate Bias: 0.0013 | RAM: 245MB
+💾 Auto-Saving Checkpoint Step 62000...
+➡️  Step 62050 | Loss: 2.0297 | BPC: 2.928 | Gate Openness: 31.94% | LR: 1.17e-4
+   📐 GRADS -> Max: [d_v: 6.3878] | Friction a_diag: 0.0007 | Gate Bias: 0.0 | RAM: 248MB
+➡️  Step 62100 | Loss: 1.9708 | BPC: 2.843 | Gate Openness: 33.65% | LR: 1.16e-4
+   📐 GRADS -> Max: [d_v: 3.5005] | Friction a_diag: 0.0007 | Gate Bias: 0.0019 | RAM: 248MB
+➡️  Step 62150 | Loss: 2.0681 | BPC: 2.984 | Gate Openness: 32.85% | LR: 1.16e-4
+   📐 GRADS -> Max: [d_v: 6.1928] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 250MB
+➡️  Step 62200 | Loss: 1.9114 | BPC: 2.758 | Gate Openness: 32.46% | LR: 1.16e-4
+   📐 GRADS -> Max: [d_v: 6.2543] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 252MB
+➡️  Step 62250 | Loss: 1.9916 | BPC: 2.873 | Gate Openness: 33.12% | LR: 1.16e-4
+   📐 GRADS -> Max: [d_v: 4.9421] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 254MB
+➡️  Step 62300 | Loss: 1.9372 | BPC: 2.795 | Gate Openness: 30.31% | LR: 1.16e-4
+   📐 GRADS -> Max: [d_v: 6.7241] | Friction a_diag: 0.0008 | Gate Bias: 0.0014 | RAM: 256MB
+➡️  Step 62350 | Loss: 2.0387 | BPC: 2.941 | Gate Openness: 31.75% | LR: 1.15e-4
+   📐 GRADS -> Max: [d_v: 6.2022] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 258MB
+➡️  Step 62400 | Loss: 2.0002 | BPC: 2.886 | Gate Openness: 30.0% | LR: 1.15e-4
+   📐 GRADS -> Max: [d_v: 6.4498] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 260MB
+➡️  Step 62450 | Loss: 1.9905 | BPC: 2.872 | Gate Openness: 32.02% | LR: 1.15e-4
+   📐 GRADS -> Max: [d_v: 4.868] | Friction a_diag: 0.0006 | Gate Bias: 0.0017 | RAM: 261MB
+➡️  Step 62500 | Loss: 1.9589 | BPC: 2.826 | Gate Openness: 31.49% | LR: 1.15e-4
+   📐 GRADS -> Max: [d_v: 5.0434] | Friction a_diag: 0.0007 | Gate Bias: 0.001 | RAM: 263MB
+➡️  Step 62550 | Loss: 1.9323 | BPC: 2.788 | Gate Openness: 31.95% | LR: 1.15e-4
+   📐 GRADS -> Max: [d_v: 4.8371] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 265MB
+➡️  Step 62600 | Loss: 1.8954 | BPC: 2.735 | Gate Openness: 31.16% | LR: 1.14e-4
+   📐 GRADS -> Max: [d_v: 9.6979] | Friction a_diag: 0.0008 | Gate Bias: 0.0012 | RAM: 267MB
+➡️  Step 62650 | Loss: 1.9043 | BPC: 2.747 | Gate Openness: 31.98% | LR: 1.14e-4
+   📐 GRADS -> Max: [d_v: 4.089] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 269MB
+➡️  Step 62700 | Loss: 1.9544 | BPC: 2.82 | Gate Openness: 30.53% | LR: 1.14e-4
+   📐 GRADS -> Max: [d_v: 4.2981] | Friction a_diag: 0.0006 | Gate Bias: 0.0012 | RAM: 271MB
+➡️  Step 62750 | Loss: 2.0218 | BPC: 2.917 | Gate Openness: 33.37% | LR: 1.14e-4
+   📐 GRADS -> Max: [d_v: 5.2117] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 273MB
+➡️  Step 62800 | Loss: 1.9805 | BPC: 2.857 | Gate Openness: 30.9% | LR: 1.14e-4
+   📐 GRADS -> Max: [d_v: 5.3428] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 275MB
+➡️  Step 62850 | Loss: 2.0264 | BPC: 2.923 | Gate Openness: 33.2% | LR: 1.13e-4
+   📐 GRADS -> Max: [d_v: 5.1915] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 277MB
+➡️  Step 62900 | Loss: 1.9619 | BPC: 2.83 | Gate Openness: 33.14% | LR: 1.13e-4
+   📐 GRADS -> Max: [d_v: 5.1159] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 279MB
+➡️  Step 62950 | Loss: 2.1304 | BPC: 3.073 | Gate Openness: 32.65% | LR: 1.13e-4
+   📐 GRADS -> Max: [d_v: 5.711] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 281MB
+➡️  Step 63000 | Loss: 1.9302 | BPC: 2.785 | Gate Openness: 31.35% | LR: 1.13e-4
+   📐 GRADS -> Max: [d_v: 4.6989] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 283MB
+💾 Auto-Saving Checkpoint Step 63000...
+➡️  Step 63050 | Loss: 1.9786 | BPC: 2.855 | Gate Openness: 32.25% | LR: 1.13e-4
+   📐 GRADS -> Max: [d_v: 5.0599] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 262MB
+➡️  Step 63100 | Loss: 1.9413 | BPC: 2.801 | Gate Openness: 32.94% | LR: 1.12e-4
+   📐 GRADS -> Max: [d_v: 5.0824] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 254MB
+➡️  Step 63150 | Loss: 1.9975 | BPC: 2.882 | Gate Openness: 30.96% | LR: 1.12e-4
+   📐 GRADS -> Max: [d_v: 5.5494] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 254MB
+➡️  Step 63200 | Loss: 1.9856 | BPC: 2.865 | Gate Openness: 33.35% | LR: 1.12e-4
+   📐 GRADS -> Max: [d_v: 6.2071] | Friction a_diag: 0.0006 | Gate Bias: 0.0008 | RAM: 260MB
+➡️  Step 63250 | Loss: 1.9349 | BPC: 2.792 | Gate Openness: 31.76% | LR: 1.12e-4
+   📐 GRADS -> Max: [d_v: 3.809] | Friction a_diag: 0.0006 | Gate Bias: 0.0 | RAM: 258MB
+➡️  Step 63300 | Loss: 1.9012 | BPC: 2.743 | Gate Openness: 31.04% | LR: 1.12e-4
+   📐 GRADS -> Max: [d_v: 7.4935] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 267MB
+➡️  Step 63350 | Loss: 1.9736 | BPC: 2.847 | Gate Openness: 32.28% | LR: 1.11e-4
+   📐 GRADS -> Max: [d_v: 4.2594] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 259MB
+➡️  Step 63400 | Loss: 1.94 | BPC: 2.799 | Gate Openness: 31.16% | LR: 1.11e-4
+   📐 GRADS -> Max: [d_v: 5.1765] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 259MB
+➡️  Step 63450 | Loss: 1.988 | BPC: 2.868 | Gate Openness: 32.03% | LR: 1.11e-4
+   📐 GRADS -> Max: [d_v: 5.8883] | Friction a_diag: 0.0006 | Gate Bias: 0.0009 | RAM: 268MB
+➡️  Step 63500 | Loss: 2.0244 | BPC: 2.921 | Gate Openness: 31.32% | LR: 1.11e-4
+   📐 GRADS -> Max: [d_v: 6.2315] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 260MB
+➡️  Step 63550 | Loss: 1.9219 | BPC: 2.773 | Gate Openness: 32.34% | LR: 1.11e-4
+   📐 GRADS -> Max: [d_v: 7.5641] | Friction a_diag: 0.0008 | Gate Bias: 0.0001 | RAM: 269MB
+➡️  Step 63600 | Loss: 1.9062 | BPC: 2.75 | Gate Openness: 31.31% | LR: 1.1e-4
+   📐 GRADS -> Max: [d_v: 5.1151] | Friction a_diag: 0.0006 | Gate Bias: 0.0011 | RAM: 261MB
+➡️  Step 63650 | Loss: 1.9788 | BPC: 2.855 | Gate Openness: 31.89% | LR: 1.1e-4
+   📐 GRADS -> Max: [d_v: 5.3466] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 261MB
+➡️  Step 63700 | Loss: 1.9774 | BPC: 2.853 | Gate Openness: 33.94% | LR: 1.1e-4
+   📐 GRADS -> Max: [d_v: 5.9545] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 270MB
+➡️  Step 63750 | Loss: 1.9524 | BPC: 2.817 | Gate Openness: 31.75% | LR: 1.1e-4
+   📐 GRADS -> Max: [d_v: 6.3143] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 262MB
+➡️  Step 63800 | Loss: 1.977 | BPC: 2.852 | Gate Openness: 31.57% | LR: 1.1e-4
+   📐 GRADS -> Max: [d_v: 5.4497] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 271MB
+➡️  Step 63850 | Loss: 1.9892 | BPC: 2.87 | Gate Openness: 30.96% | LR: 1.1e-4
+   📐 GRADS -> Max: [d_v: 5.3519] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 263MB
+➡️  Step 63900 | Loss: 1.9164 | BPC: 2.765 | Gate Openness: 30.92% | LR: 1.09e-4
+   📐 GRADS -> Max: [d_v: 5.7372] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 263MB
+➡️  Step 63950 | Loss: 1.9931 | BPC: 2.875 | Gate Openness: 31.91% | LR: 1.09e-4
+   📐 GRADS -> Max: [d_v: 5.3331] | Friction a_diag: 0.0009 | Gate Bias: 0.0019 | RAM: 272MB
+➡️  Step 64000 | Loss: 1.9519 | BPC: 2.816 | Gate Openness: 32.0% | LR: 1.09e-4
+   📐 GRADS -> Max: [d_v: 3.8941] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 264MB
+💾 Auto-Saving Checkpoint Step 64000...
+➡️  Step 64050 | Loss: 2.0444 | BPC: 2.949 | Gate Openness: 31.72% | LR: 1.09e-4
+   📐 GRADS -> Max: [d_v: 4.7778] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 267MB
+➡️  Step 64100 | Loss: 1.9014 | BPC: 2.743 | Gate Openness: 32.3% | LR: 1.09e-4
+   📐 GRADS -> Max: [d_v: 4.7748] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 267MB
+➡️  Step 64150 | Loss: 1.9736 | BPC: 2.847 | Gate Openness: 32.96% | LR: 1.08e-4
+   📐 GRADS -> Max: [d_v: 5.3502] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 269MB
+➡️  Step 64200 | Loss: 2.0271 | BPC: 2.925 | Gate Openness: 29.99% | LR: 1.08e-4
+   📐 GRADS -> Max: [d_v: 5.9017] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 271MB
+➡️  Step 64250 | Loss: 1.8952 | BPC: 2.734 | Gate Openness: 30.97% | LR: 1.08e-4
+   📐 GRADS -> Max: [d_v: 5.3648] | Friction a_diag: 0.0008 | Gate Bias: 0.0007 | RAM: 273MB
+➡️  Step 64300 | Loss: 1.9102 | BPC: 2.756 | Gate Openness: 31.65% | LR: 1.08e-4
+   📐 GRADS -> Max: [d_v: 5.1623] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 275MB
+➡️  Step 64350 | Loss: 1.9894 | BPC: 2.87 | Gate Openness: 32.57% | LR: 1.08e-4
+   📐 GRADS -> Max: [d_v: 6.5708] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 277MB
+➡️  Step 64400 | Loss: 1.8803 | BPC: 2.713 | Gate Openness: 30.68% | LR: 1.07e-4
+   📐 GRADS -> Max: [d_v: 4.1537] | Friction a_diag: 0.0007 | Gate Bias: 0.0 | RAM: 279MB
+➡️  Step 64450 | Loss: 1.8661 | BPC: 2.692 | Gate Openness: 31.86% | LR: 1.07e-4
+   📐 GRADS -> Max: [d_v: 4.6757] | Friction a_diag: 0.0006 | Gate Bias: 0.0011 | RAM: 281MB
+➡️  Step 64500 | Loss: 1.8939 | BPC: 2.732 | Gate Openness: 31.03% | LR: 1.07e-4
+   📐 GRADS -> Max: [d_v: 6.0365] | Friction a_diag: 0.0006 | Gate Bias: 0.0009 | RAM: 283MB
+➡️  Step 64550 | Loss: 2.014 | BPC: 2.906 | Gate Openness: 31.37% | LR: 1.07e-4
+   📐 GRADS -> Max: [d_v: 4.9261] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 284MB
+➡️  Step 64600 | Loss: 2.0717 | BPC: 2.989 | Gate Openness: 32.0% | LR: 1.07e-4
+   📐 GRADS -> Max: [d_v: 4.1308] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 286MB
+➡️  Step 64650 | Loss: 1.9648 | BPC: 2.835 | Gate Openness: 31.61% | LR: 1.06e-4
+   📐 GRADS -> Max: [d_v: 5.9984] | Friction a_diag: 0.0006 | Gate Bias: 0.0017 | RAM: 288MB
+➡️  Step 64700 | Loss: 1.8289 | BPC: 2.639 | Gate Openness: 32.67% | LR: 1.06e-4
+   📐 GRADS -> Max: [d_u: 3.2384] | Friction a_diag: 0.0006 | Gate Bias: 0.002 | RAM: 290MB
+➡️  Step 64750 | Loss: 1.9077 | BPC: 2.752 | Gate Openness: 31.62% | LR: 1.06e-4
+   📐 GRADS -> Max: [d_v: 4.8146] | Friction a_diag: 0.0007 | Gate Bias: 0.0018 | RAM: 292MB
+➡️  Step 64800 | Loss: 1.8396 | BPC: 2.654 | Gate Openness: 31.32% | LR: 1.06e-4
+   📐 GRADS -> Max: [d_v: 5.2463] | Friction a_diag: 0.0007 | Gate Bias: 0.001 | RAM: 294MB
+➡️  Step 64850 | Loss: 2.0312 | BPC: 2.93 | Gate Openness: 33.55% | LR: 1.06e-4
+   📐 GRADS -> Max: [d_v: 4.6142] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 296MB
+➡️  Step 64900 | Loss: 1.9726 | BPC: 2.846 | Gate Openness: 30.35% | LR: 1.05e-4
+   📐 GRADS -> Max: [d_v: 5.9464] | Friction a_diag: 0.0007 | Gate Bias: 0.001 | RAM: 298MB
+➡️  Step 64950 | Loss: 1.9977 | BPC: 2.882 | Gate Openness: 32.16% | LR: 1.05e-4
+   📐 GRADS -> Max: [d_v: 4.8224] | Friction a_diag: 0.0007 | Gate Bias: 0.0018 | RAM: 300MB
+➡️  Step 65000 | Loss: 2.0011 | BPC: 2.887 | Gate Openness: 32.81% | LR: 1.05e-4
+   📐 GRADS -> Max: [d_v: 5.1834] | Friction a_diag: 0.0007 | Gate Bias: 0.002 | RAM: 302MB
+💾 Auto-Saving Checkpoint Step 65000...
+➡️  Step 65050 | Loss: 1.8935 | BPC: 2.732 | Gate Openness: 32.2% | LR: 1.05e-4
+   📐 GRADS -> Max: [d_v: 4.4445] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 275MB
+➡️  Step 65100 | Loss: 2.0618 | BPC: 2.975 | Gate Openness: 31.39% | LR: 1.05e-4
+   📐 GRADS -> Max: [d_v: 5.204] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 275MB
+➡️  Step 65150 | Loss: 1.9954 | BPC: 2.879 | Gate Openness: 31.59% | LR: 1.04e-4
+   📐 GRADS -> Max: [d_v: 7.4073] | Friction a_diag: 0.0008 | Gate Bias: 0.0007 | RAM: 277MB
+➡️  Step 65200 | Loss: 1.8868 | BPC: 2.722 | Gate Openness: 32.1% | LR: 1.04e-4
+   📐 GRADS -> Max: [d_v: 3.823] | Friction a_diag: 0.0006 | Gate Bias: 0.0015 | RAM: 279MB
+➡️  Step 65250 | Loss: 1.9952 | BPC: 2.879 | Gate Openness: 30.93% | LR: 1.04e-4
+   📐 GRADS -> Max: [d_v: 4.8861] | Friction a_diag: 0.0008 | Gate Bias: 0.0002 | RAM: 281MB
+➡️  Step 65300 | Loss: 1.9063 | BPC: 2.75 | Gate Openness: 32.16% | LR: 1.04e-4
+   📐 GRADS -> Max: [d_v: 4.9341] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 283MB
+➡️  Step 65350 | Loss: 1.9565 | BPC: 2.823 | Gate Openness: 31.84% | LR: 1.04e-4
+   📐 GRADS -> Max: [d_v: 9.1024] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 273MB
+➡️  Step 65400 | Loss: 1.8909 | BPC: 2.728 | Gate Openness: 32.22% | LR: 1.04e-4
+   📐 GRADS -> Max: [d_v: 4.3049] | Friction a_diag: 0.0007 | Gate Bias: 0.0019 | RAM: 280MB
+➡️  Step 65450 | Loss: 1.8964 | BPC: 2.736 | Gate Openness: 31.67% | LR: 1.03e-4
+   📐 GRADS -> Max: [d_v: 4.4118] | Friction a_diag: 0.0006 | Gate Bias: 0.0015 | RAM: 281MB
+➡️  Step 65500 | Loss: 2.0048 | BPC: 2.892 | Gate Openness: 32.09% | LR: 1.03e-4
+   📐 GRADS -> Max: [d_v: 5.6657] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 281MB
+➡️  Step 65550 | Loss: 2.0688 | BPC: 2.985 | Gate Openness: 30.84% | LR: 1.03e-4
+   📐 GRADS -> Max: [d_v: 5.6943] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 274MB
+➡️  Step 65600 | Loss: 1.9915 | BPC: 2.873 | Gate Openness: 32.72% | LR: 1.03e-4
+   📐 GRADS -> Max: [d_v: 5.3419] | Friction a_diag: 0.0006 | Gate Bias: 0.0014 | RAM: 274MB
+➡️  Step 65650 | Loss: 1.9202 | BPC: 2.77 | Gate Openness: 31.51% | LR: 1.03e-4
+   📐 GRADS -> Max: [d_v: 5.6426] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 275MB
+➡️  Step 65700 | Loss: 1.9661 | BPC: 2.836 | Gate Openness: 31.89% | LR: 1.02e-4
+   📐 GRADS -> Max: [d_v: 3.8419] | Friction a_diag: 0.0006 | Gate Bias: 0.0012 | RAM: 275MB
+➡️  Step 65750 | Loss: 1.9667 | BPC: 2.837 | Gate Openness: 32.47% | LR: 1.02e-4
+   📐 GRADS -> Max: [d_v: 5.188] | Friction a_diag: 0.0007 | Gate Bias: 0.0016 | RAM: 283MB
+➡️  Step 65800 | Loss: 2.0745 | BPC: 2.993 | Gate Openness: 32.59% | LR: 1.02e-4
+   📐 GRADS -> Max: [d_v: 6.0717] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 283MB
+➡️  Step 65850 | Loss: 1.9418 | BPC: 2.801 | Gate Openness: 32.01% | LR: 1.02e-4
+   📐 GRADS -> Max: [d_v: 4.9189] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 281MB
+➡️  Step 65900 | Loss: 2.0706 | BPC: 2.987 | Gate Openness: 33.41% | LR: 1.02e-4
+   📐 GRADS -> Max: [d_v: 7.1549] | Friction a_diag: 0.0008 | Gate Bias: 0.0003 | RAM: 284MB
+➡️  Step 65950 | Loss: 2.0199 | BPC: 2.914 | Gate Openness: 32.03% | LR: 1.01e-4
+   📐 GRADS -> Max: [d_v: 6.1299] | Friction a_diag: 0.0007 | Gate Bias: 0.0017 | RAM: 277MB
+➡️  Step 66000 | Loss: 1.8924 | BPC: 2.73 | Gate Openness: 32.34% | LR: 1.01e-4
+   📐 GRADS -> Max: [d_v: 4.1935] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 278MB
+💾 Auto-Saving Checkpoint Step 66000...
+➡️  Step 66050 | Loss: 1.9738 | BPC: 2.848 | Gate Openness: 31.87% | LR: 1.01e-4
+   📐 GRADS -> Max: [d_v: 4.9723] | Friction a_diag: 0.0006 | Gate Bias: 0.0011 | RAM: 285MB
+➡️  Step 66100 | Loss: 1.931 | BPC: 2.786 | Gate Openness: 31.81% | LR: 1.01e-4
+   📐 GRADS -> Max: [d_v: 4.8636] | Friction a_diag: 0.0006 | Gate Bias: 0.0015 | RAM: 286MB
+➡️  Step 66150 | Loss: 1.9578 | BPC: 2.824 | Gate Openness: 32.84% | LR: 1.01e-4
+   📐 GRADS -> Max: [d_v: 6.3173] | Friction a_diag: 0.0007 | Gate Bias: 0.0 | RAM: 287MB
+➡️  Step 66200 | Loss: 2.0187 | BPC: 2.912 | Gate Openness: 32.01% | LR: 0.0001
+   📐 GRADS -> Max: [d_v: 4.4898] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 289MB
+➡️  Step 66250 | Loss: 1.8853 | BPC: 2.72 | Gate Openness: 31.97% | LR: 0.0001
+   📐 GRADS -> Max: [d_v: 6.5929] | Friction a_diag: 0.0006 | Gate Bias: 0.0015 | RAM: 291MB
+➡️  Step 66300 | Loss: 1.9495 | BPC: 2.813 | Gate Openness: 32.1% | LR: 0.0001
+   📐 GRADS -> Max: [d_u: 4.4148] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 293MB
+➡️  Step 66350 | Loss: 1.9693 | BPC: 2.841 | Gate Openness: 32.43% | LR: 0.0001
+   📐 GRADS -> Max: [d_v: 4.9938] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 295MB
+➡️  Step 66400 | Loss: 1.9593 | BPC: 2.827 | Gate Openness: 31.48% | LR: 0.0001
+   📐 GRADS -> Max: [d_v: 5.1932] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 297MB
+➡️  Step 66450 | Loss: 2.0235 | BPC: 2.919 | Gate Openness: 30.99% | LR: 0.0001
+   📐 GRADS -> Max: [d_v: 5.1905] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 299MB
+➡️  Step 66500 | Loss: 1.947 | BPC: 2.809 | Gate Openness: 32.63% | LR: 9.9e-5
+   📐 GRADS -> Max: [d_v: 4.2342] | Friction a_diag: 0.0007 | Gate Bias: 0.0017 | RAM: 301MB
+➡️  Step 66550 | Loss: 1.9523 | BPC: 2.817 | Gate Openness: 31.21% | LR: 9.9e-5
+   📐 GRADS -> Max: [d_v: 4.2686] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 303MB
+➡️  Step 66600 | Loss: 1.9085 | BPC: 2.753 | Gate Openness: 32.66% | LR: 9.9e-5
+   📐 GRADS -> Max: [d_v: 5.4136] | Friction a_diag: 0.0007 | Gate Bias: 0.001 | RAM: 305MB
+➡️  Step 66650 | Loss: 1.9688 | BPC: 2.84 | Gate Openness: 30.49% | LR: 9.9e-5
+   📐 GRADS -> Max: [d_u: 3.3205] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 307MB
+➡️  Step 66700 | Loss: 1.9786 | BPC: 2.854 | Gate Openness: 32.52% | LR: 9.9e-5
+   📐 GRADS -> Max: [d_v: 5.1728] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 309MB
+➡️  Step 66750 | Loss: 2.0148 | BPC: 2.907 | Gate Openness: 31.7% | LR: 9.8e-5
+   📐 GRADS -> Max: [d_v: 4.5641] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 310MB
+➡️  Step 66800 | Loss: 1.9236 | BPC: 2.775 | Gate Openness: 31.6% | LR: 9.8e-5
+   📐 GRADS -> Max: [d_v: 5.1864] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 312MB
+➡️  Step 66850 | Loss: 2.0116 | BPC: 2.902 | Gate Openness: 31.99% | LR: 9.8e-5
+   📐 GRADS -> Max: [d_v: 7.7081] | Friction a_diag: 0.0007 | Gate Bias: 0.0021 | RAM: 314MB
+➡️  Step 66900 | Loss: 1.9501 | BPC: 2.813 | Gate Openness: 33.08% | LR: 9.8e-5
+   📐 GRADS -> Max: [d_v: 5.5651] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 316MB
+➡️  Step 66950 | Loss: 1.8546 | BPC: 2.676 | Gate Openness: 32.39% | LR: 9.8e-5
+   📐 GRADS -> Max: [d_v: 4.9058] | Friction a_diag: 0.0006 | Gate Bias: 0.0012 | RAM: 318MB
+➡️  Step 67000 | Loss: 1.8559 | BPC: 2.677 | Gate Openness: 31.5% | LR: 9.8e-5
+   📐 GRADS -> Max: [d_v: 5.0231] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 320MB
+💾 Auto-Saving Checkpoint Step 67000...
+➡️  Step 67050 | Loss: 1.9357 | BPC: 2.793 | Gate Openness: 32.63% | LR: 9.7e-5
+   📐 GRADS -> Max: [d_v: 4.6217] | Friction a_diag: 0.0008 | Gate Bias: 0.0005 | RAM: 291MB
+➡️  Step 67100 | Loss: 1.9072 | BPC: 2.751 | Gate Openness: 32.49% | LR: 9.7e-5
+   📐 GRADS -> Max: [d_v: 4.8274] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 291MB
+➡️  Step 67150 | Loss: 2.1018 | BPC: 3.032 | Gate Openness: 30.84% | LR: 9.7e-5
+   📐 GRADS -> Max: [d_v: 7.2119] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 294MB
+➡️  Step 67200 | Loss: 1.9667 | BPC: 2.837 | Gate Openness: 31.73% | LR: 9.7e-5
+   📐 GRADS -> Max: [d_v: 8.2167] | Friction a_diag: 0.0008 | Gate Bias: 0.0005 | RAM: 295MB
+➡️  Step 67250 | Loss: 2.0498 | BPC: 2.957 | Gate Openness: 30.42% | LR: 9.7e-5
+   📐 GRADS -> Max: [d_v: 5.8978] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 295MB
+➡️  Step 67300 | Loss: 2.0921 | BPC: 3.018 | Gate Openness: 31.29% | LR: 9.6e-5
+   📐 GRADS -> Max: [d_v: 6.7308] | Friction a_diag: 0.0008 | Gate Bias: 0.0003 | RAM: 293MB
+➡️  Step 67350 | Loss: 2.0062 | BPC: 2.894 | Gate Openness: 32.06% | LR: 9.6e-5
+   📐 GRADS -> Max: [d_v: 5.8746] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 296MB
+➡️  Step 67400 | Loss: 1.9255 | BPC: 2.778 | Gate Openness: 32.19% | LR: 9.6e-5
+   📐 GRADS -> Max: [d_v: 4.7198] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 293MB
+➡️  Step 67450 | Loss: 1.983 | BPC: 2.861 | Gate Openness: 32.64% | LR: 9.6e-5
+   📐 GRADS -> Max: [d_v: 6.0621] | Friction a_diag: 0.0006 | Gate Bias: 0.0011 | RAM: 296MB
+➡️  Step 67500 | Loss: 2.0195 | BPC: 2.914 | Gate Openness: 32.36% | LR: 9.6e-5
+   📐 GRADS -> Max: [d_v: 6.4833] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 297MB
+➡️  Step 67550 | Loss: 1.9035 | BPC: 2.746 | Gate Openness: 31.2% | LR: 9.5e-5
+   📐 GRADS -> Max: [d_v: 5.5323] | Friction a_diag: 0.0006 | Gate Bias: 0.0011 | RAM: 297MB
+➡️  Step 67600 | Loss: 1.9275 | BPC: 2.781 | Gate Openness: 32.05% | LR: 9.5e-5
+   📐 GRADS -> Max: [d_v: 5.4427] | Friction a_diag: 0.0007 | Gate Bias: 0.001 | RAM: 298MB
+➡️  Step 67650 | Loss: 1.9044 | BPC: 2.747 | Gate Openness: 32.08% | LR: 9.5e-5
+   📐 GRADS -> Max: [d_u: 4.115] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 291MB
+➡️  Step 67700 | Loss: 1.9059 | BPC: 2.75 | Gate Openness: 31.0% | LR: 9.5e-5
+   📐 GRADS -> Max: [d_v: 4.6632] | Friction a_diag: 0.0006 | Gate Bias: 0.0021 | RAM: 291MB
+➡️  Step 67750 | Loss: 2.121 | BPC: 3.06 | Gate Openness: 31.96% | LR: 9.5e-5
+   📐 GRADS -> Max: [d_v: 5.7968] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 291MB
+➡️  Step 67800 | Loss: 1.9613 | BPC: 2.83 | Gate Openness: 32.61% | LR: 9.5e-5
+   📐 GRADS -> Max: [d_v: 7.0262] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 292MB
+➡️  Step 67850 | Loss: 1.9939 | BPC: 2.877 | Gate Openness: 32.41% | LR: 9.4e-5
+   📐 GRADS -> Max: [d_v: 6.4974] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 292MB
+➡️  Step 67900 | Loss: 1.9702 | BPC: 2.842 | Gate Openness: 31.59% | LR: 9.4e-5
+   📐 GRADS -> Max: [d_v: 3.5117] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 293MB
+➡️  Step 67950 | Loss: 1.9901 | BPC: 2.871 | Gate Openness: 30.14% | LR: 9.4e-5
+   📐 GRADS -> Max: [d_v: 5.9303] | Friction a_diag: 0.0007 | Gate Bias: 0.001 | RAM: 293MB
+➡️  Step 68000 | Loss: 1.9352 | BPC: 2.792 | Gate Openness: 33.02% | LR: 9.4e-5
+   📐 GRADS -> Max: [d_v: 4.1176] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 293MB
+💾 Auto-Saving Checkpoint Step 68000...
+➡️  Step 68050 | Loss: 1.9288 | BPC: 2.783 | Gate Openness: 31.47% | LR: 9.4e-5
+   📐 GRADS -> Max: [d_v: 5.6024] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 295MB
+➡️  Step 68100 | Loss: 1.9906 | BPC: 2.872 | Gate Openness: 32.02% | LR: 9.3e-5
+   📐 GRADS -> Max: [d_v: 4.8652] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 297MB
+➡️  Step 68150 | Loss: 1.9377 | BPC: 2.795 | Gate Openness: 30.64% | LR: 9.3e-5
+   📐 GRADS -> Max: [d_v: 4.0834] | Friction a_diag: 0.0006 | Gate Bias: 0.0016 | RAM: 299MB
+➡️  Step 68200 | Loss: 1.9628 | BPC: 2.832 | Gate Openness: 32.18% | LR: 9.3e-5
+   📐 GRADS -> Max: [d_v: 4.3071] | Friction a_diag: 0.0006 | Gate Bias: 0.0012 | RAM: 301MB
+➡️  Step 68250 | Loss: 2.038 | BPC: 2.94 | Gate Openness: 30.93% | LR: 9.3e-5
+   📐 GRADS -> Max: [d_v: 5.6598] | Friction a_diag: 0.0006 | Gate Bias: 0.0008 | RAM: 303MB
+➡️  Step 68300 | Loss: 1.8324 | BPC: 2.644 | Gate Openness: 31.2% | LR: 9.3e-5
+   📐 GRADS -> Max: [d_v: 5.7847] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 304MB
+➡️  Step 68350 | Loss: 1.9479 | BPC: 2.81 | Gate Openness: 31.7% | LR: 9.3e-5
+   📐 GRADS -> Max: [d_v: 5.2169] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 306MB
+➡️  Step 68400 | Loss: 1.9483 | BPC: 2.811 | Gate Openness: 32.09% | LR: 9.2e-5
+   📐 GRADS -> Max: [d_v: 4.5957] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 308MB
+➡️  Step 68450 | Loss: 1.8613 | BPC: 2.685 | Gate Openness: 31.58% | LR: 9.2e-5
+   📐 GRADS -> Max: [d_v: 7.1028] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 310MB
+➡️  Step 68500 | Loss: 2.0242 | BPC: 2.92 | Gate Openness: 30.85% | LR: 9.2e-5
+   📐 GRADS -> Max: [d_v: 3.7845] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 312MB
+➡️  Step 68550 | Loss: 2.0425 | BPC: 2.947 | Gate Openness: 32.96% | LR: 9.2e-5
+   📐 GRADS -> Max: [d_v: 4.5736] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 314MB
+➡️  Step 68600 | Loss: 1.8973 | BPC: 2.737 | Gate Openness: 31.34% | LR: 9.2e-5
+   📐 GRADS -> Max: [d_v: 5.1775] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 316MB
+➡️  Step 68650 | Loss: 2.0271 | BPC: 2.925 | Gate Openness: 32.24% | LR: 9.1e-5
+   📐 GRADS -> Max: [d_v: 9.0382] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 318MB
+➡️  Step 68700 | Loss: 1.9939 | BPC: 2.877 | Gate Openness: 31.57% | LR: 9.1e-5
+   📐 GRADS -> Max: [d_v: 5.5197] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 320MB
+➡️  Step 68750 | Loss: 1.968 | BPC: 2.839 | Gate Openness: 33.18% | LR: 9.1e-5
+   📐 GRADS -> Max: [d_v: 6.0731] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 322MB
+➡️  Step 68800 | Loss: 2.0421 | BPC: 2.946 | Gate Openness: 33.83% | LR: 9.1e-5
+   📐 GRADS -> Max: [d_v: 3.5543] | Friction a_diag: 0.0006 | Gate Bias: 0.0017 | RAM: 324MB
+➡️  Step 68850 | Loss: 2.0149 | BPC: 2.907 | Gate Openness: 31.56% | LR: 9.1e-5
+   📐 GRADS -> Max: [d_v: 3.8778] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 326MB
+➡️  Step 68900 | Loss: 2.0284 | BPC: 2.926 | Gate Openness: 32.79% | LR: 9.1e-5
+   📐 GRADS -> Max: [d_u: 3.2479] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 328MB
+➡️  Step 68950 | Loss: 2.0407 | BPC: 2.944 | Gate Openness: 30.88% | LR: 9.0e-5
+   📐 GRADS -> Max: [d_v: 7.2834] | Friction a_diag: 0.0007 | Gate Bias: 0.0024 | RAM: 329MB
+➡️  Step 69000 | Loss: 1.9886 | BPC: 2.869 | Gate Openness: 32.26% | LR: 9.0e-5
+   📐 GRADS -> Max: [d_v: 5.0284] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 331MB
+💾 Auto-Saving Checkpoint Step 69000...
+➡️  Step 69050 | Loss: 1.9661 | BPC: 2.836 | Gate Openness: 32.89% | LR: 9.0e-5
+   📐 GRADS -> Max: [d_v: 5.9192] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 302MB
+➡️  Step 69100 | Loss: 1.8986 | BPC: 2.739 | Gate Openness: 31.73% | LR: 9.0e-5
+   📐 GRADS -> Max: [d_v: 4.0302] | Friction a_diag: 0.0008 | Gate Bias: 0.0018 | RAM: 302MB
+➡️  Step 69150 | Loss: 1.9155 | BPC: 2.763 | Gate Openness: 32.0% | LR: 9.0e-5
+   📐 GRADS -> Max: [d_v: 5.5469] | Friction a_diag: 0.0006 | Gate Bias: 0.0 | RAM: 303MB
+➡️  Step 69200 | Loss: 1.9707 | BPC: 2.843 | Gate Openness: 32.86% | LR: 9.0e-5
+   📐 GRADS -> Max: [d_v: 4.2636] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 303MB
+➡️  Step 69250 | Loss: 1.9803 | BPC: 2.857 | Gate Openness: 31.62% | LR: 8.9e-5
+   📐 GRADS -> Max: [d_v: 3.6123] | Friction a_diag: 0.0006 | Gate Bias: 0.0014 | RAM: 311MB
+➡️  Step 69300 | Loss: 1.9721 | BPC: 2.845 | Gate Openness: 33.17% | LR: 8.9e-5
+   📐 GRADS -> Max: [d_v: 3.8804] | Friction a_diag: 0.0006 | Gate Bias: 0.0016 | RAM: 311MB
+➡️  Step 69350 | Loss: 1.9782 | BPC: 2.854 | Gate Openness: 32.64% | LR: 8.9e-5
+   📐 GRADS -> Max: [d_v: 6.8363] | Friction a_diag: 0.0006 | Gate Bias: 0.0017 | RAM: 304MB
+➡️  Step 69400 | Loss: 1.9649 | BPC: 2.835 | Gate Openness: 32.12% | LR: 8.9e-5
+   📐 GRADS -> Max: [d_v: 4.2563] | Friction a_diag: 0.0007 | Gate Bias: 0.0016 | RAM: 305MB
+➡️  Step 69450 | Loss: 1.9351 | BPC: 2.792 | Gate Openness: 32.99% | LR: 8.9e-5
+   📐 GRADS -> Max: [d_v: 5.3114] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 305MB
+➡️  Step 69500 | Loss: 1.913 | BPC: 2.76 | Gate Openness: 31.2% | LR: 8.8e-5
+   📐 GRADS -> Max: [d_v: 5.1841] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 312MB
+➡️  Step 69550 | Loss: 1.9616 | BPC: 2.83 | Gate Openness: 31.99% | LR: 8.8e-5
+   📐 GRADS -> Max: [d_v: 6.6002] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 313MB
+➡️  Step 69600 | Loss: 1.9899 | BPC: 2.871 | Gate Openness: 31.39% | LR: 8.8e-5
+   📐 GRADS -> Max: [d_v: 4.0428] | Friction a_diag: 0.0006 | Gate Bias: 0.0019 | RAM: 306MB
+➡️  Step 69650 | Loss: 2.0267 | BPC: 2.924 | Gate Openness: 34.41% | LR: 8.8e-5
+   📐 GRADS -> Max: [d_v: 4.6194] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 307MB
+➡️  Step 69700 | Loss: 1.9458 | BPC: 2.807 | Gate Openness: 33.08% | LR: 8.8e-5
+   📐 GRADS -> Max: [d_v: 4.8461] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 307MB
+➡️  Step 69750 | Loss: 2.0055 | BPC: 2.893 | Gate Openness: 31.75% | LR: 8.8e-5
+   📐 GRADS -> Max: [d_v: 5.5725] | Friction a_diag: 0.0006 | Gate Bias: 0.0017 | RAM: 315MB
+➡️  Step 69800 | Loss: 1.9711 | BPC: 2.844 | Gate Openness: 31.96% | LR: 8.7e-5
+   📐 GRADS -> Max: [d_v: 6.0143] | Friction a_diag: 0.0008 | Gate Bias: 0.0008 | RAM: 315MB
+➡️  Step 69850 | Loss: 1.8891 | BPC: 2.725 | Gate Openness: 32.09% | LR: 8.7e-5
+   📐 GRADS -> Max: [d_v: 6.8596] | Friction a_diag: 0.001 | Gate Bias: 0.0015 | RAM: 308MB
+➡️  Step 69900 | Loss: 1.9879 | BPC: 2.868 | Gate Openness: 31.64% | LR: 8.7e-5
+   📐 GRADS -> Max: [d_v: 4.9427] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 308MB
+➡️  Step 69950 | Loss: 2.0021 | BPC: 2.888 | Gate Openness: 31.2% | LR: 8.7e-5
+   📐 GRADS -> Max: [d_v: 4.9763] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 309MB
+➡️  Step 70000 | Loss: 2.0502 | BPC: 2.958 | Gate Openness: 32.49% | LR: 8.7e-5
+   📐 GRADS -> Max: [d_v: 5.2242] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 317MB
+💾 Auto-Saving Checkpoint Step 70000...
+➡️  Step 70050 | Loss: 1.9188 | BPC: 2.768 | Gate Openness: 31.9% | LR: 8.7e-5
+   📐 GRADS -> Max: [d_v: 5.3323] | Friction a_diag: 0.0007 | Gate Bias: 0.002 | RAM: 310MB
+➡️  Step 70100 | Loss: 2.052 | BPC: 2.96 | Gate Openness: 33.59% | LR: 8.6e-5
+   📐 GRADS -> Max: [d_v: 4.5319] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 310MB
+➡️  Step 70150 | Loss: 1.8716 | BPC: 2.7 | Gate Openness: 31.71% | LR: 8.6e-5
+   📐 GRADS -> Max: [d_v: 7.3559] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 318MB
+➡️  Step 70200 | Loss: 1.8999 | BPC: 2.741 | Gate Openness: 33.55% | LR: 8.6e-5
+   📐 GRADS -> Max: [d_v: 4.2461] | Friction a_diag: 0.0006 | Gate Bias: 0.0012 | RAM: 316MB
+➡️  Step 70250 | Loss: 1.9409 | BPC: 2.8 | Gate Openness: 31.57% | LR: 8.6e-5
+   📐 GRADS -> Max: [d_v: 5.7819] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 312MB
+➡️  Step 70300 | Loss: 1.9996 | BPC: 2.885 | Gate Openness: 31.88% | LR: 8.6e-5
+   📐 GRADS -> Max: [d_v: 5.1355] | Friction a_diag: 0.0007 | Gate Bias: 0.0027 | RAM: 312MB
+➡️  Step 70350 | Loss: 1.9368 | BPC: 2.794 | Gate Openness: 32.07% | LR: 8.5e-5
+   📐 GRADS -> Max: [d_v: 5.2358] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 320MB
+➡️  Step 70400 | Loss: 1.8483 | BPC: 2.667 | Gate Openness: 32.54% | LR: 8.5e-5
+   📐 GRADS -> Max: [d_v: 4.0709] | Friction a_diag: 0.0006 | Gate Bias: 0.0021 | RAM: 320MB
+➡️  Step 70450 | Loss: 1.9677 | BPC: 2.839 | Gate Openness: 32.44% | LR: 8.5e-5
+   📐 GRADS -> Max: [d_v: 4.3312] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 313MB
+➡️  Step 70500 | Loss: 2.0346 | BPC: 2.935 | Gate Openness: 31.67% | LR: 8.5e-5
+   📐 GRADS -> Max: [d_v: 5.5216] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 313MB
+➡️  Step 70550 | Loss: 1.9206 | BPC: 2.771 | Gate Openness: 32.53% | LR: 8.5e-5
+   📐 GRADS -> Max: [d_v: 4.3039] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 321MB
+➡️  Step 70600 | Loss: 1.9922 | BPC: 2.874 | Gate Openness: 31.4% | LR: 8.5e-5
+   📐 GRADS -> Max: [d_v: 4.6446] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 322MB
+➡️  Step 70650 | Loss: 1.9924 | BPC: 2.874 | Gate Openness: 31.62% | LR: 8.4e-5
+   📐 GRADS -> Max: [d_v: 4.971] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 315MB
+➡️  Step 70700 | Loss: 1.968 | BPC: 2.839 | Gate Openness: 31.8% | LR: 8.4e-5
+   📐 GRADS -> Max: [d_v: 4.1392] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 315MB
+➡️  Step 70750 | Loss: 1.9975 | BPC: 2.882 | Gate Openness: 31.42% | LR: 8.4e-5
+   📐 GRADS -> Max: [d_v: 4.4918] | Friction a_diag: 0.0006 | Gate Bias: 0.0009 | RAM: 330MB
+➡️  Step 70800 | Loss: 1.9001 | BPC: 2.741 | Gate Openness: 32.05% | LR: 8.4e-5
+   📐 GRADS -> Max: [d_v: 5.8638] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 323MB
+➡️  Step 70850 | Loss: 1.9657 | BPC: 2.836 | Gate Openness: 32.58% | LR: 8.4e-5
+   📐 GRADS -> Max: [d_v: 4.6924] | Friction a_diag: 0.0007 | Gate Bias: 0.0018 | RAM: 324MB
+➡️  Step 70900 | Loss: 2.009 | BPC: 2.898 | Gate Openness: 31.07% | LR: 8.4e-5
+   📐 GRADS -> Max: [d_v: 4.8747] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 324MB
+➡️  Step 70950 | Loss: 1.9396 | BPC: 2.798 | Gate Openness: 30.6% | LR: 8.3e-5
+   📐 GRADS -> Max: [d_v: 5.2219] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 332MB
+➡️  Step 71000 | Loss: 1.9882 | BPC: 2.868 | Gate Openness: 30.98% | LR: 8.3e-5
+   📐 GRADS -> Max: [d_v: 6.8844] | Friction a_diag: 0.0008 | Gate Bias: 0.0008 | RAM: 325MB
+💾 Auto-Saving Checkpoint Step 71000...
+➡️  Step 71050 | Loss: 1.9695 | BPC: 2.841 | Gate Openness: 32.21% | LR: 8.3e-5
+   📐 GRADS -> Max: [d_v: 4.928] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 333MB
+➡️  Step 71100 | Loss: 1.9069 | BPC: 2.751 | Gate Openness: 31.97% | LR: 8.3e-5
+   📐 GRADS -> Max: [d_v: 4.7742] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 333MB
+➡️  Step 71150 | Loss: 2.0445 | BPC: 2.95 | Gate Openness: 33.4% | LR: 8.3e-5
+   📐 GRADS -> Max: [d_v: 5.6616] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 335MB
+➡️  Step 71200 | Loss: 1.8923 | BPC: 2.73 | Gate Openness: 33.01% | LR: 8.3e-5
+   📐 GRADS -> Max: [d_v: 8.1737] | Friction a_diag: 0.0008 | Gate Bias: 0.0002 | RAM: 337MB
+➡️  Step 71250 | Loss: 2.041 | BPC: 2.945 | Gate Openness: 31.62% | LR: 8.2e-5
+   📐 GRADS -> Max: [d_v: 4.5984] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 339MB
+➡️  Step 71300 | Loss: 1.9977 | BPC: 2.882 | Gate Openness: 33.98% | LR: 8.2e-5
+   📐 GRADS -> Max: [d_v: 6.8333] | Friction a_diag: 0.0008 | Gate Bias: 0.0016 | RAM: 341MB
+➡️  Step 71350 | Loss: 1.9229 | BPC: 2.774 | Gate Openness: 31.64% | LR: 8.2e-5
+   📐 GRADS -> Max: [d_v: 4.8959] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 343MB
+➡️  Step 71400 | Loss: 1.9841 | BPC: 2.862 | Gate Openness: 32.67% | LR: 8.2e-5
+   📐 GRADS -> Max: [d_v: 5.0739] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 344MB
+➡️  Step 71450 | Loss: 1.9698 | BPC: 2.842 | Gate Openness: 30.69% | LR: 8.2e-5
+   📐 GRADS -> Max: [d_v: 5.2253] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 346MB
+➡️  Step 71500 | Loss: 2.0356 | BPC: 2.937 | Gate Openness: 32.79% | LR: 8.2e-5
+   📐 GRADS -> Max: [d_v: 5.2872] | Friction a_diag: 0.0007 | Gate Bias: 0.0018 | RAM: 348MB
+➡️  Step 71550 | Loss: 1.9847 | BPC: 2.863 | Gate Openness: 32.81% | LR: 8.1e-5
+   📐 GRADS -> Max: [d_v: 6.2504] | Friction a_diag: 0.0008 | Gate Bias: 0.0005 | RAM: 350MB
+➡️  Step 71600 | Loss: 1.8134 | BPC: 2.616 | Gate Openness: 32.94% | LR: 8.1e-5
+   📐 GRADS -> Max: [d_v: 5.361] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 352MB
+➡️  Step 71650 | Loss: 2.0324 | BPC: 2.932 | Gate Openness: 32.53% | LR: 8.1e-5
+   📐 GRADS -> Max: [d_v: 5.7776] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 354MB
+➡️  Step 71700 | Loss: 1.8864 | BPC: 2.722 | Gate Openness: 32.38% | LR: 8.1e-5
+   📐 GRADS -> Max: [d_v: 4.5766] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 356MB
+➡️  Step 71750 | Loss: 1.9057 | BPC: 2.749 | Gate Openness: 33.63% | LR: 8.1e-5
+   📐 GRADS -> Max: [d_v: 4.4263] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 358MB
+➡️  Step 71800 | Loss: 1.8851 | BPC: 2.72 | Gate Openness: 32.5% | LR: 8.1e-5
+   📐 GRADS -> Max: [d_v: 7.8939] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 360MB
+➡️  Step 71850 | Loss: 1.9426 | BPC: 2.803 | Gate Openness: 33.95% | LR: 8.0e-5
+   📐 GRADS -> Max: [d_v: 4.6162] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 362MB
+➡️  Step 71900 | Loss: 1.8838 | BPC: 2.718 | Gate Openness: 33.44% | LR: 8.0e-5
+   📐 GRADS -> Max: [d_v: 5.1785] | Friction a_diag: 0.0006 | Gate Bias: 0.0012 | RAM: 363MB
+➡️  Step 71950 | Loss: 2.0383 | BPC: 2.941 | Gate Openness: 32.82% | LR: 8.0e-5
+   📐 GRADS -> Max: [d_v: 3.8715] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 365MB
+➡️  Step 72000 | Loss: 1.9198 | BPC: 2.77 | Gate Openness: 32.36% | LR: 8.0e-5
+   📐 GRADS -> Max: [d_v: 5.3366] | Friction a_diag: 0.0007 | Gate Bias: 0.0 | RAM: 367MB
+💾 Auto-Saving Checkpoint Step 72000...
+➡️  Step 72050 | Loss: 2.0831 | BPC: 3.005 | Gate Openness: 31.36% | LR: 8.0e-5
+   📐 GRADS -> Max: [d_v: 5.2397] | Friction a_diag: 0.0008 | Gate Bias: 0.0006 | RAM: 338MB
+➡️  Step 72100 | Loss: 1.8996 | BPC: 2.741 | Gate Openness: 30.97% | LR: 8.0e-5
+   📐 GRADS -> Max: [d_v: 5.9644] | Friction a_diag: 0.0006 | Gate Bias: 0.002 | RAM: 338MB
+➡️  Step 72150 | Loss: 1.855 | BPC: 2.676 | Gate Openness: 31.37% | LR: 7.9e-5
+   📐 GRADS -> Max: [d_v: 6.5948] | Friction a_diag: 0.0008 | Gate Bias: 0.0007 | RAM: 340MB
+➡️  Step 72200 | Loss: 1.961 | BPC: 2.829 | Gate Openness: 33.11% | LR: 7.9e-5
+   📐 GRADS -> Max: [d_v: 5.5009] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 342MB
+➡️  Step 72250 | Loss: 1.9728 | BPC: 2.846 | Gate Openness: 33.19% | LR: 7.9e-5
+   📐 GRADS -> Max: [d_v: 5.6907] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 344MB
+➡️  Step 72300 | Loss: 2.0261 | BPC: 2.923 | Gate Openness: 32.28% | LR: 7.9e-5
+   📐 GRADS -> Max: [d_v: 5.1787] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 346MB
+➡️  Step 72350 | Loss: 2.0352 | BPC: 2.936 | Gate Openness: 31.23% | LR: 7.9e-5
+   📐 GRADS -> Max: [d_v: 7.2806] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 340MB
+➡️  Step 72400 | Loss: 2.0036 | BPC: 2.891 | Gate Openness: 32.41% | LR: 7.9e-5
+   📐 GRADS -> Max: [d_v: 7.4358] | Friction a_diag: 0.0007 | Gate Bias: 0.0 | RAM: 334MB
+➡️  Step 72450 | Loss: 2.0612 | BPC: 2.974 | Gate Openness: 30.98% | LR: 7.8e-5
+   📐 GRADS -> Max: [d_v: 7.0968] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 341MB
+➡️  Step 72500 | Loss: 1.9906 | BPC: 2.872 | Gate Openness: 32.05% | LR: 7.8e-5
+   📐 GRADS -> Max: [d_v: 4.2782] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 342MB
+➡️  Step 72550 | Loss: 1.9829 | BPC: 2.861 | Gate Openness: 33.07% | LR: 7.8e-5
+   📐 GRADS -> Max: [d_v: 3.8791] | Friction a_diag: 0.0006 | Gate Bias: 0.0021 | RAM: 335MB
+➡️  Step 72600 | Loss: 2.0198 | BPC: 2.914 | Gate Openness: 33.55% | LR: 7.8e-5
+   📐 GRADS -> Max: [d_v: 5.3084] | Friction a_diag: 0.0006 | Gate Bias: 0.0041 | RAM: 336MB
+➡️  Step 72650 | Loss: 1.9213 | BPC: 2.772 | Gate Openness: 33.52% | LR: 7.8e-5
+   📐 GRADS -> Max: [d_v: 4.9808] | Friction a_diag: 0.0008 | Gate Bias: 0.0003 | RAM: 343MB
+➡️  Step 72700 | Loss: 1.9685 | BPC: 2.84 | Gate Openness: 33.46% | LR: 7.8e-5
+   📐 GRADS -> Max: [d_v: 5.0916] | Friction a_diag: 0.0007 | Gate Bias: 0.0019 | RAM: 337MB
+➡️  Step 72750 | Loss: 2.0256 | BPC: 2.922 | Gate Openness: 32.56% | LR: 7.7e-5
+   📐 GRADS -> Max: [d_v: 5.1526] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 337MB
+➡️  Step 72800 | Loss: 2.0843 | BPC: 3.007 | Gate Openness: 31.27% | LR: 7.7e-5
+   📐 GRADS -> Max: [d_v: 5.7555] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 337MB
+➡️  Step 72850 | Loss: 1.9392 | BPC: 2.798 | Gate Openness: 32.89% | LR: 7.7e-5
+   📐 GRADS -> Max: [d_v: 3.9341] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 344MB
+➡️  Step 72900 | Loss: 1.9879 | BPC: 2.868 | Gate Openness: 30.13% | LR: 7.7e-5
+   📐 GRADS -> Max: [d_v: 5.2637] | Friction a_diag: 0.0006 | Gate Bias: 0.0017 | RAM: 338MB
+➡️  Step 72950 | Loss: 1.9247 | BPC: 2.777 | Gate Openness: 32.86% | LR: 7.7e-5
+   📐 GRADS -> Max: [d_v: 5.8031] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 345MB
+➡️  Step 73000 | Loss: 1.9697 | BPC: 2.842 | Gate Openness: 32.51% | LR: 7.7e-5
+   📐 GRADS -> Max: [d_v: 5.6712] | Friction a_diag: 0.0008 | Gate Bias: 0.0005 | RAM: 345MB
+💾 Auto-Saving Checkpoint Step 73000...
+➡️  Step 73050 | Loss: 1.9676 | BPC: 2.839 | Gate Openness: 32.27% | LR: 7.6e-5
+   📐 GRADS -> Max: [d_v: 4.1497] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 339MB
+➡️  Step 73100 | Loss: 2.031 | BPC: 2.93 | Gate Openness: 31.39% | LR: 7.6e-5
+   📐 GRADS -> Max: [d_u: 3.617] | Friction a_diag: 0.0007 | Gate Bias: 0.0016 | RAM: 340MB
+➡️  Step 73150 | Loss: 1.9759 | BPC: 2.851 | Gate Openness: 32.79% | LR: 7.6e-5
+   📐 GRADS -> Max: [d_v: 7.606] | Friction a_diag: 0.0007 | Gate Bias: 0.0017 | RAM: 343MB
+➡️  Step 73200 | Loss: 2.0055 | BPC: 2.893 | Gate Openness: 32.91% | LR: 7.6e-5
+   📐 GRADS -> Max: [d_v: 4.8394] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 340MB
+➡️  Step 73250 | Loss: 2.0257 | BPC: 2.922 | Gate Openness: 32.46% | LR: 7.6e-5
+   📐 GRADS -> Max: [d_v: 3.9421] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 341MB
+➡️  Step 73300 | Loss: 1.951 | BPC: 2.815 | Gate Openness: 33.1% | LR: 7.6e-5
+   📐 GRADS -> Max: [d_v: 4.7812] | Friction a_diag: 0.0006 | Gate Bias: 0.0009 | RAM: 341MB
+➡️  Step 73350 | Loss: 1.9235 | BPC: 2.775 | Gate Openness: 33.13% | LR: 7.5e-5
+   📐 GRADS -> Max: [d_v: 5.8048] | Friction a_diag: 0.0008 | Gate Bias: 0.0008 | RAM: 342MB
+➡️  Step 73400 | Loss: 2.0074 | BPC: 2.896 | Gate Openness: 32.95% | LR: 7.5e-5
+   📐 GRADS -> Max: [d_v: 4.9697] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 345MB
+➡️  Step 73450 | Loss: 1.944 | BPC: 2.805 | Gate Openness: 33.79% | LR: 7.5e-5
+   📐 GRADS -> Max: [d_v: 6.2293] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 349MB
+➡️  Step 73500 | Loss: 1.8827 | BPC: 2.716 | Gate Openness: 31.45% | LR: 7.5e-5
+   📐 GRADS -> Max: [d_v: 4.6987] | Friction a_diag: 0.0006 | Gate Bias: 0.0011 | RAM: 343MB
+➡️  Step 73550 | Loss: 1.9078 | BPC: 2.752 | Gate Openness: 33.78% | LR: 7.5e-5
+   📐 GRADS -> Max: [d_v: 3.8121] | Friction a_diag: 0.0006 | Gate Bias: 0.0016 | RAM: 343MB
+➡️  Step 73600 | Loss: 2.0427 | BPC: 2.947 | Gate Openness: 32.1% | LR: 7.5e-5
+   📐 GRADS -> Max: [d_v: 7.666] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 344MB
+➡️  Step 73650 | Loss: 1.9782 | BPC: 2.854 | Gate Openness: 31.95% | LR: 7.5e-5
+   📐 GRADS -> Max: [d_v: 6.7229] | Friction a_diag: 0.0006 | Gate Bias: 0.0014 | RAM: 350MB
+➡️  Step 73700 | Loss: 1.9663 | BPC: 2.837 | Gate Openness: 32.31% | LR: 7.4e-5
+   📐 GRADS -> Max: [d_v: 4.4174] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 351MB
+➡️  Step 73750 | Loss: 1.8658 | BPC: 2.692 | Gate Openness: 31.39% | LR: 7.4e-5
+   📐 GRADS -> Max: [d_v: 5.8586] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 345MB
+➡️  Step 73800 | Loss: 2.0057 | BPC: 2.894 | Gate Openness: 33.55% | LR: 7.4e-5
+   📐 GRADS -> Max: [d_v: 4.7149] | Friction a_diag: 0.0008 | Gate Bias: 0.0004 | RAM: 345MB
+➡️  Step 73850 | Loss: 2.0083 | BPC: 2.897 | Gate Openness: 32.87% | LR: 7.4e-5
+   📐 GRADS -> Max: [d_v: 4.5191] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 349MB
+➡️  Step 73900 | Loss: 1.9627 | BPC: 2.832 | Gate Openness: 31.89% | LR: 7.4e-5
+   📐 GRADS -> Max: [d_v: 5.5858] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 346MB
+➡️  Step 73950 | Loss: 2.1655 | BPC: 3.124 | Gate Openness: 32.3% | LR: 7.4e-5
+   📐 GRADS -> Max: [d_v: 5.639] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 346MB
+➡️  Step 74000 | Loss: 1.9383 | BPC: 2.796 | Gate Openness: 32.64% | LR: 7.3e-5
+   📐 GRADS -> Max: [d_v: 5.971] | Friction a_diag: 0.0008 | Gate Bias: 0.0002 | RAM: 347MB
+💾 Auto-Saving Checkpoint Step 74000...
+➡️  Step 74050 | Loss: 1.9954 | BPC: 2.879 | Gate Openness: 31.89% | LR: 7.3e-5
+   📐 GRADS -> Max: [d_v: 4.827] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 354MB
+➡️  Step 74100 | Loss: 1.9284 | BPC: 2.782 | Gate Openness: 31.75% | LR: 7.3e-5
+   📐 GRADS -> Max: [d_v: 5.4089] | Friction a_diag: 0.0006 | Gate Bias: 0.0015 | RAM: 354MB
+➡️  Step 74150 | Loss: 1.9578 | BPC: 2.824 | Gate Openness: 32.91% | LR: 7.3e-5
+   📐 GRADS -> Max: [d_v: 4.6003] | Friction a_diag: 0.0006 | Gate Bias: 0.0021 | RAM: 356MB
+➡️  Step 74200 | Loss: 1.9971 | BPC: 2.881 | Gate Openness: 32.22% | LR: 7.3e-5
+   📐 GRADS -> Max: [d_v: 5.2065] | Friction a_diag: 0.0008 | Gate Bias: 0.0 | RAM: 358MB
+➡️  Step 74250 | Loss: 1.9443 | BPC: 2.805 | Gate Openness: 33.4% | LR: 7.3e-5
+   📐 GRADS -> Max: [d_v: 4.8556] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 360MB
+➡️  Step 74300 | Loss: 1.9864 | BPC: 2.866 | Gate Openness: 33.55% | LR: 7.2e-5
+   📐 GRADS -> Max: [d_v: 6.933] | Friction a_diag: 0.0008 | Gate Bias: 0.0006 | RAM: 362MB
+➡️  Step 74350 | Loss: 1.9452 | BPC: 2.806 | Gate Openness: 31.51% | LR: 7.2e-5
+   📐 GRADS -> Max: [d_v: 3.9202] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 364MB
+➡️  Step 74400 | Loss: 2.1027 | BPC: 3.034 | Gate Openness: 32.81% | LR: 7.2e-5
+   📐 GRADS -> Max: [d_v: 6.2653] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 365MB
+➡️  Step 74450 | Loss: 1.9757 | BPC: 2.85 | Gate Openness: 31.32% | LR: 7.2e-5
+   📐 GRADS -> Max: [d_v: 6.3173] | Friction a_diag: 0.0007 | Gate Bias: 0.001 | RAM: 367MB
+➡️  Step 74500 | Loss: 1.9164 | BPC: 2.765 | Gate Openness: 31.73% | LR: 7.2e-5
+   📐 GRADS -> Max: [d_v: 4.3834] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 369MB
+➡️  Step 74550 | Loss: 1.8687 | BPC: 2.696 | Gate Openness: 31.84% | LR: 7.2e-5
+   📐 GRADS -> Max: [d_v: 4.6399] | Friction a_diag: 0.0006 | Gate Bias: 0.0005 | RAM: 371MB
+➡️  Step 74600 | Loss: 1.8954 | BPC: 2.735 | Gate Openness: 31.72% | LR: 7.2e-5
+   📐 GRADS -> Max: [d_v: 4.2838] | Friction a_diag: 0.0006 | Gate Bias: 0.0028 | RAM: 373MB
+➡️  Step 74650 | Loss: 1.9375 | BPC: 2.795 | Gate Openness: 33.47% | LR: 7.1e-5
+   📐 GRADS -> Max: [d_v: 5.3544] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 375MB
+➡️  Step 74700 | Loss: 1.9132 | BPC: 2.76 | Gate Openness: 31.96% | LR: 7.1e-5
+   📐 GRADS -> Max: [d_v: 4.9397] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 377MB
+➡️  Step 74750 | Loss: 2.0054 | BPC: 2.893 | Gate Openness: 33.24% | LR: 7.1e-5
+   📐 GRADS -> Max: [d_v: 9.111] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 379MB
+➡️  Step 74800 | Loss: 1.9755 | BPC: 2.85 | Gate Openness: 33.06% | LR: 7.1e-5
+   📐 GRADS -> Max: [d_v: 5.0493] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 381MB
+➡️  Step 74850 | Loss: 1.8596 | BPC: 2.683 | Gate Openness: 34.19% | LR: 7.1e-5
+   📐 GRADS -> Max: [d_v: 3.8375] | Friction a_diag: 0.0006 | Gate Bias: 0.0011 | RAM: 383MB
+➡️  Step 74900 | Loss: 2.0417 | BPC: 2.946 | Gate Openness: 32.49% | LR: 7.1e-5
+   📐 GRADS -> Max: [d_v: 4.2946] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 385MB
+➡️  Step 74950 | Loss: 1.9332 | BPC: 2.789 | Gate Openness: 31.4% | LR: 7.0e-5
+   📐 GRADS -> Max: [d_v: 5.1903] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 387MB
+➡️  Step 75000 | Loss: 1.882 | BPC: 2.715 | Gate Openness: 33.33% | LR: 7.0e-5
+   📐 GRADS -> Max: [d_v: 4.9781] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 389MB
+💾 Auto-Saving Checkpoint Step 75000...
+➡️  Step 75050 | Loss: 1.9273 | BPC: 2.781 | Gate Openness: 33.42% | LR: 7.0e-5
+   📐 GRADS -> Max: [d_v: 4.8886] | Friction a_diag: 0.0006 | Gate Bias: 0.002 | RAM: 353MB
+➡️  Step 75100 | Loss: 1.9444 | BPC: 2.805 | Gate Openness: 33.88% | LR: 7.0e-5
+   📐 GRADS -> Max: [d_v: 4.101] | Friction a_diag: 0.0006 | Gate Bias: 0.0008 | RAM: 357MB
+➡️  Step 75150 | Loss: 2.1644 | BPC: 3.123 | Gate Openness: 31.08% | LR: 7.0e-5
+   📐 GRADS -> Max: [d_v: 8.5137] | Friction a_diag: 0.0008 | Gate Bias: 0.0003 | RAM: 354MB
+➡️  Step 75200 | Loss: 1.8575 | BPC: 2.68 | Gate Openness: 31.84% | LR: 7.0e-5
+   📐 GRADS -> Max: [d_v: 6.3436] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 355MB
+➡️  Step 75250 | Loss: 2.0275 | BPC: 2.925 | Gate Openness: 33.28% | LR: 7.0e-5
+   📐 GRADS -> Max: [d_v: 6.7864] | Friction a_diag: 0.0006 | Gate Bias: 0.001 | RAM: 358MB
+➡️  Step 75300 | Loss: 1.9083 | BPC: 2.753 | Gate Openness: 32.6% | LR: 6.9e-5
+   📐 GRADS -> Max: [d_v: 4.2604] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 355MB
+➡️  Step 75350 | Loss: 1.9495 | BPC: 2.813 | Gate Openness: 33.29% | LR: 6.9e-5
+   📐 GRADS -> Max: [d_v: 4.7865] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 359MB
+➡️  Step 75400 | Loss: 1.9274 | BPC: 2.781 | Gate Openness: 32.77% | LR: 6.9e-5
+   📐 GRADS -> Max: [d_v: 5.7446] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 356MB
+➡️  Step 75450 | Loss: 1.9389 | BPC: 2.797 | Gate Openness: 32.11% | LR: 6.9e-5
+   📐 GRADS -> Max: [d_v: 3.7904] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 362MB
+➡️  Step 75500 | Loss: 1.9328 | BPC: 2.788 | Gate Openness: 32.49% | LR: 6.9e-5
+   📐 GRADS -> Max: [d_v: 3.7308] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 360MB
+➡️  Step 75550 | Loss: 2.0521 | BPC: 2.961 | Gate Openness: 33.22% | LR: 6.9e-5
+   📐 GRADS -> Max: [d_v: 7.3653] | Friction a_diag: 0.0006 | Gate Bias: 0.0014 | RAM: 357MB
+➡️  Step 75600 | Loss: 2.0223 | BPC: 2.918 | Gate Openness: 31.51% | LR: 6.8e-5
+   📐 GRADS -> Max: [d_v: 5.6763] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 361MB
+➡️  Step 75650 | Loss: 1.9356 | BPC: 2.793 | Gate Openness: 33.08% | LR: 6.8e-5
+   📐 GRADS -> Max: [d_v: 6.1281] | Friction a_diag: 0.0006 | Gate Bias: 0.0016 | RAM: 358MB
+➡️  Step 75700 | Loss: 2.0045 | BPC: 2.892 | Gate Openness: 32.96% | LR: 6.8e-5
+   📐 GRADS -> Max: [d_v: 4.6696] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 362MB
+➡️  Step 75750 | Loss: 1.936 | BPC: 2.793 | Gate Openness: 32.79% | LR: 6.8e-5
+   📐 GRADS -> Max: [d_v: 3.6575] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 359MB
+➡️  Step 75800 | Loss: 2.0317 | BPC: 2.931 | Gate Openness: 32.81% | LR: 6.8e-5
+   📐 GRADS -> Max: [d_v: 4.2393] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 360MB
+➡️  Step 75850 | Loss: 1.9322 | BPC: 2.788 | Gate Openness: 32.63% | LR: 6.8e-5
+   📐 GRADS -> Max: [d_v: 4.5] | Friction a_diag: 0.0007 | Gate Bias: 0.0007 | RAM: 363MB
+➡️  Step 75900 | Loss: 1.9597 | BPC: 2.827 | Gate Openness: 33.09% | LR: 6.8e-5
+   📐 GRADS -> Max: [d_v: 4.5954] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 360MB
+➡️  Step 75950 | Loss: 2.035 | BPC: 2.936 | Gate Openness: 32.32% | LR: 6.7e-5
+   📐 GRADS -> Max: [d_v: 6.1288] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 361MB
+➡️  Step 76000 | Loss: 1.8297 | BPC: 2.64 | Gate Openness: 31.32% | LR: 6.7e-5
+   📐 GRADS -> Max: [d_v: 5.3817] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 366MB
+💾 Auto-Saving Checkpoint Step 76000...
+➡️  Step 76050 | Loss: 2.0013 | BPC: 2.887 | Gate Openness: 32.46% | LR: 6.7e-5
+   📐 GRADS -> Max: [d_v: 5.4686] | Friction a_diag: 0.0007 | Gate Bias: 0.0023 | RAM: 363MB
+➡️  Step 76100 | Loss: 1.9171 | BPC: 2.766 | Gate Openness: 33.96% | LR: 6.7e-5
+   📐 GRADS -> Max: [d_v: 4.6478] | Friction a_diag: 0.0006 | Gate Bias: 0.0018 | RAM: 363MB
+➡️  Step 76150 | Loss: 2.0133 | BPC: 2.905 | Gate Openness: 32.65% | LR: 6.7e-5
+   📐 GRADS -> Max: [d_v: 4.4165] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 365MB
+➡️  Step 76200 | Loss: 1.9294 | BPC: 2.784 | Gate Openness: 33.67% | LR: 6.7e-5
+   📐 GRADS -> Max: [d_v: 5.2892] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 367MB
+➡️  Step 76250 | Loss: 2.0219 | BPC: 2.917 | Gate Openness: 31.69% | LR: 6.7e-5
+   📐 GRADS -> Max: [d_v: 6.9744] | Friction a_diag: 0.0008 | Gate Bias: 0.0001 | RAM: 369MB
+➡️  Step 76300 | Loss: 2.0713 | BPC: 2.988 | Gate Openness: 32.35% | LR: 6.6e-5
+   📐 GRADS -> Max: [d_v: 4.1977] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 371MB
+➡️  Step 76350 | Loss: 1.9954 | BPC: 2.879 | Gate Openness: 32.97% | LR: 6.6e-5
+   📐 GRADS -> Max: [d_v: 6.0384] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 373MB
+➡️  Step 76400 | Loss: 2.005 | BPC: 2.893 | Gate Openness: 31.9% | LR: 6.6e-5
+   📐 GRADS -> Max: [d_v: 5.3373] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 375MB
+➡️  Step 76450 | Loss: 2.0552 | BPC: 2.965 | Gate Openness: 31.45% | LR: 6.6e-5
+   📐 GRADS -> Max: [d_v: 6.1105] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 377MB
+➡️  Step 76500 | Loss: 1.946 | BPC: 2.807 | Gate Openness: 32.83% | LR: 6.6e-5
+   📐 GRADS -> Max: [d_v: 5.6903] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 379MB
+➡️  Step 76550 | Loss: 1.9899 | BPC: 2.871 | Gate Openness: 33.54% | LR: 6.6e-5
+   📐 GRADS -> Max: [d_v: 4.1922] | Friction a_diag: 0.0008 | Gate Bias: 0.0019 | RAM: 381MB
+➡️  Step 76600 | Loss: 1.9956 | BPC: 2.879 | Gate Openness: 33.57% | LR: 6.6e-5
+   📐 GRADS -> Max: [d_v: 6.5135] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 383MB
+➡️  Step 76650 | Loss: 1.9386 | BPC: 2.797 | Gate Openness: 32.85% | LR: 6.5e-5
+   📐 GRADS -> Max: [d_v: 3.9815] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 384MB
+➡️  Step 76700 | Loss: 1.9826 | BPC: 2.86 | Gate Openness: 32.85% | LR: 6.5e-5
+   📐 GRADS -> Max: [d_v: 3.8449] | Friction a_diag: 0.0007 | Gate Bias: 0.0 | RAM: 386MB
+➡️  Step 76750 | Loss: 1.9524 | BPC: 2.817 | Gate Openness: 32.44% | LR: 6.5e-5
+   📐 GRADS -> Max: [d_v: 5.5258] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 388MB
+➡️  Step 76800 | Loss: 1.9368 | BPC: 2.794 | Gate Openness: 32.3% | LR: 6.5e-5
+   📐 GRADS -> Max: [d_v: 7.8247] | Friction a_diag: 0.0006 | Gate Bias: 0.0026 | RAM: 390MB
+➡️  Step 76850 | Loss: 1.9585 | BPC: 2.826 | Gate Openness: 33.73% | LR: 6.5e-5
+   📐 GRADS -> Max: [d_v: 7.9239] | Friction a_diag: 0.0007 | Gate Bias: 0.0027 | RAM: 392MB
+➡️  Step 76900 | Loss: 1.9885 | BPC: 2.869 | Gate Openness: 33.67% | LR: 6.5e-5
+   📐 GRADS -> Max: [d_v: 3.2243] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 394MB
+➡️  Step 76950 | Loss: 1.9531 | BPC: 2.818 | Gate Openness: 33.82% | LR: 6.5e-5
+   📐 GRADS -> Max: [d_v: 6.4791] | Friction a_diag: 0.0007 | Gate Bias: 0.0005 | RAM: 396MB
+➡️  Step 77000 | Loss: 2.0229 | BPC: 2.918 | Gate Openness: 31.5% | LR: 6.4e-5
+   📐 GRADS -> Max: [d_v: 5.1191] | Friction a_diag: 0.0007 | Gate Bias: 0.0023 | RAM: 398MB
+💾 Auto-Saving Checkpoint Step 77000...
+➡️  Step 77050 | Loss: 2.0477 | BPC: 2.954 | Gate Openness: 31.78% | LR: 6.4e-5
+   📐 GRADS -> Max: [d_v: 6.7923] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 374MB
+➡️  Step 77100 | Loss: 1.9286 | BPC: 2.782 | Gate Openness: 32.15% | LR: 6.4e-5
+   📐 GRADS -> Max: [d_v: 6.1288] | Friction a_diag: 0.0007 | Gate Bias: 0.0 | RAM: 370MB
+➡️  Step 77150 | Loss: 1.9373 | BPC: 2.795 | Gate Openness: 31.87% | LR: 6.4e-5
+   📐 GRADS -> Max: [d_v: 4.5077] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 370MB
+➡️  Step 77200 | Loss: 1.8407 | BPC: 2.656 | Gate Openness: 32.93% | LR: 6.4e-5
+   📐 GRADS -> Max: [d_v: 5.4149] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 371MB
+➡️  Step 77250 | Loss: 1.8985 | BPC: 2.739 | Gate Openness: 31.91% | LR: 6.4e-5
+   📐 GRADS -> Max: [d_v: 5.9755] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 371MB
+➡️  Step 77300 | Loss: 1.9857 | BPC: 2.865 | Gate Openness: 32.46% | LR: 6.4e-5
+   📐 GRADS -> Max: [d_v: 4.34] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 371MB
+➡️  Step 77350 | Loss: 1.9901 | BPC: 2.871 | Gate Openness: 34.35% | LR: 6.3e-5
+   📐 GRADS -> Max: [d_v: 6.0257] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 372MB
+➡️  Step 77400 | Loss: 1.9289 | BPC: 2.783 | Gate Openness: 34.18% | LR: 6.3e-5
+   📐 GRADS -> Max: [d_v: 7.4163] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 372MB
+➡️  Step 77450 | Loss: 1.9616 | BPC: 2.83 | Gate Openness: 32.48% | LR: 6.3e-5
+   📐 GRADS -> Max: [d_v: 4.7834] | Friction a_diag: 0.0007 | Gate Bias: 0.0013 | RAM: 373MB
+➡️  Step 77500 | Loss: 2.0326 | BPC: 2.932 | Gate Openness: 33.31% | LR: 6.3e-5
+   📐 GRADS -> Max: [d_v: 4.4699] | Friction a_diag: 0.0008 | Gate Bias: 0.0003 | RAM: 373MB
+➡️  Step 77550 | Loss: 1.8892 | BPC: 2.726 | Gate Openness: 33.9% | LR: 6.3e-5
+   📐 GRADS -> Max: [d_v: 4.045] | Friction a_diag: 0.0006 | Gate Bias: 0.0027 | RAM: 373MB
+➡️  Step 77600 | Loss: 2.0155 | BPC: 2.908 | Gate Openness: 32.37% | LR: 6.3e-5
+   📐 GRADS -> Max: [d_v: 4.325] | Friction a_diag: 0.0007 | Gate Bias: 0.0019 | RAM: 374MB
+➡️  Step 77650 | Loss: 1.8598 | BPC: 2.683 | Gate Openness: 32.65% | LR: 6.3e-5
+   📐 GRADS -> Max: [d_v: 4.5292] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 374MB
+➡️  Step 77700 | Loss: 2.1068 | BPC: 3.04 | Gate Openness: 31.93% | LR: 6.2e-5
+   📐 GRADS -> Max: [d_v: 4.9705] | Friction a_diag: 0.0006 | Gate Bias: 0.0001 | RAM: 374MB
+➡️  Step 77750 | Loss: 1.9185 | BPC: 2.768 | Gate Openness: 31.92% | LR: 6.2e-5
+   📐 GRADS -> Max: [d_v: 4.7434] | Friction a_diag: 0.0006 | Gate Bias: 0.0013 | RAM: 375MB
+➡️  Step 77800 | Loss: 2.0416 | BPC: 2.945 | Gate Openness: 31.75% | LR: 6.2e-5
+   📐 GRADS -> Max: [d_v: 7.1835] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 375MB
+➡️  Step 77850 | Loss: 1.9304 | BPC: 2.785 | Gate Openness: 33.19% | LR: 6.2e-5
+   📐 GRADS -> Max: [d_v: 4.8326] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 376MB
+➡️  Step 77900 | Loss: 1.9397 | BPC: 2.798 | Gate Openness: 33.0% | LR: 6.2e-5
+   📐 GRADS -> Max: [d_v: 5.8795] | Friction a_diag: 0.0007 | Gate Bias: 0.0017 | RAM: 376MB
+➡️  Step 77950 | Loss: 1.8872 | BPC: 2.723 | Gate Openness: 33.71% | LR: 6.2e-5
+   📐 GRADS -> Max: [d_v: 4.8895] | Friction a_diag: 0.0007 | Gate Bias: 0.0019 | RAM: 379MB
+➡️  Step 78000 | Loss: 1.9957 | BPC: 2.879 | Gate Openness: 33.16% | LR: 6.2e-5
+   📐 GRADS -> Max: [d_v: 3.5094] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 380MB
+💾 Auto-Saving Checkpoint Step 78000...
+➡️  Step 78050 | Loss: 2.0273 | BPC: 2.925 | Gate Openness: 33.01% | LR: 6.1e-5
+   📐 GRADS -> Max: [d_v: 4.6324] | Friction a_diag: 0.0007 | Gate Bias: 0.0015 | RAM: 380MB
+➡️  Step 78100 | Loss: 1.9653 | BPC: 2.835 | Gate Openness: 33.29% | LR: 6.1e-5
+   📐 GRADS -> Max: [d_v: 4.662] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 381MB
+➡️  Step 78150 | Loss: 1.858 | BPC: 2.681 | Gate Openness: 33.09% | LR: 6.1e-5
+   📐 GRADS -> Max: [d_v: 5.7565] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 383MB
+➡️  Step 78200 | Loss: 2.0594 | BPC: 2.971 | Gate Openness: 31.81% | LR: 6.1e-5
+   📐 GRADS -> Max: [d_v: 5.6659] | Friction a_diag: 0.0008 | Gate Bias: 0.0013 | RAM: 385MB
+➡️  Step 78250 | Loss: 1.9491 | BPC: 2.812 | Gate Openness: 32.57% | LR: 6.1e-5
+   📐 GRADS -> Max: [d_v: 3.9583] | Friction a_diag: 0.0008 | Gate Bias: 0.0024 | RAM: 386MB
+➡️  Step 78300 | Loss: 1.9743 | BPC: 2.848 | Gate Openness: 31.95% | LR: 6.1e-5
+   📐 GRADS -> Max: [d_v: 5.5787] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 388MB
+➡️  Step 78350 | Loss: 2.071 | BPC: 2.988 | Gate Openness: 32.18% | LR: 6.1e-5
+   📐 GRADS -> Max: [d_v: 8.6471] | Friction a_diag: 0.0012 | Gate Bias: 0.0008 | RAM: 390MB
+➡️  Step 78400 | Loss: 1.9105 | BPC: 2.756 | Gate Openness: 31.49% | LR: 6.0e-5
+   📐 GRADS -> Max: [d_v: 4.7923] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 392MB
+➡️  Step 78450 | Loss: 1.9599 | BPC: 2.827 | Gate Openness: 31.85% | LR: 6.0e-5
+   📐 GRADS -> Max: [d_v: 5.0415] | Friction a_diag: 0.0007 | Gate Bias: 0.0008 | RAM: 394MB
+➡️  Step 78500 | Loss: 2.0156 | BPC: 2.908 | Gate Openness: 31.51% | LR: 6.0e-5
+   📐 GRADS -> Max: [d_v: 8.7309] | Friction a_diag: 0.0011 | Gate Bias: 0.0011 | RAM: 396MB
+➡️  Step 78550 | Loss: 1.9789 | BPC: 2.855 | Gate Openness: 32.13% | LR: 6.0e-5
+   📐 GRADS -> Max: [d_v: 4.3213] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 398MB
+➡️  Step 78600 | Loss: 1.9902 | BPC: 2.871 | Gate Openness: 33.01% | LR: 6.0e-5
+   📐 GRADS -> Max: [d_v: 5.9632] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 400MB
+➡️  Step 78650 | Loss: 1.9412 | BPC: 2.801 | Gate Openness: 34.31% | LR: 6.0e-5
+   📐 GRADS -> Max: [d_v: 5.4095] | Friction a_diag: 0.0007 | Gate Bias: 0.0006 | RAM: 402MB
+➡️  Step 78700 | Loss: 1.881 | BPC: 2.714 | Gate Openness: 33.39% | LR: 6.0e-5
+   📐 GRADS -> Max: [d_v: 6.6105] | Friction a_diag: 0.0008 | Gate Bias: 0.0002 | RAM: 404MB
+➡️  Step 78750 | Loss: 1.9657 | BPC: 2.836 | Gate Openness: 34.33% | LR: 6.0e-5
+   📐 GRADS -> Max: [d_v: 5.24] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 406MB
+➡️  Step 78800 | Loss: 1.9378 | BPC: 2.796 | Gate Openness: 33.16% | LR: 5.9e-5
+   📐 GRADS -> Max: [d_v: 5.4148] | Friction a_diag: 0.0007 | Gate Bias: 0.0015 | RAM: 407MB
+➡️  Step 78850 | Loss: 2.0364 | BPC: 2.938 | Gate Openness: 32.91% | LR: 5.9e-5
+   📐 GRADS -> Max: [d_v: 7.4548] | Friction a_diag: 0.0008 | Gate Bias: 0.0006 | RAM: 409MB
+➡️  Step 78900 | Loss: 2.0412 | BPC: 2.945 | Gate Openness: 32.4% | LR: 5.9e-5
+   📐 GRADS -> Max: [d_v: 4.4774] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 411MB
+➡️  Step 78950 | Loss: 1.9807 | BPC: 2.858 | Gate Openness: 32.86% | LR: 5.9e-5
+   📐 GRADS -> Max: [d_v: 6.2198] | Friction a_diag: 0.0007 | Gate Bias: 0.0001 | RAM: 413MB
+➡️  Step 79000 | Loss: 1.9995 | BPC: 2.885 | Gate Openness: 31.06% | LR: 5.9e-5
+   📐 GRADS -> Max: [d_v: 3.9695] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 415MB
+💾 Auto-Saving Checkpoint Step 79000...
+➡️  Step 79050 | Loss: 1.9296 | BPC: 2.784 | Gate Openness: 32.35% | LR: 5.9e-5
+   📐 GRADS -> Max: [d_v: 4.9525] | Friction a_diag: 0.0007 | Gate Bias: 0.0015 | RAM: 390MB
+➡️  Step 79100 | Loss: 2.0292 | BPC: 2.928 | Gate Openness: 31.97% | LR: 5.9e-5
+   📐 GRADS -> Max: [d_v: 5.2488] | Friction a_diag: 0.0007 | Gate Bias: 0.0011 | RAM: 386MB
+➡️  Step 79150 | Loss: 2.0106 | BPC: 2.901 | Gate Openness: 32.31% | LR: 5.8e-5
+   📐 GRADS -> Max: [d_v: 5.9729] | Friction a_diag: 0.0008 | Gate Bias: 0.0002 | RAM: 386MB
+➡️  Step 79200 | Loss: 1.9707 | BPC: 2.843 | Gate Openness: 33.24% | LR: 5.8e-5
+   📐 GRADS -> Max: [d_v: 5.5764] | Friction a_diag: 0.0007 | Gate Bias: 0.0014 | RAM: 386MB
+➡️  Step 79250 | Loss: 1.9162 | BPC: 2.765 | Gate Openness: 32.75% | LR: 5.8e-5
+   📐 GRADS -> Max: [d_v: 4.2555] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 390MB
+➡️  Step 79300 | Loss: 1.9204 | BPC: 2.771 | Gate Openness: 31.59% | LR: 5.8e-5
+   📐 GRADS -> Max: [d_v: 5.6198] | Friction a_diag: 0.0006 | Gate Bias: 0.0006 | RAM: 387MB
+➡️  Step 79350 | Loss: 2.014 | BPC: 2.906 | Gate Openness: 34.15% | LR: 5.8e-5
+   📐 GRADS -> Max: [d_v: 5.2689] | Friction a_diag: 0.0006 | Gate Bias: 0.0007 | RAM: 388MB
+➡️  Step 79400 | Loss: 1.9307 | BPC: 2.785 | Gate Openness: 32.46% | LR: 5.8e-5
+   📐 GRADS -> Max: [d_v: 4.3007] | Friction a_diag: 0.0006 | Gate Bias: 0.0004 | RAM: 393MB
+➡️  Step 79450 | Loss: 1.9334 | BPC: 2.789 | Gate Openness: 33.32% | LR: 5.8e-5
+   📐 GRADS -> Max: [d_v: 5.1433] | Friction a_diag: 0.0007 | Gate Bias: 0.0004 | RAM: 388MB
+➡️  Step 79500 | Loss: 1.901 | BPC: 2.743 | Gate Openness: 33.39% | LR: 5.8e-5
+   📐 GRADS -> Max: [d_v: 4.5994] | Friction a_diag: 0.0006 | Gate Bias: 0.0009 | RAM: 389MB
+➡️  Step 79550 | Loss: 2.0693 | BPC: 2.985 | Gate Openness: 32.86% | LR: 5.7e-5
+   📐 GRADS -> Max: [d_v: 4.0938] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 394MB
+➡️  Step 79600 | Loss: 2.0109 | BPC: 2.901 | Gate Openness: 33.67% | LR: 5.7e-5
+   📐 GRADS -> Max: [d_v: 3.9279] | Friction a_diag: 0.0008 | Gate Bias: 0.0003 | RAM: 390MB
+➡️  Step 79650 | Loss: 1.9836 | BPC: 2.862 | Gate Openness: 29.87% | LR: 5.7e-5
+   📐 GRADS -> Max: [d_v: 5.1537] | Friction a_diag: 0.0007 | Gate Bias: 0.0022 | RAM: 390MB
+➡️  Step 79700 | Loss: 2.0014 | BPC: 2.887 | Gate Openness: 32.01% | LR: 5.7e-5
+   📐 GRADS -> Max: [d_v: 6.8271] | Friction a_diag: 0.0008 | Gate Bias: 0.0018 | RAM: 390MB
+➡️  Step 79750 | Loss: 1.9384 | BPC: 2.796 | Gate Openness: 32.8% | LR: 5.7e-5
+   📐 GRADS -> Max: [d_v: 5.537] | Friction a_diag: 0.0006 | Gate Bias: 0.0011 | RAM: 391MB
+➡️  Step 79800 | Loss: 2.0763 | BPC: 2.995 | Gate Openness: 32.48% | LR: 5.7e-5
+   📐 GRADS -> Max: [d_v: 5.6114] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 396MB
+➡️  Step 79850 | Loss: 1.9425 | BPC: 2.803 | Gate Openness: 33.21% | LR: 5.7e-5
+   📐 GRADS -> Max: [d_v: 4.59] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 392MB
+➡️  Step 79900 | Loss: 1.879 | BPC: 2.711 | Gate Openness: 32.77% | LR: 5.7e-5
+   📐 GRADS -> Max: [d_v: 5.347] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 392MB
+➡️  Step 79950 | Loss: 1.9828 | BPC: 2.861 | Gate Openness: 32.41% | LR: 5.6e-5
+   📐 GRADS -> Max: [d_v: 5.4801] | Friction a_diag: 0.0006 | Gate Bias: 0.0003 | RAM: 395MB
+➡️  Step 80000 | Loss: 1.947 | BPC: 2.809 | Gate Openness: 31.55% | LR: 5.6e-5
+   📐 GRADS -> Max: [d_v: 5.4057] | Friction a_diag: 0.0007 | Gate Bias: 0.0003 | RAM: 394MB
+💾 Auto-Saving Checkpoint Step 80000...
+➡️  Step 80050 | Loss: 1.9236 | BPC: 2.775 | Gate Openness: 32.84% | LR: 5.6e-5
+   📐 GRADS -> Max: [d_v: 3.3492] | Friction a_diag: 0.0007 | Gate Bias: 0.0002 | RAM: 392MB
+➡️  Step 80100 | Loss: 2.0093 | BPC: 2.899 | Gate Openness: 34.24% | LR: 5.6e-5
+   📐 GRADS -> Max: [d_v: 5.2685] | Friction a_diag: 0.0007 | Gate Bias: 0.0009 | RAM: 392MB
+➡️  Step 80150 | Loss: 1.9088 | BPC: 2.754 | Gate Openness: 32.33% | LR: 5.6e-5
+   📐 GRADS -> Max: [d_v: 6.7414] | Friction a_diag: 0.0007 | Gate Bias: 0.0012 | RAM: 397MB
+➡️  Step 80200 | Loss: 1.9855 | BPC: 2.864 | Gate Openness: 33.37% | LR: 5.6e-5
+   📐 GRADS -> Max: [d_v: 4.0434] | Friction a_diag: 0.0006 | Gate Bias: 0.0002 | RAM: 393MB
+```
