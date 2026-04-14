@@ -1,0 +1,2533 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# HSSMP3 v37
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN for Rank 2 Tensors)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # pred and target are {batch_size, dim}
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    # 1. Batched Dot Product: {batch, dim} x {dim, batch} -> {batch, batch}
+    # This creates a similarity matrix comparing every pred to every target in the batch
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 2. Create Identity Targets -> {batch, batch}
+    batch_size = Nx.axis_size(pred, 0)
+    # ⚡ THE FIX: Pass a 2D tuple {32, 32} instead of a 1D tuple {32}
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    # 3. Manual Dense Log-Softmax
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))ozen_w2,
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 27, ...>>, true}
+```
+
+```elixir
+defmodule DLM.SinkhornOT do
+  import Nx.Defn
+
+  defn cost_matrix(pred, target) do
+    p_exp = Nx.new_axis(pred, 1)
+    t_exp = Nx.new_axis(target, 0)
+    diff = Nx.subtract(p_exp, t_exp)
+    Nx.sum(Nx.pow(diff, 2), axes: [-1])
+  end
+
+  # ⚡ FIX 1: Bump the default epsilon up to 10.0 to handle your 512D spatial scale
+  defn compute(pred, target, epsilon \\ 10.0, max_iters \\ 5) do
+    c = cost_matrix(pred, target)
+    k = Nx.exp(Nx.divide(Nx.negate(c), epsilon))
+    
+    batch_size = Nx.axis_size(pred, 0)
+    mass = 1.0 / batch_size
+    mu = Nx.broadcast(mass, {batch_size})
+    nu = Nx.broadcast(mass, {batch_size})
+
+    {_final_k, u_final, v_final, _mu, _nu, _i} =
+      while {k_mat = k, 
+             u = Nx.broadcast(1.0, {batch_size}), 
+             _v = Nx.broadcast(1.0, {batch_size}), 
+             m = mu, n = nu, i = 0},
+            Nx.less(i, max_iters) do
+            
+        # ⚡ FIX 2: Add 1.0e-8 to the denominator to mathematically prevent NaN crashes
+        denom_v = Nx.add(Nx.dot(Nx.transpose(k_mat), u), 1.0e-8)
+        v_new = Nx.divide(n, denom_v)
+        
+        denom_u = Nx.add(Nx.dot(k_mat, v_new), 1.0e-8)
+        u_new = Nx.divide(m, denom_u)
+
+        {k_mat, u_new, v_new, m, n, i + 1}
+      end
+
+    u_exp = Nx.new_axis(u_final, 1)
+    v_exp = Nx.new_axis(v_final, 0)
+    p = Nx.multiply(Nx.multiply(u_exp, k), v_exp)
+
+    Nx.sum(Nx.multiply(p, c))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SinkhornOT, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Main SSM
+
+```elixir
+defmodule DLM.Main_SSM do
+  import Nx.Defn
+
+  defn swish(x) do
+    x * Nx.sigmoid(x)
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn softplus(x) do
+    # ⚡ UNBREAKABLE SOFTPLUS: Guaranteed stable in forward AND backward passes
+    Nx.max(x, 0.0) + Nx.log1p(Nx.exp(-Nx.abs(x)))
+  end
+
+  defn apply_svd_weight(x, u, v) do
+    hidden = Nx.dot(x, u)
+    normed_hidden = rms_norm(hidden) # Apply the shield
+    activated = Nx.tanh(normed_hidden) # Swap to symmetric activation
+    Nx.dot(activated, v)
+  end
+
+  # ⚡ The core physics step (Used heavily by the new Master Loop)
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2) do
+    # 1. Local Mixers
+    mix1 = apply_svd_weight(x_p2, mu1, mv1)
+    mix2 = apply_svd_weight(x_p1, mu2, mv2)
+    x_mixed = Nx.add(x_t, Nx.add(mix1, mix2))
+    
+    # 2. Input Force
+    b_proj = apply_svd_weight(x_mixed, bu, bv)
+    delta = Nx.tensor(0.1, type: :f32)
+    
+    # 3. Friction
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    b_bar = Nx.multiply(delta, b_proj)
+    
+    # 4. Momentum Update
+    h_new = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    
+    # 5. Output Velocity
+    out_proj = apply_svd_weight(h_new, cu, cv)
+    
+    # 6. Skip Connection
+    skip = apply_svd_weight(x_t, du, dv)
+    
+    y_t = Nx.add(out_proj, skip)
+    
+    {y_t, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM, <<70, 79, 82, 49, 0, 0, 31, ...>>, true}
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  defn newton_schulz(g, iters \\ 5) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) + 1.0e-7
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, iters) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_update(grad, lr) do
+    Nx.subtract(0.0, Nx.multiply(lr, newton_schulz(grad)))
+  end
+
+  defn adam_update(param, grad, m, v, step, lr) do
+    safe_step = step + 1.0
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  defn step(params, grads, ms, vs, step_count, lr) do
+    # ⚡ Unpack 19 elements
+    {p_a, p_bu, p_bv, p_cu, p_cv, p_du, p_dv, p_mu1, p_mv1, p_mu2, p_mv2, 
+     p_gw, p_gb, p_spell_w, p_spell_b, p_valve_w, p_valve_b, p_out_w, p_out_b} = params
+  
+    {g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv, g_mu1, g_mv1, g_mu2, g_mv2, 
+     g_gw, g_gb, g_spell_w, g_spell_b, g_valve_w, g_valve_b, g_out_w, g_out_b} = grads
+  
+    {m_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv, m_mu1, m_mv1, m_mu2, m_mv2, 
+     m_gw, m_gb, m_spell_w, m_spell_b, m_valve_w, m_valve_b, m_out_w, m_out_b} = ms
+  
+    {v_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv, v_mu1, v_mv1, v_mu2, v_mv2, 
+     v_gw, v_gb, v_spell_w, v_spell_b, v_valve_w, v_valve_b, v_out_w, v_out_b} = vs
+  
+    # ⚡ Adam for scalars, biases, and the 1D gate weight
+    {up_a, nm_a, nv_a} = adam_update(p_a, g_a, m_a, v_a, step_count, lr)
+    {up_gw, nm_gw, nv_gw} = adam_update(p_gw, g_gw, m_gw, v_gw, step_count, Nx.multiply(lr, 0.3))
+    {up_gb, nm_gb, nv_gb} = adam_update(p_gb, g_gb, m_gb, v_gb, step_count, lr)
+    {up_spell_b, nm_spell_b, nv_spell_b} = adam_update(p_spell_b, g_spell_b, m_spell_b, v_spell_b, step_count, lr)
+    {up_valve_b, nm_valve_b, nv_valve_b} = adam_update(p_valve_b, g_valve_b, m_valve_b, v_valve_b, step_count, lr)
+    {up_out_b, nm_out_b, nv_out_b} = adam_update(p_out_b, g_out_b, m_out_b, v_out_b, step_count, lr)
+    
+    # ⚡ Muon for SVD and Dense 2D Matrices
+    up_bu = p_bu + muon_update(g_bu, lr)
+    up_bv = p_bv + muon_update(g_bv, lr)
+    up_cu = p_cu + muon_update(g_cu, lr)
+    up_cv = p_cv + muon_update(g_cv, lr)
+    up_du = p_du + muon_update(g_du, lr)
+    up_dv = p_dv + muon_update(g_dv, lr)
+    up_mu1 = p_mu1 + muon_update(g_mu1, lr)
+    up_mv1 = p_mv1 + muon_update(g_mv1, lr)
+    up_mu2 = p_mu2 + muon_update(g_mu2, lr)
+    up_mv2 = p_mv2 + muon_update(g_mv2, lr)
+    up_spell_w = p_spell_w + muon_update(g_spell_w, lr)
+    up_valve_w = p_valve_w + muon_update(g_valve_w, lr)
+    up_out_w = p_out_w + muon_update(g_out_w, lr)
+  
+    # Repack
+    new_params = {up_a, up_bu, up_bv, up_cu, up_cv, up_du, up_dv, up_mu1, up_mv1, up_mu2, up_mv2, 
+                  up_gw, up_gb, up_spell_w, up_spell_b, up_valve_w, up_valve_b, up_out_w, up_out_b}
+  
+    new_ms = {nm_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv, m_mu1, m_mv1, m_mu2, m_mv2, 
+              nm_gw, nm_gb, m_spell_w, nm_spell_b, m_valve_w, nm_valve_b, m_out_w, nm_out_b}
+  
+    new_vs = {nv_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv, v_mu1, v_mv1, v_mu2, v_mv2, 
+              nv_gw, nv_gb, v_spell_w, nv_spell_b, v_valve_w, nv_valve_b, v_out_w, nv_out_b}
+  
+    {new_params, new_ms, new_vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.MuonHybrid, <<70, 79, 82, 49, 0, 0, 45, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Main_SSM_Genesis do
+  @dim 512
+  @rank 256
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    
+    # ⚡ Keep your new -2.0 high friction for the upper layers!
+    {a_diag, key} = Nx.Random.normal(key, -0.1, 0.01, shape: {@dim})
+    
+    {b_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {b_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {c_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {c_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {d_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {d_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    
+    # 1. The Boundary Gate
+    {gate_w, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, 1})
+    gate_b = Nx.tensor([-3.0], type: :f32)
+
+    # 2. ⚡ The Spell Feature Generator
+    {spell_w, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @dim})
+    spell_b = Nx.broadcast(0.0, {@dim})
+
+    # 3. ⚡ The Syntax Valve (Swish Gate)
+    {valve_w, _key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @dim})
+    valve_b = Nx.broadcast(0.0, {@dim})
+
+    # 4. ⚡ Latent Output Projection (STRICT ZERO INITIALIZATION)
+    out_w = Nx.broadcast(0.0, {@dim, @dim}) |> Nx.as_type(:f32)
+    out_b = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
+
+    # 19 Parameters Total
+    {a_diag, b_u, b_v, c_u, c_v, d_u, d_v, mx_u1, mx_v1, mx_u2, mx_v2, 
+     gate_w, gate_b, spell_w, spell_b, valve_w, valve_b, out_w, out_b}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = DLM.Tree.map(params, zero_like)
+    vs = DLM.Tree.map(params, zero_like)
+    {ms, vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM_Genesis, <<70, 79, 82, 49, 0, 0, 18, ...>>, {:init_optimizer, 1}}
+```
+
+```elixir
+defmodule DLM.TinySSM do
+  import Nx.Defn
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    
+    # 🛡️ The Shield: normalizes variance to 1.0 BEFORE the tanh
+    normed_hidden = rms_norm(hidden) 
+    activated = Nx.tanh(normed_hidden)
+    
+    Nx.dot(activated, v)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn forward(x_t, h_prev, params) do
+    # ⚡ Unpack the 7 parameters
+    {a, bu, bv, cu, cv, du, dv} = params
+
+    b_proj = apply_svd(x_t, bu, bv)
+    
+    # ⚡ The Dynamic Gate
+    gate_proj = apply_svd(x_t, du, dv)
+
+    # ⚡ Shift the projection by -3.0 so the initial delta is ~0.048
+    shifted_gate = Nx.subtract(gate_proj, 3.0)
+    delta = Nx.max(softplus(shifted_gate), 0.01)
+    
+    # Dynamic Friction & Force
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    b_bar = b_proj
+    
+    h_new = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    
+    predicted_vector = apply_svd(h_new, cu, cv)
+    
+    {predicted_vector, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 28, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inferece
+
+```elixir
+defmodule DLM.Phase3_Eval do
+  import Nx.Defn
+
+  # Run this on a held-out validation batch
+  defn compute_accuracy(input_tokens, target_tokens, h_base_init, h_top_init, frozen_base_p, top_p, frozen_map) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+
+    # 1. Map inputs to continuous space
+    input_coords =
+      Nx.take(frozen_map, Nx.flatten(input_tokens))
+      |> Nx.reshape({1, seq_len, 512})
+    
+    in_t = Nx.transpose(input_coords, axes: [1, 0, 2])
+    targ_t = Nx.transpose(target_tokens, axes: [1, 0])
+
+    zero_frame = Nx.broadcast(0.0, {1, 512})
+
+    result =
+      # ⚡ 12 Elements exactly
+      while {i = 0, correct_top1 = 0.0, total_chars = 0.0,
+             h_base = h_base_init, h_top = h_top_init,
+             xp1 = zero_frame, xp2 = zero_frame,
+             x_in = in_t, y_targ = targ_t,
+             b_p = frozen_base_p, t_p = top_p, f_map = frozen_map}, 
+            Nx.less(i, seq_len) do
+            
+        x_curr = x_in[i]
+
+        # ⚡ Grab the actual Phase 2 prediction!
+        {y_base, h_base_new} = DLM.TinySSM.forward(x_curr, h_base, b_p)
+
+        # ⚡ Unpack all 19 params, ignoring the dead gate weights
+        {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, 
+         _gate_w, _gate_b, spell_w, spell_b, valve_w, valve_b, out_w, out_b} = t_p
+
+        # ⚡ Top SSM (Chunker) - Unchained!
+        {_y_top, h_top_new} = DLM.Main_SSM.ssm_recurrence(
+          h_base_new, xp1, xp2, h_top, 
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+        )
+
+        # ⚡ Swish Fusion
+        f_spell = Nx.add(Nx.dot(h_base_new, spell_w), spell_b)
+        v_syntax = DLM.Main_SSM.swish(Nx.add(Nx.dot(h_top_new, valve_w), valve_b))
+        
+        h_fused = Nx.multiply(v_syntax, f_spell)
+        h_fused_norm = DLM.Main_SSM.rms_norm(h_fused)
+
+        # ⚡ 3. Residual Prediction uses the True Output, not the hidden state
+        p2_native_latent = y_base
+        p3_adjustment = Nx.add(Nx.dot(h_fused_norm, out_w), out_b)
+        
+        pred_latent = Nx.add(p2_native_latent, p3_adjustment)
+
+        # ⚡ Calculate Top-1 Accuracy against the map
+        pred_norm = DLM.Loss.l2_normalize(pred_latent)
+        similarities = Nx.dot(pred_norm, Nx.transpose(f_map))
+        
+        predicted_indices = Nx.argmax(similarities, axis: -1)
+        true_indices = y_targ[i]
+        
+        matches = Nx.equal(predicted_indices, true_indices) |> Nx.sum()
+        
+        # ⚡ THE FIX: Restore the Shift Register here as well!
+        {i + 1, Nx.add(correct_top1, matches), Nx.add(total_chars, Nx.axis_size(true_indices, 0)), 
+         h_base_new, h_top_new, h_base_new, xp1, x_in, y_targ, b_p, t_p, f_map}
+      end
+
+    total_correct = elem(result, 1)
+    total_count = elem(result, 2)
+    
+    Nx.multiply(Nx.divide(total_correct, total_count), 100.0)
+  end
+
+  defn compute_sentence_loss(input_tokens, target_tokens, h_base_init, h_top_init, frozen_base_p, top_p, frozen_map) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+  
+    input_coords =
+      Nx.take(frozen_map, Nx.flatten(input_tokens))
+      |> Nx.reshape({1, seq_len, 512})
+  
+    in_t = Nx.transpose(input_coords, axes: [1, 0, 2])
+  
+    target_coords =
+      Nx.take(frozen_map, Nx.flatten(target_tokens))
+      |> Nx.reshape({1, seq_len, 512})
+  
+    targ_t = Nx.transpose(target_coords, axes: [1, 0, 2])
+  
+    zero_frame = Nx.broadcast(0.0, {1, 512})
+  
+    result =
+      while {i = 0, total_loss = 0.0,
+             h_base = h_base_init, h_top = h_top_init,
+             xp1 = zero_frame, xp2 = zero_frame,
+             x_in = in_t, y_targ = targ_t,
+             b_p = frozen_base_p, t_p = top_p, f_map = frozen_map},
+            Nx.less(i, seq_len) do
+  
+        x_curr = x_in[i]
+  
+        {y_base, h_base_new} = DLM.TinySSM.forward(x_curr, h_base, b_p)
+  
+        {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2,
+         gate_w, gate_b, spell_w, spell_b, valve_w, valve_b, out_w, out_b} = t_p
+  
+        {_y_top, h_top_candidate} = DLM.Main_SSM.ssm_recurrence(
+          h_base_new, xp1, xp2, h_top,
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+        )
+  
+        {h_top_new, h_base_flushed, _g} =
+          DLM.HierarchyBridge.apply_gate(h_base_new, h_top_candidate, h_top, gate_w, gate_b)
+  
+        f_spell = Nx.add(Nx.dot(h_base_new, spell_w), spell_b)
+        v_syntax = DLM.Main_SSM.swish(Nx.add(Nx.dot(h_top_new, valve_w), valve_b))
+  
+        h_fused = Nx.multiply(v_syntax, f_spell)
+        h_fused_norm = DLM.Main_SSM.rms_norm(h_fused)
+  
+        p3_adjustment = Nx.add(Nx.dot(h_fused_norm, out_w), out_b)
+        pred_latent = Nx.add(y_base, p3_adjustment)
+  
+        step_loss = DLM.Loss.cosine_distance(pred_latent, y_targ[i])
+  
+        {i + 1, total_loss + step_loss,
+         h_base_flushed, h_top_new, h_base_flushed, xp1,
+         x_in, y_targ, b_p, t_p, f_map}
+      end
+  
+    # Return average loss across the sequence
+    Nx.divide(elem(result, 1), seq_len)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase3_Eval, <<70, 79, 82, 49, 0, 0, 42, ...>>, true}
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+
+# ==============================================================================
+# 1. LOAD MODELS (once, shared across all evals)
+# ==============================================================================
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+{cpu_embeds, _w1, _w2, _key} = phase1_p
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+phase2_p = File.read!("v37_DLM_Phase_2_lr3e5_softnn_checkpoint_step_10000.bin") |> :erlang.binary_to_term()
+%{params: phase3_p} = File.read!("v37_DLM_Phase_3_cosg_ec_checkpoint_step_24000.bin") |> :erlang.binary_to_term()
+
+# ==============================================================================
+# PRE-WARM: compile the JIT kernel once before the batch loop
+# so EXLA reuses it for every subsequent call
+# ==============================================================================
+IO.puts("🔥 Pre-warming JIT compiler...")
+warmup_tokens = Nx.tensor([[72, 101, 108, 108, 111]], type: :s32) |> Nx.backend_copy(gpu)
+warmup_input  = Nx.slice_along_axis(warmup_tokens, 0, 4, axis: 1)
+warmup_target = Nx.slice_along_axis(warmup_tokens, 1, 4, axis: 1)
+h_init_warm   = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+DLM.Phase3_Eval.compute_sentence_loss(warmup_input, warmup_target, h_init_warm, h_init_warm, phase2_p, phase3_p, frozen_map)
+IO.puts("✅ JIT warm, starting batch...\n")
+
+# ==============================================================================
+# 2. EVAL FUNCTION
+# ==============================================================================
+run_blimp = fn path ->
+  pairs =
+    File.read!(path)
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
+
+  total_pairs = length(pairs)
+
+  {passes, total_loss_diff} =
+    Enum.reduce(pairs, {0, 0.0}, fn pair, {pass_count, diff_acc} ->
+      good_sentence = pair["sentence_good"]
+      bad_sentence  = pair["sentence_bad"]
+  
+      good_val_tokens = good_sentence |> to_charlist() |> Nx.tensor(type: :s32)
+      bad_val_tokens  = bad_sentence  |> to_charlist() |> Nx.tensor(type: :s32)
+  
+      good_seq_len = Nx.size(good_val_tokens) - 1
+      bad_seq_len  = Nx.size(bad_val_tokens)  - 1
+  
+      good_input  = Nx.slice_along_axis(good_val_tokens, 0, good_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      good_target = Nx.slice_along_axis(good_val_tokens, 1, good_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      bad_input   = Nx.slice_along_axis(bad_val_tokens,  0, bad_seq_len,  axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      bad_target  = Nx.slice_along_axis(bad_val_tokens,  1, bad_seq_len,  axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+  
+      h_init = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+  
+      good_loss = DLM.Phase3_Eval.compute_sentence_loss(good_input, good_target, h_init, h_init, phase2_p, phase3_p, frozen_map) |> Nx.to_number()
+      bad_loss  = DLM.Phase3_Eval.compute_sentence_loss(bad_input,  bad_target,  h_init, h_init, phase2_p, phase3_p, frozen_map) |> Nx.to_number()
+  
+      # ⚡ Explicit cleanup to prevent process accumulation
+      :erlang.garbage_collect(self())
+  
+      new_pass_count = if good_loss < bad_loss, do: pass_count + 1, else: pass_count
+      {new_pass_count, diff_acc + (bad_loss - good_loss)}
+    end)
+
+  accuracy   = (passes / total_pairs) * 100.0
+  avg_margin = total_loss_diff / total_pairs
+  name       = Path.basename(path, ".jsonl")
+
+  {name, accuracy, avg_margin, passes, total_pairs}
+end
+
+# ==============================================================================
+# 3. BATCH RUN
+# ==============================================================================
+dataset_files = Path.wildcard("./data/*.jsonl") |> Enum.sort()
+total_files   = length(dataset_files)
+
+IO.puts("🚀 Running BLiMP batch eval across #{total_files} datasets...\n")
+
+results =
+  dataset_files
+  |> Enum.with_index(1)
+  |> Enum.map(fn {path, idx} ->
+    IO.puts("  [#{idx}/#{total_files}] #{Path.basename(path)}...")
+    result = run_blimp.(path)
+    :erlang.garbage_collect(self())  # ⚡ flush between files
+    result
+  end)
+
+# ==============================================================================
+# 4. SORTED SUMMARY
+# ==============================================================================
+sorted = Enum.sort_by(results, fn {_, acc, _, _, _} -> acc end, :desc)
+
+IO.puts("\n")
+IO.puts(String.duplicate("=", 70))
+IO.puts("🏆 BLIMP BATCH RESULTS — sorted by accuracy")
+IO.puts(String.duplicate("=", 70))
+IO.puts(String.pad_trailing("Dataset", 48) <> "Accuracy   Margin")
+IO.puts(String.duplicate("-", 70))
+
+Enum.each(sorted, fn {name, acc, margin, passes, total} ->
+  flag = cond do
+    acc >= 60.0 -> "✅"
+    acc <= 40.0 -> "❌"
+    true        -> "〰️"
+  end
+  IO.puts("#{flag} #{String.pad_trailing(name, 46)} #{String.pad_leading("#{Float.round(acc, 1)}%", 7)} (#{passes}/#{total})   #{Float.round(margin, 4)}")
+end)
+
+IO.puts(String.duplicate("-", 70))
+
+# Overall average
+avg_acc = results |> Enum.map(fn {_, acc, _, _, _} -> acc end) |> Enum.sum() |> Kernel./(total_files)
+IO.puts("📊 Overall average accuracy: #{Float.round(avg_acc, 2)}%")
+IO.puts(String.duplicate("=", 70))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+
+20:14:59.071 [info] XLA service 0x73f590017d10 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+20:14:59.074 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+20:14:59.074 [info] Using BFC allocator.
+
+20:14:59.074 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+20:14:59.074 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+🔥 Pre-warming JIT compiler...
+✅ JIT warm, starting batch...
+
+🚀 Running BLiMP batch eval across 67 datasets...
+
+  [1/67] adjunct_island.jsonl...
+  [2/67] anaphor_gender_agreement.jsonl...
+  [3/67] anaphor_number_agreement.jsonl...
+  [4/67] animate_subject_passive.jsonl...
+  [5/67] animate_subject_trans.jsonl...
+  [6/67] causative.jsonl...
+  [7/67] complex_NP_island.jsonl...
+  [8/67] coordinate_structure_constraint_complex_left_branch.jsonl...
+  [9/67] coordinate_structure_constraint_object_extraction.jsonl...
+  [10/67] determiner_noun_agreement_1.jsonl...
+  [11/67] determiner_noun_agreement_2.jsonl...
+  [12/67] determiner_noun_agreement_irregular_1.jsonl...
+  [13/67] determiner_noun_agreement_irregular_2.jsonl...
+  [14/67] determiner_noun_agreement_with_adj_2.jsonl...
+  [15/67] determiner_noun_agreement_with_adj_irregular_1.jsonl...
+  [16/67] determiner_noun_agreement_with_adj_irregular_2.jsonl...
+  [17/67] determiner_noun_agreement_with_adjective_1.jsonl...
+  [18/67] distractor_agreement_relational_noun.jsonl...
+  [19/67] distractor_agreement_relative_clause.jsonl...
+  [20/67] drop_argument.jsonl...
+  [21/67] ellipsis_n_bar_1.jsonl...
+  [22/67] ellipsis_n_bar_2.jsonl...
+  [23/67] existential_there_object_raising.jsonl...
+  [24/67] existential_there_quantifiers_1.jsonl...
+  [25/67] existential_there_quantifiers_2.jsonl...
+  [26/67] existential_there_subject_raising.jsonl...
+  [27/67] expletive_it_object_raising.jsonl...
+  [28/67] inchoative.jsonl...
+  [29/67] intransitive.jsonl...
+  [30/67] irregular_past_participle_adjectives.jsonl...
+  [31/67] irregular_past_participle_verbs.jsonl...
+  [32/67] irregular_plural_subject_verb_agreement_1.jsonl...
+  [33/67] irregular_plural_subject_verb_agreement_2.jsonl...
+  [34/67] left_branch_island_echo_question.jsonl...
+  [35/67] left_branch_island_simple_question.jsonl...
+  [36/67] matrix_question_npi_licensor_present.jsonl...
+  [37/67] npi_present_1.jsonl...
+  [38/67] npi_present_2.jsonl...
+  [39/67] only_npi_licensor_present.jsonl...
+  [40/67] only_npi_scope.jsonl...
+  [41/67] passive_1.jsonl...
+  [42/67] passive_2.jsonl...
+  [43/67] principle_A_c_command.jsonl...
+  [44/67] principle_A_case_1.jsonl...
+  [45/67] principle_A_case_2.jsonl...
+  [46/67] principle_A_domain_1.jsonl...
+  [47/67] principle_A_domain_2.jsonl...
+  [48/67] principle_A_domain_3.jsonl...
+  [49/67] principle_A_reconstruction.jsonl...
+  [50/67] regular_plural_subject_verb_agreement_1.jsonl...
+  [51/67] regular_plural_subject_verb_agreement_2.jsonl...
+  [52/67] sentential_negation_npi_licensor_present.jsonl...
+  [53/67] sentential_negation_npi_scope.jsonl...
+  [54/67] sentential_subject_island.jsonl...
+  [55/67] superlative_quantifiers_1.jsonl...
+  [56/67] superlative_quantifiers_2.jsonl...
+  [57/67] tough_vs_raising_1.jsonl...
+  [58/67] tough_vs_raising_2.jsonl...
+  [59/67] transitive.jsonl...
+  [60/67] wh_island.jsonl...
+  [61/67] wh_questions_object_gap.jsonl...
+  [62/67] wh_questions_subject_gap.jsonl...
+  [63/67] wh_questions_subject_gap_long_distance.jsonl...
+  [64/67] wh_vs_that_no_gap.jsonl...
+  [65/67] wh_vs_that_no_gap_long_distance.jsonl...
+  [66/67] wh_vs_that_with_gap.jsonl...
+  [67/67] wh_vs_that_with_gap_long_distance.jsonl...
+
+
+======================================================================
+🏆 BLIMP BATCH RESULTS — sorted by accuracy
+======================================================================
+Dataset                                         Accuracy   Margin
+----------------------------------------------------------------------
+✅ principle_A_case_1                              100.0% (1000/1000)   0.0194
+✅ principle_A_domain_1                            100.0% (1000/1000)   0.015
+✅ wh_vs_that_no_gap                               100.0% (1000/1000)   0.016
+✅ wh_vs_that_no_gap_long_distance                 100.0% (1000/1000)   0.0118
+✅ wh_questions_subject_gap                         99.7% (997/1000)   0.0171
+✅ wh_questions_subject_gap_long_distance           98.9% (989/1000)   0.0097
+✅ wh_questions_object_gap                          96.1% (961/1000)   0.012
+✅ principle_A_case_2                               96.0% (960/1000)   0.0092
+✅ sentential_negation_npi_licensor_present         95.6% (956/1000)   0.0158
+✅ wh_island                                        91.1% (911/1000)   0.0138
+✅ existential_there_quantifiers_2                  84.1% (841/1000)   0.0056
+✅ irregular_past_participle_verbs                  70.6% (706/1000)   0.0049
+✅ principle_A_c_command                            69.3% (693/1000)   0.0067
+✅ existential_there_subject_raising                66.8% (668/1000)   0.0051
+✅ anaphor_gender_agreement                         66.1% (661/1000)   0.0089
+✅ tough_vs_raising_2                               65.3% (653/1000)   0.0068
+✅ sentential_negation_npi_scope                    64.1% (641/1000)   0.0007
+✅ superlative_quantifiers_1                        63.0% (630/1000)   0.0033
+✅ adjunct_island                                   62.9% (629/1000)   0.0014
+✅ existential_there_quantifiers_1                  62.9% (629/1000)   0.0053
+✅ complex_NP_island                                60.9% (609/1000)   0.0008
+〰️ existential_there_object_raising                 57.6% (576/1000)   0.0009
+〰️ superlative_quantifiers_2                        56.3% (563/1000)   0.0019
+〰️ transitive                                       54.8% (548/1000)   0.0017
+〰️ expletive_it_object_raising                      54.5% (545/1000)   0.001
+〰️ causative                                        54.4% (544/1000)   0.001
+〰️ left_branch_island_echo_question                 54.0% (540/1000)   0.0002
+〰️ ellipsis_n_bar_1                                 52.7% (527/1000)   0.0002
+〰️ passive_2                                        52.3% (523/1000)   0.0004
+〰️ determiner_noun_agreement_1                      51.4% (514/1000)   0.0002
+〰️ animate_subject_passive                          50.8% (508/1000)   0.0019
+〰️ determiner_noun_agreement_with_adjective_1       50.8% (508/1000)   0.0002
+〰️ ellipsis_n_bar_2                                 50.7% (507/1000)   -0.0001
+〰️ determiner_noun_agreement_2                      50.5% (505/1000)   0.0005
+〰️ determiner_noun_agreement_with_adj_2             50.2% (502/1000)   0.0
+〰️ irregular_plural_subject_verb_agreement_1        49.8% (498/1000)   -0.0
+〰️ distractor_agreement_relative_clause             49.2% (492/1000)   0.0001
+〰️ distractor_agreement_relational_noun             49.0% (490/1000)   -0.0
+〰️ determiner_noun_agreement_irregular_2            48.9% (489/1000)   -0.0001
+〰️ principle_A_domain_3                             48.8% (488/1000)   -0.0002
+〰️ determiner_noun_agreement_with_adj_irregular_2   48.7% (487/1000)   -0.0005
+〰️ determiner_noun_agreement_irregular_1            48.5% (485/1000)   -0.0006
+〰️ anaphor_number_agreement                         47.9% (479/1000)   -0.0028
+〰️ passive_1                                        47.4% (474/1000)   -0.0008
+〰️ coordinate_structure_constraint_complex_left_branch   47.0% (470/1000)   -0.0003
+〰️ determiner_noun_agreement_with_adj_irregular_1   45.3% (453/1000)   -0.0004
+〰️ regular_plural_subject_verb_agreement_2          45.1% (451/1000)   -0.0007
+〰️ irregular_plural_subject_verb_agreement_2        42.1% (421/1000)   -0.0012
+〰️ coordinate_structure_constraint_object_extraction   40.5% (405/1000)   -0.0027
+〰️ inchoative                                       40.2% (402/1000)   -0.0052
+❌ principle_A_domain_2                             38.5% (385/1000)   -0.0043
+❌ left_branch_island_simple_question               35.8% (358/1000)   -0.0018
+❌ tough_vs_raising_1                               34.1% (341/1000)   -0.0077
+❌ regular_plural_subject_verb_agreement_1          33.2% (332/1000)   -0.0029
+❌ sentential_subject_island                        32.0% (320/1000)   -0.0021
+❌ principle_A_reconstruction                       31.0% (310/1000)   -0.0031
+❌ drop_argument                                    28.5% (285/1000)   -0.0185
+❌ intransitive                                     26.4% (264/1000)   -0.0145
+❌ animate_subject_trans                            24.8% (248/1000)   -0.0197
+❌ irregular_past_participle_adjectives             23.5% (235/1000)   -0.0096
+❌ only_npi_scope                                   16.3% (163/1000)   -0.0038
+❌ matrix_question_npi_licensor_present             14.8% (148/1000)   -0.0122
+❌ npi_present_1                                     1.0% (10/1000)   -0.0195
+❌ npi_present_2                                     0.8% (8/1000)   -0.0242
+❌ only_npi_licensor_present                         0.0% (0/1000)   -0.0133
+❌ wh_vs_that_with_gap                               0.0% (0/1000)   -0.0186
+❌ wh_vs_that_with_gap_long_distance                 0.0% (0/1000)   -0.0127
+----------------------------------------------------------------------
+📊 Overall average accuracy: 52.14%
+======================================================================
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# 1. Load the completed Phase 1 state
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+
+# 2. Unpack it (we only want the embeds, we can throw away the Phase 1 denoiser weights for now)
+{cpu_embeds, _w1, _w2, _key} = phase1_p
+
+# 3. Push the finalized map to the GPU and L2 Normalize it one last time to be safe
+frozen_map = cpu_embeds
+             |> Nx.backend_copy(gpu)
+             |> DLM.Loss.l2_normalize()
+
+phase2_p = File.read!("v37_DLM_Phase_2_lr3e5_softnn_checkpoint_step_10000.bin") |> :erlang.binary_to_term()
+
+phase3_p = File.read!("v37_DLM_Phase_3_cosg_ec_checkpoint_step_24000.bin") |> :erlang.binary_to_term()
+
+# 1. Use the EXACT same validation string from your Phase 2 eval
+val_text = "The quick brown fox jumps over the lazy dog. It was the best of times, it was the worst of times."
+
+# 2. Convert and shift
+val_tokens = val_text |> to_charlist() |> Nx.tensor(type: :s32)
+seq_len = Nx.size(val_tokens) - 1
+
+input_tokens = Nx.slice_along_axis(val_tokens, 0, seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+target_tokens = Nx.slice_along_axis(val_tokens, 1, seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+
+# 3. Initialize dual states
+h_init = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+
+# 4. Evaluate!
+# Make sure frozen_base_p is your 10k low-LR champion from Phase 2
+accuracy_tensor = DLM.Phase3_Eval.compute_accuracy(
+  input_tokens, target_tokens, h_init, h_init, phase2_p, phase3_p.params, frozen_map
+)
+
+accuracy = Nx.to_number(accuracy_tensor)
+IO.puts("Phase 3 Top-1 Accuracy: #{Float.round(accuracy, 2)}%")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Phase 3 Top-1 Accuracy: 35.42%
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+blimp_file = "./data/anaphor_gender_agreement.jsonl"
+
+# 1. Load the completed Phase 1 state
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+
+# 2. Unpack it (we only want the embeds, we can throw away the Phase 1 denoiser weights for now)
+{cpu_embeds, _w1, _w2, _key} = phase1_p
+
+# 3. Push the finalized map to the GPU and L2 Normalize it one last time to be safe
+frozen_map = cpu_embeds
+             |> Nx.backend_copy(gpu)
+             |> DLM.Loss.l2_normalize()
+
+phase2_p = File.read!("v37_DLM_Phase_2_lr3e5_softnn_checkpoint_step_10000.bin") |> :erlang.binary_to_term()
+
+%{params: phase3_p} = File.read!("v37_DLM_Phase_3_cosg_ec_checkpoint_step_18000.bin") |> :erlang.binary_to_term()
+
+
+# ==============================================================================
+# 2. RUN BLIMP EVALUATION
+# ==============================================================================
+IO.puts("📖 Reading BLiMP Dataset: #{blimp_file}")
+
+# Parse the JSON Lines
+pairs = 
+  File.read!(blimp_file)
+  |> String.split("\n", trim: true)
+  |> Enum.map(&Jason.decode!/1)
+
+total_pairs = length(pairs)
+IO.puts("⚖️ Evaluating #{total_pairs} minimalist pairs...")
+
+# Tally the results
+{passes, total_loss_diff} = 
+  Enum.reduce(pairs, {0, 0.0}, fn pair, {pass_count, diff_acc} ->
+    good_sentence = pair["sentence_good"]
+    bad_sentence = pair["sentence_bad"]
+
+    # 2. Convert and shift
+    good_val_tokens = good_sentence |> to_charlist() |> Nx.tensor(type: :s32)
+    good_seq_len = Nx.size(good_val_tokens) - 1
+
+    bad_val_tokens = bad_sentence |> to_charlist() |> Nx.tensor(type: :s32)
+    bad_seq_len = Nx.size(bad_val_tokens) - 1
+    
+    good_input_tokens = Nx.slice_along_axis(good_val_tokens, 0, good_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+    good_target_tokens = Nx.slice_along_axis(good_val_tokens, 1, good_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+
+    bad_input_tokens = Nx.slice_along_axis(bad_val_tokens, 0, bad_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+    bad_target_tokens = Nx.slice_along_axis(bad_val_tokens, 1, bad_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+    # 3. Initialize dual states
+    h_init = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+
+    good_loss = DLM.Phase3_Eval.compute_sentence_loss(good_input_tokens, good_target_tokens, h_init, h_init, phase2_p, phase3_p, frozen_map) |> Nx.to_number()
+    bad_loss  = DLM.Phase3_Eval.compute_sentence_loss(bad_input_tokens, bad_target_tokens, h_init, h_init, phase2_p, phase3_p, frozen_map) |> Nx.to_number()
+
+    # Did the model assign a lower loss (higher probability) to the grammatically correct sentence?
+    is_pass? = good_loss < bad_loss
+    
+    new_pass_count = if is_pass?, do: pass_count + 1, else: pass_count
+
+    {new_pass_count, diff_acc + (bad_loss - good_loss)}
+  end)
+
+# Calculate final metrics
+accuracy = (passes / total_pairs) * 100.0
+avg_margin = total_loss_diff / total_pairs
+
+IO.puts(String.duplicate("=", 50))
+IO.puts("🏆 BLiMP EVALUATION RESULTS")
+IO.puts(String.duplicate("=", 50))
+IO.puts("Dataset:   #{blimp_file}")
+IO.puts("Accuracy:  #{Float.round(accuracy, 2)}% (#{passes}/#{total_pairs})")
+IO.puts("Margin:    #{Float.round(avg_margin, 4)} (Avg loss difference)")
+IO.puts(String.duplicate("=", 50))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+📖 Reading BLiMP Dataset: ./data/anaphor_gender_agreement.jsonl
+⚖️ Evaluating 1000 minimalist pairs...
+==================================================
+🏆 BLiMP EVALUATION RESULTS
+==================================================
+Dataset:   ./data/anaphor_gender_agreement.jsonl
+Accuracy:  66.1% (661/1000)
+Margin:    0.0089 (Avg loss difference)
+==================================================
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.HierarchyBridge do
+  import Nx.Defn
+
+  @doc """
+  Applies the hierarchical gate AFTER both SSMs have already stepped.
+  
+  - h_base_new: fresh output from TinySSM this step
+  - h_top_candidate: fresh output from Main_SSM.ssm_recurrence this step  
+  - h_top_prev: the top state from the previous step (before this step's update)
+  - gate_w: the {512, 1} gating weight
+  - gate_b: the {1} gating bias
+  
+  Returns:
+  - h_top_gated: the interpolated top state (soft-updated or held)
+  - h_base_flushed: the base state after soft reset
+  - g: the gate value (useful for telemetry)
+  """
+  defn apply_gate(h_base_new, h_top_candidate, h_top_prev, gate_w, gate_b) do
+    # 1. Compute gate from current base state → scalar per batch item
+    boundary_logit = Nx.add(Nx.dot(h_base_new, gate_w), gate_b)
+    g = Nx.sigmoid(boundary_logit)  # shape: {batch, 1}
+
+    # 2. Soft interpolation of the top state
+    #    g ≈ 0 (mid-concept): keep h_top_prev almost entirely
+    #    g ≈ 1 (chunk boundary): pull fully toward h_top_candidate
+    h_top_gated = Nx.add(
+      Nx.multiply(g, h_top_candidate),
+      Nx.multiply(Nx.subtract(1.0, g), h_top_prev)
+    )
+
+    # 3. Soft reset of the base state
+    #    When a boundary fires, flush base memory so it starts fresh
+    h_base_flushed = Nx.multiply(h_base_new, Nx.subtract(1.0, g))
+
+    {h_top_gated, h_base_flushed, g}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.HierarchyBridge, <<70, 79, 82, 49, 0, 0, 14, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Main_SSM_Trainer do
+  import Nx.Defn
+
+  # 1. Maps discrete tokens to their perfect 512D spatial coordinates
+  defn get_real_coordinates(batch_tokens, frozen_embeds) do
+    Nx.take(frozen_embeds, Nx.flatten(batch_tokens))
+      |> Nx.reshape({Nx.axis_size(batch_tokens, 0), Nx.axis_size(batch_tokens, 1), 512})
+      |> stop_grad()
+  end
+
+  # 2. THE MASTER SEQUENCE LOOP (Gate completely removed!)
+  defn compute_sequence_loss(input_tokens, target_tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+ 
+    clean_coords = get_real_coordinates(input_tokens, frozen_map)
+    inputs_time = Nx.transpose(clean_coords, axes: [1, 0, 2])
+    
+    target_coords = get_real_coordinates(target_tokens, frozen_map)
+    targets_time = Nx.transpose(target_coords, axes: [1, 0, 2])
+
+    zero_frame = Nx.broadcast(0.0, Nx.shape(h_top_init))
+
+    result =
+    while {i = 0, total_loss = 0.0,
+           h_base = h_base_init, h_top = h_top_init,
+           xp1 = zero_frame, xp2 = zero_frame,
+           in_t = inputs_time, targ_t = targets_time,
+           b_p = frozen_base_p, t_p = top_p, f_map = frozen_map, total_g = 0.0},
+          Nx.less(i, seq_len) do
+
+      x_curr = in_t[i]
+
+      # Step 1: Base SSM runs on the raw input embedding
+      {y_base, h_base_new} = DLM.TinySSM.forward(x_curr, h_base, b_p)
+
+      # Step 2: Unpack top params (gate_w and gate_b are now ACTIVE)
+      {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2,
+       gate_w, gate_b, spell_w, spell_b, valve_w, valve_b, out_w, out_b} = t_p
+
+      gate_logit = Nx.add(Nx.dot(h_base_new, gate_w), gate_b)
+      g = Nx.sigmoid(gate_logit) 
+      batch_avg_g = Nx.mean(g)
+
+      # Step 3: Top SSM produces a candidate state
+      {_y_top, h_top_candidate} = DLM.Main_SSM.ssm_recurrence(
+        h_base_new, xp1, xp2, h_top,
+        a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2
+      )
+
+      # Step 4: Gate decides how much of the candidate to actually commit
+      {h_top_gated, h_base_flushed, _g} =
+        DLM.HierarchyBridge.apply_gate(h_base_new, h_top_candidate, h_top, gate_w, gate_b)
+
+      # Step 5: Fusion uses the GATED top state
+      f_spell = Nx.add(Nx.dot(h_base_new, spell_w), spell_b)
+      v_syntax = DLM.Main_SSM.swish(Nx.add(Nx.dot(h_top_gated, valve_w), valve_b))
+
+      h_fused = Nx.multiply(v_syntax, f_spell)
+      h_fused_norm = DLM.Main_SSM.rms_norm(h_fused)
+
+      p3_adjustment = Nx.add(Nx.dot(h_fused_norm, out_w), out_b)
+      pred_latent = Nx.add(y_base, p3_adjustment)
+      step_loss = DLM.Loss.cosine_distance(pred_latent, targ_t[i])
+
+      # Step 6: Shift register now uses h_base_flushed for xp1
+      #         so the top SSM sees boundary-aware base context
+      {i + 1, total_loss + step_loss,
+       h_base_flushed, h_top_gated,   # ← carry gated/flushed states forward
+       h_base_flushed, xp1,           # ← xp1 = flushed base (t-1), xp2 = xp1 (t-2)
+       in_t, targ_t, b_p, t_p, f_map, total_g + batch_avg_g}
+    end
+    # Return {avg_loss, final_h_base, final_h_top}
+    {Nx.divide(elem(result, 1), seq_len), elem(result, 2), elem(result, 3), Nx.divide(elem(result, 11), seq_len)}
+  end
+
+  # 3. GRADIENT TAPE
+  defn compute_grad_and_step(batch_tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p) do
+    seq_len = Nx.axis_size(batch_tokens, 1) - 1
+    input_tokens = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+
+    {loss, raw_grads} = value_and_grad(top_p, fn p ->
+      # ⚡ FIX 2: Only unpack the 3 elements we now return, and return ONLY avg_loss for the gradient calculation
+      {avg_loss, _h_base_final, _h_top_final, avg_g} = 
+        compute_sequence_loss(input_tokens, target_tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, p)
+
+          # ⚡ THE "GENTLE PRESSURE" L1 SPARSITY PENALTY
+          # We no longer force a specific rhythm. We just apply a tiny "energy cost" to opening the gate.
+          # The Swish fusion will naturally pull the gate open when it needs linguistic features.
+          energy_cost = Nx.tensor(0.012, type: :f32) 
+          
+          # Penalty = energy_cost * avg_g
+          gentle_penalty = Nx.multiply(energy_cost, avg_g)
+    
+          # The optimizer must now balance minimizing Cosine Distance against conserving gate energy.
+          Nx.add(avg_loss, gentle_penalty)
+    end)
+    
+    # Run a clean pass to get final states
+    {_loss, final_h_base, final_h_top, avg_g} = 
+        compute_sequence_loss(input_tokens, target_tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p)
+
+    # ⚡ FIX 2 (Continued): Drop avg_g from the return
+    {loss, raw_grads, final_h_base, final_h_top, avg_g}
+  end
+
+  def grad_norms(grads) do
+    {g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv, g_mu1, g_mv1, g_mu2, g_mv2, 
+     g_gw, g_gb, g_spell_w, g_spell_b, g_valve_w, g_valve_b, g_out_w, g_out_b} = grads
+    
+    calc = fn g -> g |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4) end
+    
+    [
+      a_diag: calc.(g_a), b_u: calc.(g_bu), b_v: calc.(g_bv),
+      c_u: calc.(g_cu), c_v: calc.(g_cv), d_u: calc.(g_du), d_v: calc.(g_dv),
+      mx_u1: calc.(g_mu1), mx_v1: calc.(g_mv1), mx_u2: calc.(g_mu2), mx_v2: calc.(g_mv2),
+      gate_w: calc.(g_gw), gate_b: calc.(g_gb),
+      spell_w: calc.(g_spell_w), spell_b: calc.(g_spell_b), 
+      valve_w: calc.(g_valve_w), valve_b: calc.(g_valve_b), 
+      out_w: calc.(g_out_w), out_b: calc.(g_out_b)
+    ]
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM_Trainer, <<70, 79, 82, 49, 0, 0, 51, ...>>, {:grad_norms, 1}}
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Handles resuming and saving states for the Hierarchical DLM.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("✨ Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("✨ No checkpoints found for '#{run_prefix}'. Starting FRESH.")
+        {:fresh, 0}
+      end
+    else
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("🚀 Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+
+  # ⚡ NEW: Clean, centralized saving logic
+  def save_checkpoint(prefix, step, p, m, v, h_base, h_top) do
+    IO.puts("💾 Auto-Saving Checkpoint Step #{step}...")
+    
+    state = %{
+      params: DLM.Tree.map(p, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      ms: DLM.Tree.map(m, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      vs: DLM.Tree.map(v, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      step: step,
+      h_base: Nx.backend_copy(h_base, Nx.BinaryBackend),
+      h_top: Nx.backend_copy(h_top, Nx.BinaryBackend)
+    }
+    
+    File.write!("#{prefix}_checkpoint_step_#{step}.bin", :erlang.term_to_binary(state))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.CheckpointManager, <<70, 79, 82, 49, 0, 0, 24, ...>>, {:save_checkpoint, 7}}
+```
+
+```elixir
+run_prefix  = "v37_DLM_Phase_3_cosg_ec"  
+total_steps = 100000
+batch_size = 32
+seq_len = 128
+save_interval = 1000
+
+# ==============================================================================
+# 1. LOAD FROZEN FOUNDATIONS (Manifold + Physics Engine)
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1 Frozen Manifold...")
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+{cpu_embeds, _w1, _w2, _key} = phase1_p
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+IO.puts("⚙️ Loading Phase 2 Base SSM (Physics Engine)...")
+base_checkpoint = File.read!("v37_DLM_Phase_2_lr3e5_softnn_checkpoint_step_10000.bin") |> :erlang.binary_to_term()
+frozen_base_p = DLM.Tree.map(base_checkpoint, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# 2. INITIALIZE / RESUME TOP LEVEL
+# ==============================================================================
+{load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
+
+{starting_p, starting_m, starting_v, start_h_base, start_h_top} =
+  if load_path == :fresh do
+    IO.puts("✨ Igniting brand new Phase 3 Genesis weights...")
+    raw_p = DLM.Main_SSM_Genesis.init_params(42)
+    {raw_m, raw_v} = DLM.Main_SSM_Genesis.init_optimizer(raw_p)
+    
+    blank_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+    
+    {raw_p, raw_m, raw_v, blank_h, blank_h}
+  else
+    ckpt = File.read!(load_path) |> :erlang.binary_to_term()
+    blank_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+    
+    {
+      ckpt.params, 
+      ckpt.ms, 
+      ckpt.vs, 
+      Map.get(ckpt, :h_base, blank_h), 
+      Map.get(ckpt, :h_top, blank_h)
+    }
+  end
+
+# Push standard optimizer states to GPU
+p = DLM.Tree.map(starting_p, &Nx.backend_copy(&1, gpu))
+m = DLM.Tree.map(starting_m, &Nx.backend_copy(&1, gpu))
+v = DLM.Tree.map(starting_v, &Nx.backend_copy(&1, gpu))
+h_base = Nx.backend_copy(start_h_base, gpu)
+h_top = Nx.backend_copy(start_h_top, gpu)
+
+# ==============================================================================
+# 3. DATA STREAM
+# ==============================================================================
+IO.puts("🧠 Loading Curriculum...")
+dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+dataset = Nx.flatten(dataset_2d)
+data_stream = DLM.DataStreamer.build_infinite_stream(dataset, batch_size, 128)
+
+# ==============================================================================
+# 4. THE MASTER LOOP
+# ==============================================================================
+if start_step != :completed do
+  IO.puts("🚀 Entering Continuous Hierarchy Loop...")
+
+  {final_p, _m, _v, _hb, _ht} =
+    Enum.reduce(Enum.zip(start_step..(total_steps - 1), data_stream), {p, m, v, h_base, h_top}, 
+      fn {step, cpu_batch}, {cp, cm, cv, ch_base, ch_top} ->
+        
+        gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+
+        # ⚡ 1. Learning Rate Schedule
+        base_lr = 1.5e-4
+        min_lr = 1.5e-5
+        warmup_steps = 1000
+        
+        current_lr = 
+          if step < warmup_steps do
+            base_lr * (step / warmup_steps)
+          else
+            progress = min(max((step - warmup_steps) / (total_steps - warmup_steps), 0.0), 1.0)
+            min_lr + 0.5 * (base_lr - min_lr) * (1.0 + :math.cos(:math.pi() * progress))
+          end
+
+        # ⚡ 2. The Unified Gradient Tape
+        {loss_tensor, grads, next_h_base, next_h_top, avg_g_tensor} = 
+          DLM.Main_SSM_Trainer.compute_grad_and_step(
+            gpu_batch, ch_base, ch_top, frozen_base_p, frozen_map, cp
+          )
+
+        loss_val = Nx.to_number(loss_tensor)
+        g_mean = Nx.to_number(avg_g_tensor)
+        # ⚡ 3. Safety Check
+        if loss_val == :nan or loss_val > 20.0 do
+          IO.puts("⚠️ Step #{step}: NaN/Spike detected! Flushing Hidden States.")
+          clean_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+          {cp, cm, cv, clean_h, clean_h} # Skip update, flush memory
+        else
+          # ⚡ 4. Optimizer Step
+          lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+          step_tensor = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
+          
+          {up_p, up_m, up_v} = DLM.MuonHybrid.step(cp, grads, cm, cv, step_tensor, lr_tensor)
+
+          # ⚡ 5. Telemetry
+          if rem(step, 50) == 0 do
+            # Note: Since we use Cosine Distance now, loss is roughly between 0.0 (perfect) and 1.0 (orthogonal)
+            mem = :erlang.memory(:total) |> div(1024 * 1024)
+            
+            # Transfer grads to CPU for inspection to avoid slowing down the GPU tape
+            cpu_grads = DLM.Tree.map(grads, &Nx.backend_copy(&1, Nx.BinaryBackend))
+            norms = DLM.Main_SSM_Trainer.grad_norms(cpu_grads)
+            # In your telemetry block, after unpacking t_p
+            {_, _, _, _, _, _, _, _, _, _, _, _, gate_b, _, _, _, _, _, _} = up_p
+            gate_b_val = gate_b |> Nx.squeeze() |> Nx.to_number() |> Float.round(4)
+            IO.puts("   🔧 gate_b: #{gate_b_val}")
+            # Sort to find the hottest gradients
+            sorted_norms = Enum.sort_by(norms, fn {_k, v} -> v end, :desc)
+            {max_name, max_norm} = hd(sorted_norms)
+            
+            # Specifically check on our critical temporal and gating parameters
+            # a_norm = Keyword.get(norms, :a_diag)
+            valve_norm = Keyword.get(norms, :valve_w) # Watch the Swish syntax valve!
+            gate_norm = Keyword.get(norms, :gate_w)
+
+            IO.puts("➡️  Step #{step} | Cosine Loss: #{Float.round(loss_val, 4)} | LR: #{Float.round(current_lr, 6)} | 🚪 Gate mean: #{Float.round(g_mean * 100, 4)}%")
+            IO.puts("📐 GRADS -> Max: [#{max_name}: #{max_norm}] | Valve: #{valve_norm} | Gate: #{gate_norm} | RAM: #{mem}MB")
+          end
+
+          # ⚡ 6. Auto-Save
+          if rem(step, save_interval) == 0 and step > 0 do
+            DLM.CheckpointManager.save_checkpoint(run_prefix, step, up_p, up_m, up_v, next_h_base, next_h_top)
+            :erlang.garbage_collect(self())
+          end
+
+          {up_p, up_m, up_v, next_h_base, next_h_top}
+        end
+    end)
+
+  IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
+  DLM.CheckpointManager.save_checkpoint("#{run_prefix}_final", total_steps, final_p, m, v, h_base, h_top)
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+...
+📐 GRADS -> Max: [spell_w: 0.1389] | Valve: 0.017 | Gate: 0.0049 | RAM: 314MB
+   🔧 gate_b: -3.0262
+➡️  Step 7750 | Cosine Loss: 0.5251 | LR: 1.48e-4 | 🚪 Gate mean: 23.7487%
+📐 GRADS -> Max: [spell_w: 0.1943] | Valve: 0.0164 | Gate: 0.002 | RAM: 328MB
+   🔧 gate_b: -3.0277
+➡️  Step 7800 | Cosine Loss: 0.5216 | LR: 1.48e-4 | 🚪 Gate mean: 23.3272%
+📐 GRADS -> Max: [spell_w: 0.2391] | Valve: 0.017 | Gate: 0.0047 | RAM: 336MB
+   🔧 gate_b: -3.0291
+➡️  Step 7850 | Cosine Loss: 0.5356 | LR: 1.48e-4 | 🚪 Gate mean: 21.092%
+📐 GRADS -> Max: [spell_w: 0.368] | Valve: 0.0162 | Gate: 0.0031 | RAM: 315MB
+   🔧 gate_b: -3.031
+➡️  Step 7900 | Cosine Loss: 0.5225 | LR: 1.48e-4 | 🚪 Gate mean: 22.9775%
+📐 GRADS -> Max: [spell_w: 0.1949] | Valve: 0.0184 | Gate: 0.0019 | RAM: 316MB
+   🔧 gate_b: -3.0344
+➡️  Step 7950 | Cosine Loss: 0.543 | LR: 1.48e-4 | 🚪 Gate mean: 22.4871%
+📐 GRADS -> Max: [spell_w: 0.2395] | Valve: 0.017 | Gate: 0.003 | RAM: 329MB
+   🔧 gate_b: -3.0354
+➡️  Step 8000 | Cosine Loss: 0.5335 | LR: 1.48e-4 | 🚪 Gate mean: 23.3631%
+📐 GRADS -> Max: [spell_w: 0.1494] | Valve: 0.0153 | Gate: 0.001 | RAM: 317MB
+💾 Auto-Saving Checkpoint Step 8000...
+   🔧 gate_b: -3.0379
+➡️  Step 8050 | Cosine Loss: 0.5238 | LR: 1.48e-4 | 🚪 Gate mean: 22.9029%
+📐 GRADS -> Max: [spell_w: 0.2505] | Valve: 0.0149 | Gate: 0.0031 | RAM: 278MB
+   🔧 gate_b: -3.0412
+➡️  Step 8100 | Cosine Loss: 0.5263 | LR: 1.48e-4 | 🚪 Gate mean: 22.8445%
+📐 GRADS -> Max: [spell_w: 0.1595] | Valve: 0.0158 | Gate: 0.0025 | RAM: 266MB
+   🔧 gate_b: -3.0436
+➡️  Step 8150 | Cosine Loss: 0.5427 | LR: 1.48e-4 | 🚪 Gate mean: 22.3392%
+📐 GRADS -> Max: [spell_w: 0.1852] | Valve: 0.0156 | Gate: 0.0036 | RAM: 266MB
+   🔧 gate_b: -3.0444
+➡️  Step 8200 | Cosine Loss: 0.5426 | LR: 1.48e-4 | 🚪 Gate mean: 22.0894%
+📐 GRADS -> Max: [spell_w: 0.165] | Valve: 0.0145 | Gate: 0.0019 | RAM: 288MB
+   🔧 gate_b: -3.045
+➡️  Step 8250 | Cosine Loss: 0.5411 | LR: 1.48e-4 | 🚪 Gate mean: 22.0652%
+📐 GRADS -> Max: [spell_w: 0.1909] | Valve: 0.0147 | Gate: 0.0035 | RAM: 268MB
+   🔧 gate_b: -3.0467
+➡️  Step 8300 | Cosine Loss: 0.516 | LR: 1.48e-4 | 🚪 Gate mean: 24.1328%
+📐 GRADS -> Max: [spell_w: 0.1965] | Valve: 0.0162 | Gate: 0.0041 | RAM: 268MB
+   🔧 gate_b: -3.0492
+➡️  Step 8350 | Cosine Loss: 0.5344 | LR: 1.48e-4 | 🚪 Gate mean: 22.9575%
+📐 GRADS -> Max: [spell_w: 0.2808] | Valve: 0.0173 | Gate: 0.0035 | RAM: 268MB
+   🔧 gate_b: -3.0501
+➡️  Step 8400 | Cosine Loss: 0.5197 | LR: 1.48e-4 | 🚪 Gate mean: 24.3585%
+📐 GRADS -> Max: [spell_w: 0.1551] | Valve: 0.0187 | Gate: 0.0046 | RAM: 289MB
+   🔧 gate_b: -3.0522
+➡️  Step 8450 | Cosine Loss: 0.5222 | LR: 1.48e-4 | 🚪 Gate mean: 24.2293%
+📐 GRADS -> Max: [spell_w: 0.3636] | Valve: 0.0156 | Gate: 0.0023 | RAM: 269MB
+   🔧 gate_b: -3.0531
+➡️  Step 8500 | Cosine Loss: 0.5334 | LR: 1.48e-4 | 🚪 Gate mean: 22.1683%
+📐 GRADS -> Max: [spell_w: 0.2683] | Valve: 0.0139 | Gate: 0.0018 | RAM: 269MB
+   🔧 gate_b: -3.0544
+➡️  Step 8550 | Cosine Loss: 0.5299 | LR: 1.48e-4 | 🚪 Gate mean: 23.0846%
+📐 GRADS -> Max: [spell_w: 0.1548] | Valve: 0.0166 | Gate: 0.0025 | RAM: 291MB
+   🔧 gate_b: -3.0559
+➡️  Step 8600 | Cosine Loss: 0.5229 | LR: 1.48e-4 | 🚪 Gate mean: 23.6095%
+📐 GRADS -> Max: [spell_w: 0.1574] | Valve: 0.0166 | Gate: 0.0035 | RAM: 271MB
+   🔧 gate_b: -3.0602
+➡️  Step 8650 | Cosine Loss: 0.5266 | LR: 1.48e-4 | 🚪 Gate mean: 23.1628%
+📐 GRADS -> Max: [spell_w: 0.3007] | Valve: 0.0153 | Gate: 0.0019 | RAM: 271MB
+   🔧 gate_b: -3.0609
+➡️  Step 8700 | Cosine Loss: 0.5136 | LR: 1.48e-4 | 🚪 Gate mean: 24.7677%
+📐 GRADS -> Max: [spell_w: 0.1599] | Valve: 0.0177 | Gate: 0.0021 | RAM: 271MB
+   🔧 gate_b: -3.0637
+➡️  Step 8750 | Cosine Loss: 0.5237 | LR: 1.48e-4 | 🚪 Gate mean: 22.8212%
+📐 GRADS -> Max: [spell_w: 0.1458] | Valve: 0.0159 | Gate: 0.0029 | RAM: 284MB
+   🔧 gate_b: -3.0654
+➡️  Step 8800 | Cosine Loss: 0.526 | LR: 1.48e-4 | 🚪 Gate mean: 23.9595%
+📐 GRADS -> Max: [spell_w: 0.1986] | Valve: 0.017 | Gate: 0.0032 | RAM: 272MB
+   🔧 gate_b: -3.066
+➡️  Step 8850 | Cosine Loss: 0.5286 | LR: 1.48e-4 | 🚪 Gate mean: 22.688%
+📐 GRADS -> Max: [spell_w: 0.2054] | Valve: 0.0179 | Gate: 0.0051 | RAM: 272MB
+   🔧 gate_b: -3.0672
+➡️  Step 8900 | Cosine Loss: 0.5407 | LR: 1.48e-4 | 🚪 Gate mean: 23.2225%
+📐 GRADS -> Max: [spell_w: 0.2712] | Valve: 0.016 | Gate: 0.0026 | RAM: 286MB
+   🔧 gate_b: -3.0674
+➡️  Step 8950 | Cosine Loss: 0.5351 | LR: 1.48e-4 | 🚪 Gate mean: 24.5823%
+📐 GRADS -> Max: [spell_w: 0.2753] | Valve: 0.0168 | Gate: 0.0037 | RAM: 274MB
+   🔧 gate_b: -3.0714
+➡️  Step 9000 | Cosine Loss: 0.5241 | LR: 1.48e-4 | 🚪 Gate mean: 24.8072%
+📐 GRADS -> Max: [spell_w: 0.1351] | Valve: 0.0163 | Gate: 0.0033 | RAM: 274MB
+💾 Auto-Saving Checkpoint Step 9000...
+   🔧 gate_b: -3.074
+➡️  Step 9050 | Cosine Loss: 0.5212 | LR: 1.48e-4 | 🚪 Gate mean: 23.4149%
+📐 GRADS -> Max: [spell_w: 0.3107] | Valve: 0.0149 | Gate: 0.0035 | RAM: 295MB
+   🔧 gate_b: -3.0741
+➡️  Step 9100 | Cosine Loss: 0.5392 | LR: 1.48e-4 | 🚪 Gate mean: 23.9816%
+📐 GRADS -> Max: [spell_w: 0.1558] | Valve: 0.0154 | Gate: 0.0036 | RAM: 295MB
+   🔧 gate_b: -3.0744
+➡️  Step 9150 | Cosine Loss: 0.5417 | LR: 1.48e-4 | 🚪 Gate mean: 23.8405%
+📐 GRADS -> Max: [spell_w: 0.221] | Valve: 0.0174 | Gate: 0.0019 | RAM: 296MB
+   🔧 gate_b: -3.0762
+➡️  Step 9200 | Cosine Loss: 0.5284 | LR: 1.48e-4 | 🚪 Gate mean: 24.238%
+📐 GRADS -> Max: [spell_w: 0.277] | Valve: 0.0151 | Gate: 0.0027 | RAM: 304MB
+   🔧 gate_b: -3.0782
+➡️  Step 9250 | Cosine Loss: 0.5347 | LR: 1.48e-4 | 🚪 Gate mean: 23.4848%
+📐 GRADS -> Max: [spell_w: 0.198] | Valve: 0.0159 | Gate: 0.004 | RAM: 313MB
+   🔧 gate_b: -3.0805
+➡️  Step 9300 | Cosine Loss: 0.5297 | LR: 1.48e-4 | 🚪 Gate mean: 22.9255%
+📐 GRADS -> Max: [spell_w: 0.2205] | Valve: 0.016 | Gate: 0.0037 | RAM: 321MB
+   🔧 gate_b: -3.0817
+➡️  Step 9350 | Cosine Loss: 0.5426 | LR: 1.48e-4 | 🚪 Gate mean: 23.3735%
+📐 GRADS -> Max: [spell_w: 0.1538] | Valve: 0.016 | Gate: 0.0035 | RAM: 330MB
+   🔧 gate_b: -3.0857
+➡️  Step 9400 | Cosine Loss: 0.5357 | LR: 1.48e-4 | 🚪 Gate mean: 23.0096%
+📐 GRADS -> Max: [spell_w: 0.2453] | Valve: 0.0142 | Gate: 0.005 | RAM: 338MB
+   🔧 gate_b: -3.0844
+➡️  Step 9450 | Cosine Loss: 0.5404 | LR: 1.48e-4 | 🚪 Gate mean: 23.0504%
+📐 GRADS -> Max: [spell_w: 0.2429] | Valve: 0.0147 | Gate: 0.0012 | RAM: 347MB
+   🔧 gate_b: -3.0859
+➡️  Step 9500 | Cosine Loss: 0.5294 | LR: 1.48e-4 | 🚪 Gate mean: 24.9053%
+📐 GRADS -> Max: [spell_w: 0.1818] | Valve: 0.0158 | Gate: 0.0022 | RAM: 355MB
+   🔧 gate_b: -3.0869
+➡️  Step 9550 | Cosine Loss: 0.5341 | LR: 1.48e-4 | 🚪 Gate mean: 25.5509%
+📐 GRADS -> Max: [spell_w: 0.1235] | Valve: 0.0156 | Gate: 0.0025 | RAM: 363MB
+   🔧 gate_b: -3.0889
+➡️  Step 9600 | Cosine Loss: 0.5279 | LR: 1.48e-4 | 🚪 Gate mean: 25.3055%
+📐 GRADS -> Max: [spell_w: 0.3045] | Valve: 0.0163 | Gate: 0.0021 | RAM: 372MB
+   🔧 gate_b: -3.0901
+➡️  Step 9650 | Cosine Loss: 0.536 | LR: 1.47e-4 | 🚪 Gate mean: 23.0926%
+📐 GRADS -> Max: [spell_w: 0.2644] | Valve: 0.0154 | Gate: 0.0027 | RAM: 380MB
+   🔧 gate_b: -3.0925
+➡️  Step 9700 | Cosine Loss: 0.5238 | LR: 1.47e-4 | 🚪 Gate mean: 24.9154%
+📐 GRADS -> Max: [spell_w: 0.314] | Valve: 0.0173 | Gate: 0.0032 | RAM: 389MB
+   🔧 gate_b: -3.092
+➡️  Step 9750 | Cosine Loss: 0.5154 | LR: 1.47e-4 | 🚪 Gate mean: 25.5331%
+📐 GRADS -> Max: [spell_w: 0.1716] | Valve: 0.0172 | Gate: 0.0026 | RAM: 397MB
+   🔧 gate_b: -3.0939
+➡️  Step 9800 | Cosine Loss: 0.5271 | LR: 1.47e-4 | 🚪 Gate mean: 24.8986%
+📐 GRADS -> Max: [spell_w: 0.1836] | Valve: 0.016 | Gate: 0.0024 | RAM: 406MB
+   🔧 gate_b: -3.095
+➡️  Step 9850 | Cosine Loss: 0.5226 | LR: 1.47e-4 | 🚪 Gate mean: 25.2074%
+📐 GRADS -> Max: [spell_w: 0.2644] | Valve: 0.0149 | Gate: 0.0046 | RAM: 414MB
+   🔧 gate_b: -3.0966
+➡️  Step 9900 | Cosine Loss: 0.5487 | LR: 1.47e-4 | 🚪 Gate mean: 24.6399%
+📐 GRADS -> Max: [spell_w: 0.1855] | Valve: 0.0164 | Gate: 0.0012 | RAM: 423MB
+   🔧 gate_b: -3.0984
+➡️  Step 9950 | Cosine Loss: 0.5257 | LR: 1.47e-4 | 🚪 Gate mean: 24.5433%
+📐 GRADS -> Max: [spell_w: 0.1588] | Valve: 0.0155 | Gate: 0.0015 | RAM: 431MB
+   🔧 gate_b: -3.0992
+➡️  Step 10000 | Cosine Loss: 0.5356 | LR: 1.47e-4 | 🚪 Gate mean: 25.0876%
+📐 GRADS -> Max: [spell_w: 0.1516] | Valve: 0.0176 | Gate: 0.0024 | RAM: 295MB
+💾 Auto-Saving Checkpoint Step 10000...
+   🔧 gate_b: -3.1
+➡️  Step 10050 | Cosine Loss: 0.5075 | LR: 1.47e-4 | 🚪 Gate mean: 25.0458%
+📐 GRADS -> Max: [spell_w: 0.1685] | Valve: 0.0164 | Gate: 0.0029 | RAM: 281MB
+   🔧 gate_b: -3.1019
+➡️  Step 10100 | Cosine Loss: 0.5319 | LR: 1.47e-4 | 🚪 Gate mean: 24.4962%
+📐 GRADS -> Max: [spell_w: 0.3013] | Valve: 0.0187 | Gate: 0.0022 | RAM: 282MB
+   🔧 gate_b: -3.1038
+➡️  Step 10150 | Cosine Loss: 0.5306 | LR: 1.47e-4 | 🚪 Gate mean: 23.9176%
+📐 GRADS -> Max: [spell_w: 0.1556] | Valve: 0.0147 | Gate: 0.0021 | RAM: 290MB
+   🔧 gate_b: -3.1058
+➡️  Step 10200 | Cosine Loss: 0.5194 | LR: 1.47e-4 | 🚪 Gate mean: 24.7354%
+📐 GRADS -> Max: [spell_w: 0.2003] | Valve: 0.0168 | Gate: 0.0028 | RAM: 299MB
+   🔧 gate_b: -3.1076
+➡️  Step 10250 | Cosine Loss: 0.5191 | LR: 1.47e-4 | 🚪 Gate mean: 25.7347%
+📐 GRADS -> Max: [spell_w: 0.2594] | Valve: 0.0168 | Gate: 0.005 | RAM: 307MB
+   🔧 gate_b: -3.1086
+➡️  Step 10300 | Cosine Loss: 0.5333 | LR: 1.47e-4 | 🚪 Gate mean: 24.5825%
+📐 GRADS -> Max: [spell_w: 0.5045] | Valve: 0.0185 | Gate: 0.0043 | RAM: 298MB
+   🔧 gate_b: -3.1098
+➡️  Step 10350 | Cosine Loss: 0.5107 | LR: 1.47e-4 | 🚪 Gate mean: 26.0427%
+📐 GRADS -> Max: [spell_w: 0.2847] | Valve: 0.0174 | Gate: 0.0037 | RAM: 286MB
+   🔧 gate_b: -3.1123
+➡️  Step 10400 | Cosine Loss: 0.5375 | LR: 1.47e-4 | 🚪 Gate mean: 24.7053%
+📐 GRADS -> Max: [spell_w: 0.2262] | Valve: 0.016 | Gate: 0.0016 | RAM: 286MB
+   🔧 gate_b: -3.1123
+➡️  Step 10450 | Cosine Loss: 0.5336 | LR: 1.47e-4 | 🚪 Gate mean: 24.4824%
+📐 GRADS -> Max: [spell_w: 0.2226] | Valve: 0.0171 | Gate: 0.0045 | RAM: 307MB
+   🔧 gate_b: -3.1137
+➡️  Step 10500 | Cosine Loss: 0.5093 | LR: 1.47e-4 | 🚪 Gate mean: 25.3194%
+📐 GRADS -> Max: [spell_w: 0.238] | Valve: 0.0167 | Gate: 0.0047 | RAM: 287MB
+   🔧 gate_b: -3.1142
+➡️  Step 10550 | Cosine Loss: 0.5242 | LR: 1.47e-4 | 🚪 Gate mean: 24.6163%
+📐 GRADS -> Max: [spell_w: 0.1803] | Valve: 0.0172 | Gate: 0.0048 | RAM: 287MB
+   🔧 gate_b: -3.1164
+➡️  Step 10600 | Cosine Loss: 0.5202 | LR: 1.47e-4 | 🚪 Gate mean: 26.0142%
+📐 GRADS -> Max: [spell_w: 0.1841] | Valve: 0.0168 | Gate: 0.0061 | RAM: 301MB
+   🔧 gate_b: -3.1198
+➡️  Step 10650 | Cosine Loss: 0.5604 | LR: 1.47e-4 | 🚪 Gate mean: 23.7434%
+📐 GRADS -> Max: [spell_w: 0.2755] | Valve: 0.0377 | Gate: 0.0059 | RAM: 288MB
+   🔧 gate_b: -3.1196
+➡️  Step 10700 | Cosine Loss: 0.5257 | LR: 1.47e-4 | 🚪 Gate mean: 25.3391%
+📐 GRADS -> Max: [spell_w: 0.2554] | Valve: 0.0172 | Gate: 0.0024 | RAM: 289MB
+   🔧 gate_b: -3.12
+➡️  Step 10750 | Cosine Loss: 0.5432 | LR: 1.47e-4 | 🚪 Gate mean: 24.8897%
+📐 GRADS -> Max: [spell_w: 0.1905] | Valve: 0.018 | Gate: 0.0024 | RAM: 310MB
+   🔧 gate_b: -3.1219
+➡️  Step 10800 | Cosine Loss: 0.5372 | LR: 1.47e-4 | 🚪 Gate mean: 24.5923%
+📐 GRADS -> Max: [spell_w: 0.2092] | Valve: 0.0152 | Gate: 0.0029 | RAM: 310MB
+   🔧 gate_b: -3.1234
+➡️  Step 10850 | Cosine Loss: 0.5367 | LR: 1.47e-4 | 🚪 Gate mean: 25.3609%
+📐 GRADS -> Max: [spell_w: 0.2457] | Valve: 0.0159 | Gate: 0.0052 | RAM: 290MB
+   🔧 gate_b: -3.1256
+➡️  Step 10900 | Cosine Loss: 0.5333 | LR: 1.47e-4 | 🚪 Gate mean: 25.2651%
+📐 GRADS -> Max: [spell_w: 0.1854] | Valve: 0.0168 | Gate: 0.0044 | RAM: 290MB
+   🔧 gate_b: -3.1268
+➡️  Step 10950 | Cosine Loss: 0.5346 | LR: 1.47e-4 | 🚪 Gate mean: 25.4283%
+📐 GRADS -> Max: [spell_w: 0.1472] | Valve: 0.016 | Gate: 0.0023 | RAM: 304MB
+   🔧 gate_b: -3.1286
+➡️  Step 11000 | Cosine Loss: 0.5395 | LR: 1.47e-4 | 🚪 Gate mean: 25.2165%
+📐 GRADS -> Max: [spell_w: 0.2518] | Valve: 0.0158 | Gate: 0.0066 | RAM: 291MB
+💾 Auto-Saving Checkpoint Step 11000...
+   🔧 gate_b: -3.1309
+➡️  Step 11050 | Cosine Loss: 0.5331 | LR: 1.47e-4 | 🚪 Gate mean: 25.0981%
+📐 GRADS -> Max: [spell_w: 0.2685] | Valve: 0.0162 | Gate: 0.0022 | RAM: 305MB
+   🔧 gate_b: -3.1328
+➡️  Step 11100 | Cosine Loss: 0.5416 | LR: 1.47e-4 | 🚪 Gate mean: 24.8191%
+📐 GRADS -> Max: [spell_w: 0.3687] | Valve: 0.0172 | Gate: 0.0014 | RAM: 292MB
+   🔧 gate_b: -3.1332
+➡️  Step 11150 | Cosine Loss: 0.5438 | LR: 1.47e-4 | 🚪 Gate mean: 26.283%
+📐 GRADS -> Max: [spell_w: 0.2651] | Valve: 0.0162 | Gate: 0.0015 | RAM: 293MB
+   🔧 gate_b: -3.1358
+➡️  Step 11200 | Cosine Loss: 0.5177 | LR: 1.46e-4 | 🚪 Gate mean: 25.1044%
+📐 GRADS -> Max: [spell_w: 0.3378] | Valve: 0.0174 | Gate: 0.004 | RAM: 314MB
+   🔧 gate_b: -3.137
+➡️  Step 11250 | Cosine Loss: 0.5251 | LR: 1.46e-4 | 🚪 Gate mean: 25.9881%
+📐 GRADS -> Max: [spell_w: 0.3674] | Valve: 0.0158 | Gate: 0.0014 | RAM: 294MB
+   🔧 gate_b: -3.1387
+➡️  Step 11300 | Cosine Loss: 0.541 | LR: 1.46e-4 | 🚪 Gate mean: 24.0927%
+📐 GRADS -> Max: [spell_w: 0.2267] | Valve: 0.0171 | Gate: 0.0031 | RAM: 294MB
+   🔧 gate_b: -3.1391
+➡️  Step 11350 | Cosine Loss: 0.5263 | LR: 1.46e-4 | 🚪 Gate mean: 25.9125%
+📐 GRADS -> Max: [spell_w: 0.3295] | Valve: 0.0166 | Gate: 0.0064 | RAM: 315MB
+   🔧 gate_b: -3.1408
+➡️  Step 11400 | Cosine Loss: 0.526 | LR: 1.46e-4 | 🚪 Gate mean: 25.1227%
+📐 GRADS -> Max: [spell_w: 0.3489] | Valve: 0.0193 | Gate: 0.0024 | RAM: 295MB
+   🔧 gate_b: -3.1432
+➡️  Step 11450 | Cosine Loss: 0.5359 | LR: 1.46e-4 | 🚪 Gate mean: 25.2634%
+📐 GRADS -> Max: [spell_w: 0.2781] | Valve: 0.0171 | Gate: 0.0027 | RAM: 295MB
+   🔧 gate_b: -3.1445
+➡️  Step 11500 | Cosine Loss: 0.5269 | LR: 1.46e-4 | 🚪 Gate mean: 26.3152%
+📐 GRADS -> Max: [spell_w: 0.2131] | Valve: 0.0185 | Gate: 0.003 | RAM: 317MB
+   🔧 gate_b: -3.1456
+➡️  Step 11550 | Cosine Loss: 0.5227 | LR: 1.46e-4 | 🚪 Gate mean: 25.9801%
+📐 GRADS -> Max: [spell_w: 0.3314] | Valve: 0.0158 | Gate: 0.0033 | RAM: 297MB
+   🔧 gate_b: -3.1478
+➡️  Step 11600 | Cosine Loss: 0.5351 | LR: 1.46e-4 | 🚪 Gate mean: 25.7334%
+📐 GRADS -> Max: [spell_w: 0.2251] | Valve: 0.0181 | Gate: 0.0044 | RAM: 300MB
+   🔧 gate_b: -3.1479
+➡️  Step 11650 | Cosine Loss: 0.521 | LR: 1.46e-4 | 🚪 Gate mean: 25.9346%
+📐 GRADS -> Max: [spell_w: 0.1654] | Valve: 0.016 | Gate: 0.0027 | RAM: 321MB
+   🔧 gate_b: -3.1496
+➡️  Step 11700 | Cosine Loss: 0.5126 | LR: 1.46e-4 | 🚪 Gate mean: 26.7853%
+📐 GRADS -> Max: [spell_w: 0.2405] | Valve: 0.0166 | Gate: 0.0027 | RAM: 301MB
+   🔧 gate_b: -3.1523
+➡️  Step 11750 | Cosine Loss: 0.5106 | LR: 1.46e-4 | 🚪 Gate mean: 25.4291%
+📐 GRADS -> Max: [spell_w: 0.2374] | Valve: 0.0171 | Gate: 0.005 | RAM: 301MB
+   🔧 gate_b: -3.1539
+➡️  Step 11800 | Cosine Loss: 0.5188 | LR: 1.46e-4 | 🚪 Gate mean: 26.1957%
+📐 GRADS -> Max: [spell_w: 0.2133] | Valve: 0.018 | Gate: 0.0024 | RAM: 322MB
+   🔧 gate_b: -3.1553
+➡️  Step 11850 | Cosine Loss: 0.5258 | LR: 1.46e-4 | 🚪 Gate mean: 26.0723%
+📐 GRADS -> Max: [spell_w: 0.2315] | Valve: 0.017 | Gate: 0.0018 | RAM: 302MB
+   🔧 gate_b: -3.157
+➡️  Step 11900 | Cosine Loss: 0.5409 | LR: 1.46e-4 | 🚪 Gate mean: 25.7566%
+📐 GRADS -> Max: [spell_w: 0.1951] | Valve: 0.0154 | Gate: 0.0024 | RAM: 297MB
+   🔧 gate_b: -3.1583
+➡️  Step 11950 | Cosine Loss: 0.5296 | LR: 1.46e-4 | 🚪 Gate mean: 25.4042%
+📐 GRADS -> Max: [spell_w: 0.3512] | Valve: 0.0194 | Gate: 0.0038 | RAM: 297MB
+   🔧 gate_b: -3.1594
+➡️  Step 12000 | Cosine Loss: 0.5332 | LR: 1.46e-4 | 🚪 Gate mean: 25.3923%
+📐 GRADS -> Max: [spell_w: 0.2529] | Valve: 0.016 | Gate: 0.0034 | RAM: 298MB
+💾 Auto-Saving Checkpoint Step 12000...
+   🔧 gate_b: -3.1613
+➡️  Step 12050 | Cosine Loss: 0.5288 | LR: 1.46e-4 | 🚪 Gate mean: 25.5167%
+📐 GRADS -> Max: [spell_w: 0.2953] | Valve: 0.016 | Gate: 0.0026 | RAM: 312MB
+   🔧 gate_b: -3.1612
+➡️  Step 12100 | Cosine Loss: 0.5335 | LR: 1.46e-4 | 🚪 Gate mean: 26.2758%
+📐 GRADS -> Max: [spell_w: 0.2222] | Valve: 0.0167 | Gate: 0.0026 | RAM: 325MB
+   🔧 gate_b: -3.1641
+➡️  Step 12150 | Cosine Loss: 0.522 | LR: 1.46e-4 | 🚪 Gate mean: 25.3212%
+📐 GRADS -> Max: [spell_w: 0.5442] | Valve: 0.0171 | Gate: 0.0106 | RAM: 325MB
+   🔧 gate_b: -3.1652
+➡️  Step 12200 | Cosine Loss: 0.5316 | LR: 1.46e-4 | 🚪 Gate mean: 27.4342%
+📐 GRADS -> Max: [spell_w: 0.2245] | Valve: 0.0197 | Gate: 0.0026 | RAM: 326MB
+   🔧 gate_b: -3.1657
+➡️  Step 12250 | Cosine Loss: 0.5212 | LR: 1.46e-4 | 🚪 Gate mean: 26.8555%
+📐 GRADS -> Max: [spell_w: 0.1834] | Valve: 0.0162 | Gate: 0.0155 | RAM: 326MB
+   🔧 gate_b: -3.1684
+➡️  Step 12300 | Cosine Loss: 0.5146 | LR: 1.46e-4 | 🚪 Gate mean: 28.1704%
+📐 GRADS -> Max: [spell_w: 0.3241] | Valve: 0.0164 | Gate: 0.0071 | RAM: 327MB
+   🔧 gate_b: -3.1713
+➡️  Step 12350 | Cosine Loss: 0.5137 | LR: 1.46e-4 | 🚪 Gate mean: 27.0646%
+📐 GRADS -> Max: [spell_w: 0.2411] | Valve: 0.0198 | Gate: 0.006 | RAM: 335MB
+   🔧 gate_b: -3.1725
+➡️  Step 12400 | Cosine Loss: 0.5402 | LR: 1.46e-4 | 🚪 Gate mean: 26.1478%
+📐 GRADS -> Max: [spell_w: 0.1864] | Valve: 0.0164 | Gate: 0.0019 | RAM: 343MB
+   🔧 gate_b: -3.1743
+➡️  Step 12450 | Cosine Loss: 0.5194 | LR: 1.46e-4 | 🚪 Gate mean: 26.4289%
+📐 GRADS -> Max: [spell_w: 0.1395] | Valve: 0.0159 | Gate: 0.003 | RAM: 352MB
+   🔧 gate_b: -3.1756
+➡️  Step 12500 | Cosine Loss: 0.5251 | LR: 1.46e-4 | 🚪 Gate mean: 26.8388%
+📐 GRADS -> Max: [spell_w: 0.2184] | Valve: 0.0175 | Gate: 0.0098 | RAM: 360MB
+   🔧 gate_b: -3.1781
+➡️  Step 12550 | Cosine Loss: 0.5232 | LR: 1.46e-4 | 🚪 Gate mean: 26.0292%
+📐 GRADS -> Max: [spell_w: 0.1823] | Valve: 0.0177 | Gate: 0.0052 | RAM: 369MB
+   🔧 gate_b: -3.1785
+➡️  Step 12600 | Cosine Loss: 0.5223 | LR: 1.45e-4 | 🚪 Gate mean: 26.7108%
+📐 GRADS -> Max: [spell_w: 0.1817] | Valve: 0.0157 | Gate: 0.0049 | RAM: 377MB
+   🔧 gate_b: -3.1779
+➡️  Step 12650 | Cosine Loss: 0.5225 | LR: 1.45e-4 | 🚪 Gate mean: 27.0451%
+📐 GRADS -> Max: [spell_w: 0.2488] | Valve: 0.0175 | Gate: 0.0034 | RAM: 385MB
+   🔧 gate_b: -3.1788
+➡️  Step 12700 | Cosine Loss: 0.5074 | LR: 1.45e-4 | 🚪 Gate mean: 28.0517%
+📐 GRADS -> Max: [spell_w: 0.2365] | Valve: 0.0171 | Gate: 0.003 | RAM: 394MB
+   🔧 gate_b: -3.1791
+➡️  Step 12750 | Cosine Loss: 0.5328 | LR: 1.45e-4 | 🚪 Gate mean: 27.1865%
+📐 GRADS -> Max: [spell_w: 0.3157] | Valve: 0.0162 | Gate: 0.003 | RAM: 402MB
+   🔧 gate_b: -3.1827
+➡️  Step 12800 | Cosine Loss: 0.5124 | LR: 1.45e-4 | 🚪 Gate mean: 27.1313%
+📐 GRADS -> Max: [spell_w: 0.218] | Valve: 0.0171 | Gate: 0.0101 | RAM: 411MB
+   🔧 gate_b: -3.1847
+➡️  Step 12850 | Cosine Loss: 0.5252 | LR: 1.45e-4 | 🚪 Gate mean: 26.0692%
+📐 GRADS -> Max: [spell_w: 0.1771] | Valve: 0.0169 | Gate: 0.0042 | RAM: 419MB
+   🔧 gate_b: -3.1866
+➡️  Step 12900 | Cosine Loss: 0.5256 | LR: 1.45e-4 | 🚪 Gate mean: 26.226%
+📐 GRADS -> Max: [spell_w: 0.2284] | Valve: 0.0175 | Gate: 0.0027 | RAM: 428MB
+   🔧 gate_b: -3.1887
+➡️  Step 12950 | Cosine Loss: 0.5528 | LR: 1.45e-4 | 🚪 Gate mean: 26.3501%
+📐 GRADS -> Max: [spell_w: 0.1506] | Valve: 0.0173 | Gate: 0.0032 | RAM: 436MB
+   🔧 gate_b: -3.1879
+➡️  Step 13000 | Cosine Loss: 0.5263 | LR: 1.45e-4 | 🚪 Gate mean: 27.0366%
+📐 GRADS -> Max: [spell_w: 0.2367] | Valve: 0.0174 | Gate: 0.0029 | RAM: 445MB
+💾 Auto-Saving Checkpoint Step 13000...
+   🔧 gate_b: -3.1903
+➡️  Step 13050 | Cosine Loss: 0.5227 | LR: 1.45e-4 | 🚪 Gate mean: 26.6419%
+📐 GRADS -> Max: [spell_w: 0.1768] | Valve: 0.0154 | Gate: 0.0035 | RAM: 325MB
+   🔧 gate_b: -3.191
+➡️  Step 13100 | Cosine Loss: 0.52 | LR: 1.45e-4 | 🚪 Gate mean: 26.636%
+📐 GRADS -> Max: [spell_w: 0.2895] | Valve: 0.0169 | Gate: 0.0036 | RAM: 325MB
+   🔧 gate_b: -3.1929
+➡️  Step 13150 | Cosine Loss: 0.5102 | LR: 1.45e-4 | 🚪 Gate mean: 27.5324%
+📐 GRADS -> Max: [spell_w: 0.2578] | Valve: 0.0177 | Gate: 0.0057 | RAM: 326MB
+   🔧 gate_b: -3.195
+➡️  Step 13200 | Cosine Loss: 0.5302 | LR: 1.45e-4 | 🚪 Gate mean: 27.2254%
+📐 GRADS -> Max: [spell_w: 0.1764] | Valve: 0.0153 | Gate: 0.0032 | RAM: 334MB
+   🔧 gate_b: -3.1989
+➡️  Step 13250 | Cosine Loss: 0.5297 | LR: 1.45e-4 | 🚪 Gate mean: 26.606%
+📐 GRADS -> Max: [spell_w: 0.1959] | Valve: 0.0185 | Gate: 0.0046 | RAM: 343MB
+   🔧 gate_b: -3.1994
+➡️  Step 13300 | Cosine Loss: 0.5309 | LR: 1.45e-4 | 🚪 Gate mean: 26.0393%
+📐 GRADS -> Max: [spell_w: 0.2702] | Valve: 0.0178 | Gate: 0.004 | RAM: 351MB
+   🔧 gate_b: -3.1997
+➡️  Step 13350 | Cosine Loss: 0.5114 | LR: 1.45e-4 | 🚪 Gate mean: 27.9141%
+📐 GRADS -> Max: [spell_w: 0.2804] | Valve: 0.0174 | Gate: 0.005 | RAM: 360MB
+   🔧 gate_b: -3.2019
+➡️  Step 13400 | Cosine Loss: 0.5366 | LR: 1.45e-4 | 🚪 Gate mean: 26.829%
+📐 GRADS -> Max: [spell_w: 0.2308] | Valve: 0.0168 | Gate: 0.0037 | RAM: 368MB
+   🔧 gate_b: -3.2038
+➡️  Step 13450 | Cosine Loss: 0.5122 | LR: 1.45e-4 | 🚪 Gate mean: 27.1573%
+📐 GRADS -> Max: [spell_w: 0.2854] | Valve: 0.0169 | Gate: 0.0089 | RAM: 376MB
+   🔧 gate_b: -3.2046
+➡️  Step 13500 | Cosine Loss: 0.5174 | LR: 1.45e-4 | 🚪 Gate mean: 27.8804%
+📐 GRADS -> Max: [spell_w: 0.1829] | Valve: 0.0174 | Gate: 0.002 | RAM: 385MB
+   🔧 gate_b: -3.207
+➡️  Step 13550 | Cosine Loss: 0.5275 | LR: 1.45e-4 | 🚪 Gate mean: 27.1924%
+📐 GRADS -> Max: [spell_w: 0.1941] | Valve: 0.0175 | Gate: 0.0065 | RAM: 394MB
+   🔧 gate_b: -3.209
+➡️  Step 13600 | Cosine Loss: 0.5115 | LR: 1.45e-4 | 🚪 Gate mean: 28.4251%
+📐 GRADS -> Max: [spell_w: 0.1941] | Valve: 0.0173 | Gate: 0.0043 | RAM: 402MB
+   🔧 gate_b: -3.2106
+➡️  Step 13650 | Cosine Loss: 0.521 | LR: 1.45e-4 | 🚪 Gate mean: 25.7041%
+📐 GRADS -> Max: [spell_w: 0.1956] | Valve: 0.0165 | Gate: 0.0055 | RAM: 410MB
+   🔧 gate_b: -3.2135
+➡️  Step 13700 | Cosine Loss: 0.5274 | LR: 1.45e-4 | 🚪 Gate mean: 27.0617%
+📐 GRADS -> Max: [spell_w: 0.1908] | Valve: 0.018 | Gate: 0.0036 | RAM: 419MB
+   🔧 gate_b: -3.2148
+➡️  Step 13750 | Cosine Loss: 0.5248 | LR: 1.45e-4 | 🚪 Gate mean: 27.2431%
+📐 GRADS -> Max: [spell_w: 0.2861] | Valve: 0.0174 | Gate: 0.0031 | RAM: 427MB
+   🔧 gate_b: -3.2158
+➡️  Step 13800 | Cosine Loss: 0.5331 | LR: 1.45e-4 | 🚪 Gate mean: 27.0717%
+📐 GRADS -> Max: [spell_w: 0.1843] | Valve: 0.0176 | Gate: 0.0039 | RAM: 436MB
+   🔧 gate_b: -3.2158
+➡️  Step 13850 | Cosine Loss: 0.5074 | LR: 1.44e-4 | 🚪 Gate mean: 28.1679%
+📐 GRADS -> Max: [spell_w: 0.2703] | Valve: 0.0182 | Gate: 0.006 | RAM: 444MB
+   🔧 gate_b: -3.2186
+➡️  Step 13900 | Cosine Loss: 0.5282 | LR: 1.44e-4 | 🚪 Gate mean: 26.8573%
+📐 GRADS -> Max: [spell_w: 0.1726] | Valve: 0.0162 | Gate: 0.0049 | RAM: 453MB
+   🔧 gate_b: -3.2209
+➡️  Step 13950 | Cosine Loss: 0.5214 | LR: 1.44e-4 | 🚪 Gate mean: 26.3973%
+📐 GRADS -> Max: [spell_w: 0.2892] | Valve: 0.0167 | Gate: 0.0048 | RAM: 461MB
+   🔧 gate_b: -3.2221
+➡️  Step 14000 | Cosine Loss: 0.5323 | LR: 1.44e-4 | 🚪 Gate mean: 27.225%
+📐 GRADS -> Max: [spell_w: 0.2205] | Valve: 0.0149 | Gate: 0.0037 | RAM: 470MB
+💾 Auto-Saving Checkpoint Step 14000...
+   🔧 gate_b: -3.2233
+➡️  Step 14050 | Cosine Loss: 0.5344 | LR: 1.44e-4 | 🚪 Gate mean: 27.269%
+📐 GRADS -> Max: [spell_w: 0.252] | Valve: 0.0156 | Gate: 0.0052 | RAM: 319MB
+   🔧 gate_b: -3.2241
+➡️  Step 14100 | Cosine Loss: 0.5235 | LR: 1.44e-4 | 🚪 Gate mean: 26.8723%
+📐 GRADS -> Max: [spell_w: 0.1793] | Valve: 0.0161 | Gate: 0.0018 | RAM: 319MB
+   🔧 gate_b: -3.2271
+➡️  Step 14150 | Cosine Loss: 0.5324 | LR: 1.44e-4 | 🚪 Gate mean: 26.8568%
+📐 GRADS -> Max: [spell_w: 0.3064] | Valve: 0.0188 | Gate: 0.0041 | RAM: 328MB
+   🔧 gate_b: -3.2283
+➡️  Step 14200 | Cosine Loss: 0.5248 | LR: 1.44e-4 | 🚪 Gate mean: 26.5673%
+📐 GRADS -> Max: [spell_w: 0.4175] | Valve: 0.0183 | Gate: 0.0031 | RAM: 337MB
+   🔧 gate_b: -3.2288
+➡️  Step 14250 | Cosine Loss: 0.5213 | LR: 1.44e-4 | 🚪 Gate mean: 27.2408%
+📐 GRADS -> Max: [spell_w: 0.3014] | Valve: 0.0172 | Gate: 0.0036 | RAM: 345MB
+   🔧 gate_b: -3.2314
+➡️  Step 14300 | Cosine Loss: 0.5177 | LR: 1.44e-4 | 🚪 Gate mean: 28.0941%
+📐 GRADS -> Max: [spell_w: 0.2497] | Valve: 0.0164 | Gate: 0.0049 | RAM: 353MB
+   🔧 gate_b: -3.2327
+➡️  Step 14350 | Cosine Loss: 0.5212 | LR: 1.44e-4 | 🚪 Gate mean: 27.3159%
+📐 GRADS -> Max: [spell_w: 0.1904] | Valve: 0.0196 | Gate: 0.0067 | RAM: 362MB
+   🔧 gate_b: -3.2349
+➡️  Step 14400 | Cosine Loss: 0.5269 | LR: 1.44e-4 | 🚪 Gate mean: 27.4298%
+📐 GRADS -> Max: [spell_w: 0.2202] | Valve: 0.0168 | Gate: 0.0023 | RAM: 318MB
+   🔧 gate_b: -3.2355
+➡️  Step 14450 | Cosine Loss: 0.5129 | LR: 1.44e-4 | 🚪 Gate mean: 28.0206%
+📐 GRADS -> Max: [spell_w: 0.1818] | Valve: 0.0186 | Gate: 0.0073 | RAM: 319MB
+   🔧 gate_b: -3.2382
+➡️  Step 14500 | Cosine Loss: 0.5277 | LR: 1.44e-4 | 🚪 Gate mean: 27.3418%
+📐 GRADS -> Max: [spell_w: 0.2079] | Valve: 0.017 | Gate: 0.007 | RAM: 319MB
+   🔧 gate_b: -3.2384
+➡️  Step 14550 | Cosine Loss: 0.5296 | LR: 1.44e-4 | 🚪 Gate mean: 27.1486%
+📐 GRADS -> Max: [spell_w: 0.2685] | Valve: 0.016 | Gate: 0.006 | RAM: 320MB
+   🔧 gate_b: -3.2394
+➡️  Step 14600 | Cosine Loss: 0.5144 | LR: 1.44e-4 | 🚪 Gate mean: 27.9636%
+📐 GRADS -> Max: [spell_w: 0.3817] | Valve: 0.022 | Gate: 0.0057 | RAM: 339MB
+   🔧 gate_b: -3.2411
+➡️  Step 14650 | Cosine Loss: 0.5274 | LR: 1.44e-4 | 🚪 Gate mean: 28.5916%
+📐 GRADS -> Max: [spell_w: 0.2139] | Valve: 0.0173 | Gate: 0.0061 | RAM: 339MB
+   🔧 gate_b: -3.242
+➡️  Step 14700 | Cosine Loss: 0.5179 | LR: 1.44e-4 | 🚪 Gate mean: 27.8603%
+📐 GRADS -> Max: [spell_w: 0.2647] | Valve: 0.0166 | Gate: 0.0025 | RAM: 339MB
+   🔧 gate_b: -3.2425
+➡️  Step 14750 | Cosine Loss: 0.5294 | LR: 1.44e-4 | 🚪 Gate mean: 27.8893%
+📐 GRADS -> Max: [spell_w: 0.3308] | Valve: 0.0186 | Gate: 0.0023 | RAM: 340MB
+   🔧 gate_b: -3.2441
+➡️  Step 14800 | Cosine Loss: 0.5318 | LR: 1.44e-4 | 🚪 Gate mean: 26.7023%
+📐 GRADS -> Max: [spell_w: 0.22] | Valve: 0.0166 | Gate: 0.0025 | RAM: 340MB
+   🔧 gate_b: -3.2455
+➡️  Step 14850 | Cosine Loss: 0.5253 | LR: 1.44e-4 | 🚪 Gate mean: 28.3791%
+📐 GRADS -> Max: [spell_w: 0.2816] | Valve: 0.0173 | Gate: 0.0072 | RAM: 340MB
+   🔧 gate_b: -3.249
+➡️  Step 14900 | Cosine Loss: 0.5227 | LR: 1.44e-4 | 🚪 Gate mean: 27.666%
+📐 GRADS -> Max: [spell_w: 0.2793] | Valve: 0.0187 | Gate: 0.0155 | RAM: 341MB
+   🔧 gate_b: -3.2513
+➡️  Step 14950 | Cosine Loss: 0.5221 | LR: 1.43e-4 | 🚪 Gate mean: 28.5591%
+📐 GRADS -> Max: [spell_w: 0.2174] | Valve: 0.0169 | Gate: 0.0062 | RAM: 323MB
+   🔧 gate_b: -3.2518
+➡️  Step 15000 | Cosine Loss: 0.522 | LR: 1.43e-4 | 🚪 Gate mean: 27.4349%
+📐 GRADS -> Max: [spell_w: 0.2395] | Valve: 0.0179 | Gate: 0.0075 | RAM: 324MB
+💾 Auto-Saving Checkpoint Step 15000...
+   🔧 gate_b: -3.2537
+➡️  Step 15050 | Cosine Loss: 0.5224 | LR: 1.43e-4 | 🚪 Gate mean: 28.7181%
+📐 GRADS -> Max: [spell_w: 0.3217] | Valve: 0.0195 | Gate: 0.0042 | RAM: 324MB
+   🔧 gate_b: -3.2542
+➡️  Step 15100 | Cosine Loss: 0.5216 | LR: 1.43e-4 | 🚪 Gate mean: 29.093%
+📐 GRADS -> Max: [spell_w: 0.2417] | Valve: 0.0184 | Gate: 0.0032 | RAM: 324MB
+   🔧 gate_b: -3.2551
+➡️  Step 15150 | Cosine Loss: 0.5185 | LR: 1.43e-4 | 🚪 Gate mean: 28.4955%
+📐 GRADS -> Max: [spell_w: 0.2583] | Valve: 0.0185 | Gate: 0.0124 | RAM: 325MB
+   🔧 gate_b: -3.2581
+➡️  Step 15200 | Cosine Loss: 0.5215 | LR: 1.43e-4 | 🚪 Gate mean: 27.7936%
+📐 GRADS -> Max: [spell_w: 0.208] | Valve: 0.0187 | Gate: 0.0161 | RAM: 344MB
+   🔧 gate_b: -3.2598
+➡️  Step 15250 | Cosine Loss: 0.5293 | LR: 1.43e-4 | 🚪 Gate mean: 27.9864%
+📐 GRADS -> Max: [spell_w: 0.1678] | Valve: 0.0169 | Gate: 0.0064 | RAM: 344MB
+   🔧 gate_b: -3.2612
+➡️  Step 15300 | Cosine Loss: 0.5152 | LR: 1.43e-4 | 🚪 Gate mean: 27.9525%
+📐 GRADS -> Max: [spell_w: 0.1988] | Valve: 0.0156 | Gate: 0.0051 | RAM: 344MB
+   🔧 gate_b: -3.2621
+➡️  Step 15350 | Cosine Loss: 0.5194 | LR: 1.43e-4 | 🚪 Gate mean: 28.1792%
+📐 GRADS -> Max: [spell_w: 0.2454] | Valve: 0.0179 | Gate: 0.0028 | RAM: 338MB
+   🔧 gate_b: -3.2649
+➡️  Step 15400 | Cosine Loss: 0.5229 | LR: 1.43e-4 | 🚪 Gate mean: 27.4783%
+📐 GRADS -> Max: [spell_w: 0.4045] | Valve: 0.0185 | Gate: 0.0099 | RAM: 345MB
+   🔧 gate_b: -3.2665
+➡️  Step 15450 | Cosine Loss: 0.5422 | LR: 1.43e-4 | 🚪 Gate mean: 28.2885%
+📐 GRADS -> Max: [spell_w: 0.2014] | Valve: 0.0171 | Gate: 0.0087 | RAM: 339MB
+   🔧 gate_b: -3.2678
+➡️  Step 15500 | Cosine Loss: 0.5061 | LR: 1.43e-4 | 🚪 Gate mean: 28.3583%
+📐 GRADS -> Max: [spell_w: 0.2187] | Valve: 0.0181 | Gate: 0.0093 | RAM: 328MB
+   🔧 gate_b: -3.2705
+➡️  Step 15550 | Cosine Loss: 0.5145 | LR: 1.43e-4 | 🚪 Gate mean: 28.9592%
+📐 GRADS -> Max: [spell_w: 0.2717] | Valve: 0.0213 | Gate: 0.0036 | RAM: 328MB
+   🔧 gate_b: -3.2712
+➡️  Step 15600 | Cosine Loss: 0.5123 | LR: 1.43e-4 | 🚪 Gate mean: 29.1784%
+📐 GRADS -> Max: [spell_w: 0.3244] | Valve: 0.0189 | Gate: 0.0032 | RAM: 329MB
+   🔧 gate_b: -3.2727
+➡️  Step 15650 | Cosine Loss: 0.5279 | LR: 1.43e-4 | 🚪 Gate mean: 27.9803%
+📐 GRADS -> Max: [spell_w: 0.3639] | Valve: 0.0179 | Gate: 0.0054 | RAM: 329MB
+   🔧 gate_b: -3.2748
+➡️  Step 15700 | Cosine Loss: 0.5264 | LR: 1.43e-4 | 🚪 Gate mean: 28.0335%
+📐 GRADS -> Max: [spell_w: 0.1966] | Valve: 0.0167 | Gate: 0.0027 | RAM: 329MB
+   🔧 gate_b: -3.2768
+➡️  Step 15750 | Cosine Loss: 0.5091 | LR: 1.43e-4 | 🚪 Gate mean: 28.6489%
+📐 GRADS -> Max: [spell_w: 0.4212] | Valve: 0.0184 | Gate: 0.0228 | RAM: 330MB
+   🔧 gate_b: -3.2763
+➡️  Step 15800 | Cosine Loss: 0.5328 | LR: 1.43e-4 | 🚪 Gate mean: 28.5467%
+📐 GRADS -> Max: [spell_w: 0.2033] | Valve: 0.0161 | Gate: 0.0031 | RAM: 349MB
+   🔧 gate_b: -3.2798
+➡️  Step 15850 | Cosine Loss: 0.5287 | LR: 1.43e-4 | 🚪 Gate mean: 27.5467%
+📐 GRADS -> Max: [spell_w: 0.2372] | Valve: 0.0162 | Gate: 0.0045 | RAM: 349MB
+   🔧 gate_b: -3.2804
+➡️  Step 15900 | Cosine Loss: 0.5104 | LR: 1.43e-4 | 🚪 Gate mean: 28.8689%
+📐 GRADS -> Max: [spell_w: 0.199] | Valve: 0.0166 | Gate: 0.003 | RAM: 350MB
+   🔧 gate_b: -3.2814
+➡️  Step 15950 | Cosine Loss: 0.5224 | LR: 1.43e-4 | 🚪 Gate mean: 29.0404%
+📐 GRADS -> Max: [spell_w: 0.2038] | Valve: 0.0156 | Gate: 0.0033 | RAM: 350MB
+   🔧 gate_b: -3.2833
+➡️  Step 16000 | Cosine Loss: 0.5173 | LR: 1.42e-4 | 🚪 Gate mean: 29.3117%
+📐 GRADS -> Max: [spell_w: 0.3173] | Valve: 0.0192 | Gate: 0.0107 | RAM: 351MB
+💾 Auto-Saving Checkpoint Step 16000...
+   🔧 gate_b: -3.2844
+➡️  Step 16050 | Cosine Loss: 0.5323 | LR: 1.42e-4 | 🚪 Gate mean: 28.0992%
+📐 GRADS -> Max: [spell_w: 0.2504] | Valve: 0.0179 | Gate: 0.0088 | RAM: 344MB
+   🔧 gate_b: -3.2874
+➡️  Step 16100 | Cosine Loss: 0.5266 | LR: 1.42e-4 | 🚪 Gate mean: 27.845%
+📐 GRADS -> Max: [spell_w: 0.183] | Valve: 0.0162 | Gate: 0.0088 | RAM: 345MB
+   🔧 gate_b: -3.2888
+➡️  Step 16150 | Cosine Loss: 0.5246 | LR: 1.42e-4 | 🚪 Gate mean: 28.5959%
+📐 GRADS -> Max: [spell_w: 0.2068] | Valve: 0.0183 | Gate: 0.0028 | RAM: 345MB
+   🔧 gate_b: -3.2912
+➡️  Step 16200 | Cosine Loss: 0.5131 | LR: 1.42e-4 | 🚪 Gate mean: 29.0359%
+📐 GRADS -> Max: [spell_w: 0.2725] | Valve: 0.0169 | Gate: 0.0245 | RAM: 334MB
+   🔧 gate_b: -3.2935
+➡️  Step 16250 | Cosine Loss: 0.5125 | LR: 1.42e-4 | 🚪 Gate mean: 29.4459%
+📐 GRADS -> Max: [spell_w: 0.2103] | Valve: 0.0171 | Gate: 0.014 | RAM: 334MB
+   🔧 gate_b: -3.2951
+➡️  Step 16300 | Cosine Loss: 0.5298 | LR: 1.42e-4 | 🚪 Gate mean: 27.8432%
+📐 GRADS -> Max: [spell_w: 0.1872] | Valve: 0.0166 | Gate: 0.0103 | RAM: 335MB
+   🔧 gate_b: -3.2962
+➡️  Step 16350 | Cosine Loss: 0.5213 | LR: 1.42e-4 | 🚪 Gate mean: 28.7564%
+📐 GRADS -> Max: [spell_w: 0.254] | Valve: 0.0181 | Gate: 0.005 | RAM: 354MB
+   🔧 gate_b: -3.2971
+➡️  Step 16400 | Cosine Loss: 0.5267 | LR: 1.42e-4 | 🚪 Gate mean: 28.9034%
+📐 GRADS -> Max: [spell_w: 0.4225] | Valve: 0.0189 | Gate: 0.0049 | RAM: 354MB
+   🔧 gate_b: -3.2987
+➡️  Step 16450 | Cosine Loss: 0.5399 | LR: 1.42e-4 | 🚪 Gate mean: 30.5243%
+📐 GRADS -> Max: [spell_w: 0.383] | Valve: 0.018 | Gate: 0.0048 | RAM: 354MB
+   🔧 gate_b: -3.301
+➡️  Step 16500 | Cosine Loss: 0.5303 | LR: 1.42e-4 | 🚪 Gate mean: 30.0666%
+📐 GRADS -> Max: [spell_w: 0.2373] | Valve: 0.0186 | Gate: 0.0028 | RAM: 355MB
+   🔧 gate_b: -3.3026
+➡️  Step 16550 | Cosine Loss: 0.5148 | LR: 1.42e-4 | 🚪 Gate mean: 29.4182%
+📐 GRADS -> Max: [spell_w: 0.2634] | Valve: 0.0186 | Gate: 0.0082 | RAM: 337MB
+   🔧 gate_b: -3.3048
+➡️  Step 16600 | Cosine Loss: 0.5125 | LR: 1.42e-4 | 🚪 Gate mean: 29.0022%
+📐 GRADS -> Max: [spell_w: 0.2642] | Valve: 0.0174 | Gate: 0.0037 | RAM: 337MB
+   🔧 gate_b: -3.3058
+➡️  Step 16650 | Cosine Loss: 0.5103 | LR: 1.42e-4 | 🚪 Gate mean: 28.7715%
+📐 GRADS -> Max: [spell_w: 0.2057] | Valve: 0.0181 | Gate: 0.0043 | RAM: 338MB
+   🔧 gate_b: -3.3081
+➡️  Step 16700 | Cosine Loss: 0.5021 | LR: 1.42e-4 | 🚪 Gate mean: 28.0384%
+📐 GRADS -> Max: [spell_w: 0.3068] | Valve: 0.019 | Gate: 0.004 | RAM: 338MB
+   🔧 gate_b: -3.3097
+➡️  Step 16750 | Cosine Loss: 0.5175 | LR: 1.42e-4 | 🚪 Gate mean: 28.4925%
+📐 GRADS -> Max: [spell_w: 0.4097] | Valve: 0.0179 | Gate: 0.0034 | RAM: 339MB
+   🔧 gate_b: -3.3116
+➡️  Step 16800 | Cosine Loss: 0.5287 | LR: 1.42e-4 | 🚪 Gate mean: 28.9138%
+📐 GRADS -> Max: [spell_w: 0.2451] | Valve: 0.0191 | Gate: 0.0062 | RAM: 339MB
+   🔧 gate_b: -3.3136
+➡️  Step 16850 | Cosine Loss: 0.5196 | LR: 1.42e-4 | 🚪 Gate mean: 29.2077%
+📐 GRADS -> Max: [spell_w: 0.3179] | Valve: 0.0195 | Gate: 0.0029 | RAM: 358MB
+   🔧 gate_b: -3.3152
+➡️  Step 16900 | Cosine Loss: 0.5279 | LR: 1.42e-4 | 🚪 Gate mean: 29.0351%
+📐 GRADS -> Max: [spell_w: 0.3412] | Valve: 0.0173 | Gate: 0.0053 | RAM: 358MB
+   🔧 gate_b: -3.317
+➡️  Step 16950 | Cosine Loss: 0.5169 | LR: 1.42e-4 | 🚪 Gate mean: 29.5648%
+📐 GRADS -> Max: [spell_w: 0.2912] | Valve: 0.0185 | Gate: 0.0022 | RAM: 359MB
+   🔧 gate_b: -3.3206
+➡️  Step 17000 | Cosine Loss: 0.5202 | LR: 1.41e-4 | 🚪 Gate mean: 28.3263%
+📐 GRADS -> Max: [spell_w: 0.1678] | Valve: 0.0195 | Gate: 0.0024 | RAM: 359MB
+💾 Auto-Saving Checkpoint Step 17000...
+   🔧 gate_b: -3.3226
+➡️  Step 17050 | Cosine Loss: 0.5232 | LR: 1.41e-4 | 🚪 Gate mean: 28.0799%
+📐 GRADS -> Max: [spell_w: 0.2766] | Valve: 0.0185 | Gate: 0.0058 | RAM: 353MB
+   🔧 gate_b: -3.3236
+➡️  Step 17100 | Cosine Loss: 0.5256 | LR: 1.41e-4 | 🚪 Gate mean: 28.9106%
+📐 GRADS -> Max: [spell_w: 0.2454] | Valve: 0.0155 | Gate: 0.0061 | RAM: 353MB
+   🔧 gate_b: -3.3251
+➡️  Step 17150 | Cosine Loss: 0.522 | LR: 1.41e-4 | 🚪 Gate mean: 29.1409%
+📐 GRADS -> Max: [spell_w: 0.2948] | Valve: 0.0165 | Gate: 0.0118 | RAM: 354MB
+   🔧 gate_b: -3.327
+➡️  Step 17200 | Cosine Loss: 0.5245 | LR: 1.41e-4 | 🚪 Gate mean: 28.6268%
+📐 GRADS -> Max: [spell_w: 0.2341] | Valve: 0.016 | Gate: 0.0028 | RAM: 362MB
+   🔧 gate_b: -3.3278
+➡️  Step 17250 | Cosine Loss: 0.5137 | LR: 1.41e-4 | 🚪 Gate mean: 29.497%
+📐 GRADS -> Max: [spell_w: 0.1999] | Valve: 0.0171 | Gate: 0.0045 | RAM: 371MB
+   🔧 gate_b: -3.3312
+➡️  Step 17300 | Cosine Loss: 0.5281 | LR: 1.41e-4 | 🚪 Gate mean: 29.6472%
+📐 GRADS -> Max: [spell_w: 0.2365] | Valve: 0.0181 | Gate: 0.0074 | RAM: 379MB
+   🔧 gate_b: -3.3333
+➡️  Step 17350 | Cosine Loss: 0.5101 | LR: 1.41e-4 | 🚪 Gate mean: 28.7566%
+📐 GRADS -> Max: [spell_w: 0.2557] | Valve: 0.02 | Gate: 0.0064 | RAM: 388MB
+   🔧 gate_b: -3.3359
+➡️  Step 17400 | Cosine Loss: 0.5285 | LR: 1.41e-4 | 🚪 Gate mean: 29.0828%
+📐 GRADS -> Max: [spell_w: 0.259] | Valve: 0.0178 | Gate: 0.0055 | RAM: 344MB
+   🔧 gate_b: -3.3376
+➡️  Step 17450 | Cosine Loss: 0.5139 | LR: 1.41e-4 | 🚪 Gate mean: 29.7009%
+📐 GRADS -> Max: [spell_w: 0.2083] | Valve: 0.0164 | Gate: 0.0044 | RAM: 345MB
+   🔧 gate_b: -3.3391
+➡️  Step 17500 | Cosine Loss: 0.5328 | LR: 1.41e-4 | 🚪 Gate mean: 29.3194%
+📐 GRADS -> Max: [spell_w: 0.2036] | Valve: 0.0188 | Gate: 0.0038 | RAM: 364MB
+   🔧 gate_b: -3.341
+➡️  Step 17550 | Cosine Loss: 0.5171 | LR: 1.41e-4 | 🚪 Gate mean: 28.9172%
+📐 GRADS -> Max: [spell_w: 0.189] | Valve: 0.0154 | Gate: 0.0068 | RAM: 364MB
+   🔧 gate_b: -3.3422
+➡️  Step 17600 | Cosine Loss: 0.5187 | LR: 1.41e-4 | 🚪 Gate mean: 29.6599%
+📐 GRADS -> Max: [spell_w: 0.2871] | Valve: 0.0192 | Gate: 0.0218 | RAM: 364MB
+   🔧 gate_b: -3.3453
+➡️  Step 17650 | Cosine Loss: 0.5243 | LR: 1.41e-4 | 🚪 Gate mean: 29.2031%
+📐 GRADS -> Max: [spell_w: 0.3738] | Valve: 0.019 | Gate: 0.0153 | RAM: 365MB
+   🔧 gate_b: -3.348
+➡️  Step 17700 | Cosine Loss: 0.5176 | LR: 1.41e-4 | 🚪 Gate mean: 28.6707%
+📐 GRADS -> Max: [spell_w: 0.2568] | Valve: 0.0187 | Gate: 0.0032 | RAM: 347MB
+   🔧 gate_b: -3.3499
+➡️  Step 17750 | Cosine Loss: 0.5059 | LR: 1.41e-4 | 🚪 Gate mean: 29.0647%
+📐 GRADS -> Max: [spell_w: 0.2961] | Valve: 0.0191 | Gate: 0.0035 | RAM: 347MB
+   🔧 gate_b: -3.3518
+➡️  Step 17800 | Cosine Loss: 0.5015 | LR: 1.41e-4 | 🚪 Gate mean: 29.6826%
+📐 GRADS -> Max: [spell_w: 0.3463] | Valve: 0.021 | Gate: 0.0103 | RAM: 348MB
+   🔧 gate_b: -3.3534
+➡️  Step 17850 | Cosine Loss: 0.5208 | LR: 1.41e-4 | 🚪 Gate mean: 29.4597%
+📐 GRADS -> Max: [spell_w: 0.1957] | Valve: 0.0177 | Gate: 0.0024 | RAM: 348MB
+   🔧 gate_b: -3.3544
+➡️  Step 17900 | Cosine Loss: 0.5173 | LR: 1.41e-4 | 🚪 Gate mean: 30.9627%
+📐 GRADS -> Max: [spell_w: 0.2456] | Valve: 0.0172 | Gate: 0.0044 | RAM: 349MB
+   🔧 gate_b: -3.3569
+➡️  Step 17950 | Cosine Loss: 0.5153 | LR: 1.4e-4 | 🚪 Gate mean: 28.9065%
+📐 GRADS -> Max: [spell_w: 0.2581] | Valve: 0.0187 | Gate: 0.0032 | RAM: 368MB
+   🔧 gate_b: -3.3577
+➡️  Step 18000 | Cosine Loss: 0.5259 | LR: 1.4e-4 | 🚪 Gate mean: 29.8567%
+📐 GRADS -> Max: [spell_w: 0.2783] | Valve: 0.0176 | Gate: 0.0029 | RAM: 368MB
+💾 Auto-Saving Checkpoint Step 18000...
+   🔧 gate_b: -3.3603
+➡️  Step 18050 | Cosine Loss: 0.5322 | LR: 1.4e-4 | 🚪 Gate mean: 29.4334%
+📐 GRADS -> Max: [spell_w: 0.2855] | Valve: 0.0183 | Gate: 0.0034 | RAM: 369MB
+   🔧 gate_b: -3.3616
+➡️  Step 18100 | Cosine Loss: 0.5145 | LR: 1.4e-4 | 🚪 Gate mean: 29.6235%
+📐 GRADS -> Max: [spell_w: 0.2084] | Valve: 0.0166 | Gate: 0.0071 | RAM: 369MB
+   🔧 gate_b: -3.3624
+➡️  Step 18150 | Cosine Loss: 0.5291 | LR: 1.4e-4 | 🚪 Gate mean: 30.2109%
+📐 GRADS -> Max: [spell_w: 0.4786] | Valve: 0.0183 | Gate: 0.0036 | RAM: 369MB
+   🔧 gate_b: -3.3647
+➡️  Step 18200 | Cosine Loss: 0.5253 | LR: 1.4e-4 | 🚪 Gate mean: 28.8718%
+📐 GRADS -> Max: [spell_w: 0.4251] | Valve: 0.0168 | Gate: 0.0016 | RAM: 370MB
+   🔧 gate_b: -3.3677
+➡️  Step 18250 | Cosine Loss: 0.5202 | LR: 1.4e-4 | 🚪 Gate mean: 30.497%
+📐 GRADS -> Max: [spell_w: 0.2489] | Valve: 0.016 | Gate: 0.0148 | RAM: 352MB
+   🔧 gate_b: -3.3699
+➡️  Step 18300 | Cosine Loss: 0.5164 | LR: 1.4e-4 | 🚪 Gate mean: 30.65%
+📐 GRADS -> Max: [spell_w: 0.2602] | Valve: 0.0181 | Gate: 0.0038 | RAM: 352MB
+   🔧 gate_b: -3.3723
+➡️  Step 18350 | Cosine Loss: 0.5208 | LR: 1.4e-4 | 🚪 Gate mean: 28.6524%
+📐 GRADS -> Max: [spell_w: 0.2619] | Valve: 0.0191 | Gate: 0.004 | RAM: 365MB
+   🔧 gate_b: -3.3731
+➡️  Step 18400 | Cosine Loss: 0.515 | LR: 1.4e-4 | 🚪 Gate mean: 30.2864%
+📐 GRADS -> Max: [spell_w: 0.2392] | Valve: 0.0201 | Gate: 0.0024 | RAM: 371MB
+   🔧 gate_b: -3.3748
+➡️  Step 18450 | Cosine Loss: 0.5301 | LR: 1.4e-4 | 🚪 Gate mean: 29.207%
+📐 GRADS -> Max: [spell_w: 0.3338] | Valve: 0.0173 | Gate: 0.0061 | RAM: 379MB
+   🔧 gate_b: -3.377
+➡️  Step 18500 | Cosine Loss: 0.5007 | LR: 1.4e-4 | 🚪 Gate mean: 30.102%
+📐 GRADS -> Max: [spell_w: 0.4018] | Valve: 0.0215 | Gate: 0.0074 | RAM: 362MB
+   🔧 gate_b: -3.3786
+➡️  Step 18550 | Cosine Loss: 0.5252 | LR: 1.4e-4 | 🚪 Gate mean: 29.9001%
+📐 GRADS -> Max: [spell_w: 0.2886] | Valve: 0.0169 | Gate: 0.0043 | RAM: 362MB
+   🔧 gate_b: -3.3807
+➡️  Step 18600 | Cosine Loss: 0.5238 | LR: 1.4e-4 | 🚪 Gate mean: 30.2018%
+📐 GRADS -> Max: [spell_w: 0.2711] | Valve: 0.0189 | Gate: 0.0034 | RAM: 362MB
+   🔧 gate_b: -3.3829
+➡️  Step 18650 | Cosine Loss: 0.5068 | LR: 1.4e-4 | 🚪 Gate mean: 29.4546%
+📐 GRADS -> Max: [spell_w: 0.348] | Valve: 0.0199 | Gate: 0.0087 | RAM: 363MB
+   🔧 gate_b: -3.3846
+➡️  Step 18700 | Cosine Loss: 0.521 | LR: 1.4e-4 | 🚪 Gate mean: 30.0553%
+📐 GRADS -> Max: [spell_w: 0.261] | Valve: 0.0176 | Gate: 0.0037 | RAM: 363MB
+   🔧 gate_b: -3.3867
+➡️  Step 18750 | Cosine Loss: 0.5287 | LR: 1.4e-4 | 🚪 Gate mean: 30.5131%
+📐 GRADS -> Max: [spell_w: 0.2848] | Valve: 0.0178 | Gate: 0.0042 | RAM: 382MB
+   🔧 gate_b: -3.3888
+➡️  Step 18800 | Cosine Loss: 0.5344 | LR: 1.4e-4 | 🚪 Gate mean: 30.1778%
+📐 GRADS -> Max: [spell_w: 0.2784] | Valve: 0.0174 | Gate: 0.0029 | RAM: 382MB
+   🔧 gate_b: -3.3915
+➡️  Step 18850 | Cosine Loss: 0.5156 | LR: 1.39e-4 | 🚪 Gate mean: 30.0142%
+📐 GRADS -> Max: [spell_w: 0.2476] | Valve: 0.0213 | Gate: 0.0109 | RAM: 383MB
+   🔧 gate_b: -3.3929
+➡️  Step 18900 | Cosine Loss: 0.5382 | LR: 1.39e-4 | 🚪 Gate mean: 29.9953%
+📐 GRADS -> Max: [spell_w: 0.2348] | Valve: 0.0169 | Gate: 0.0068 | RAM: 365MB
+   🔧 gate_b: -3.3941
+➡️  Step 18950 | Cosine Loss: 0.5193 | LR: 1.39e-4 | 🚪 Gate mean: 30.3464%
+📐 GRADS -> Max: [spell_w: 0.339] | Valve: 0.0179 | Gate: 0.005 | RAM: 365MB
+   🔧 gate_b: -3.3963
+➡️  Step 19000 | Cosine Loss: 0.4985 | LR: 1.39e-4 | 🚪 Gate mean: 29.8842%
+📐 GRADS -> Max: [spell_w: 0.2766] | Valve: 0.0183 | Gate: 0.0042 | RAM: 365MB
+💾 Auto-Saving Checkpoint Step 19000...
+   🔧 gate_b: -3.3975
+➡️  Step 19050 | Cosine Loss: 0.5267 | LR: 1.39e-4 | 🚪 Gate mean: 30.6131%
+📐 GRADS -> Max: [spell_w: 0.3935] | Valve: 0.0178 | Gate: 0.0025 | RAM: 366MB
+   🔧 gate_b: -3.3993
+➡️  Step 19100 | Cosine Loss: 0.5177 | LR: 1.39e-4 | 🚪 Gate mean: 30.9618%
+📐 GRADS -> Max: [spell_w: 0.3318] | Valve: 0.0178 | Gate: 0.0117 | RAM: 385MB
+   🔧 gate_b: -3.402
+➡️  Step 19150 | Cosine Loss: 0.5404 | LR: 1.39e-4 | 🚪 Gate mean: 30.6369%
+📐 GRADS -> Max: [spell_w: 0.3485] | Valve: 0.0186 | Gate: 0.0066 | RAM: 385MB
+   🔧 gate_b: -3.4042
+➡️  Step 19200 | Cosine Loss: 0.5167 | LR: 1.39e-4 | 🚪 Gate mean: 29.8834%
+📐 GRADS -> Max: [spell_w: 0.497] | Valve: 0.0178 | Gate: 0.0035 | RAM: 386MB
+   🔧 gate_b: -3.4069
+➡️  Step 19250 | Cosine Loss: 0.5234 | LR: 1.39e-4 | 🚪 Gate mean: 30.2738%
+📐 GRADS -> Max: [spell_w: 0.1783] | Valve: 0.0179 | Gate: 0.0063 | RAM: 386MB
+   🔧 gate_b: -3.4085
+➡️  Step 19300 | Cosine Loss: 0.5135 | LR: 1.39e-4 | 🚪 Gate mean: 29.2335%
+📐 GRADS -> Max: [spell_w: 0.432] | Valve: 0.0189 | Gate: 0.0089 | RAM: 368MB
+   🔧 gate_b: -3.4105
+➡️  Step 19350 | Cosine Loss: 0.5344 | LR: 1.39e-4 | 🚪 Gate mean: 30.6424%
+📐 GRADS -> Max: [spell_w: 0.3657] | Valve: 0.0191 | Gate: 0.004 | RAM: 369MB
+   🔧 gate_b: -3.4119
+➡️  Step 19400 | Cosine Loss: 0.5194 | LR: 1.39e-4 | 🚪 Gate mean: 30.5137%
+📐 GRADS -> Max: [spell_w: 0.2796] | Valve: 0.0204 | Gate: 0.0064 | RAM: 369MB
+   🔧 gate_b: -3.4139
+➡️  Step 19450 | Cosine Loss: 0.5219 | LR: 1.39e-4 | 🚪 Gate mean: 30.3201%
+📐 GRADS -> Max: [spell_w: 0.2628] | Valve: 0.0181 | Gate: 0.0035 | RAM: 369MB
+   🔧 gate_b: -3.4161
+➡️  Step 19500 | Cosine Loss: 0.5172 | LR: 1.39e-4 | 🚪 Gate mean: 31.8517%
+📐 GRADS -> Max: [spell_w: 0.2566] | Valve: 0.0187 | Gate: 0.0036 | RAM: 389MB
+   🔧 gate_b: -3.4169
+➡️  Step 19550 | Cosine Loss: 0.5105 | LR: 1.39e-4 | 🚪 Gate mean: 30.8034%
+📐 GRADS -> Max: [spell_w: 0.2468] | Valve: 0.0178 | Gate: 0.0063 | RAM: 389MB
+   🔧 gate_b: -3.4194
+➡️  Step 19600 | Cosine Loss: 0.5152 | LR: 1.39e-4 | 🚪 Gate mean: 30.1005%
+📐 GRADS -> Max: [spell_w: 0.2675] | Valve: 0.0165 | Gate: 0.0064 | RAM: 389MB
+   🔧 gate_b: -3.4222
+➡️  Step 19650 | Cosine Loss: 0.5121 | LR: 1.39e-4 | 🚪 Gate mean: 31.1198%
+📐 GRADS -> Max: [spell_w: 0.2164] | Valve: 0.0182 | Gate: 0.0049 | RAM: 371MB
+   🔧 gate_b: -3.4246
+➡️  Step 19700 | Cosine Loss: 0.514 | LR: 1.38e-4 | 🚪 Gate mean: 30.9656%
+📐 GRADS -> Max: [spell_w: 0.2238] | Valve: 0.0187 | Gate: 0.0058 | RAM: 372MB
+   🔧 gate_b: -3.4267
+➡️  Step 19750 | Cosine Loss: 0.5185 | LR: 1.38e-4 | 🚪 Gate mean: 29.9863%
+📐 GRADS -> Max: [spell_w: 0.3093] | Valve: 0.0173 | Gate: 0.0049 | RAM: 372MB
+   🔧 gate_b: -3.428
+➡️  Step 19800 | Cosine Loss: 0.525 | LR: 1.38e-4 | 🚪 Gate mean: 31.5914%
+📐 GRADS -> Max: [spell_w: 0.2356] | Valve: 0.0199 | Gate: 0.005 | RAM: 391MB
+   🔧 gate_b: -3.4311
+➡️  Step 19850 | Cosine Loss: 0.5328 | LR: 1.38e-4 | 🚪 Gate mean: 30.9426%
+📐 GRADS -> Max: [spell_w: 0.1994] | Valve: 0.017 | Gate: 0.0022 | RAM: 391MB
+   🔧 gate_b: -3.4326
+➡️  Step 19900 | Cosine Loss: 0.5141 | LR: 1.38e-4 | 🚪 Gate mean: 30.7343%
+📐 GRADS -> Max: [spell_w: 0.4301] | Valve: 0.0181 | Gate: 0.0031 | RAM: 392MB
+   🔧 gate_b: -3.4346
+➡️  Step 19950 | Cosine Loss: 0.5418 | LR: 1.38e-4 | 🚪 Gate mean: 30.0181%
+📐 GRADS -> Max: [spell_w: 0.3762] | Valve: 0.0177 | Gate: 0.0033 | RAM: 374MB
+   🔧 gate_b: -3.4377
+➡️  Step 20000 | Cosine Loss: 0.5207 | LR: 1.38e-4 | 🚪 Gate mean: 30.1814%
+📐 GRADS -> Max: [spell_w: 0.251] | Valve: 0.018 | Gate: 0.0033 | RAM: 374MB
+💾 Auto-Saving Checkpoint Step 20000...
+   🔧 gate_b: -3.4401
+➡️  Step 20050 | Cosine Loss: 0.5224 | LR: 1.38e-4 | 🚪 Gate mean: 29.698%
+📐 GRADS -> Max: [spell_w: 0.3204] | Valve: 0.0169 | Gate: 0.0038 | RAM: 393MB
+   🔧 gate_b: -3.4417
+➡️  Step 20100 | Cosine Loss: 0.5162 | LR: 1.38e-4 | 🚪 Gate mean: 31.778%
+📐 GRADS -> Max: [spell_w: 0.1989] | Valve: 0.0173 | Gate: 0.0053 | RAM: 393MB
+   🔧 gate_b: -3.4425
+➡️  Step 20150 | Cosine Loss: 0.5236 | LR: 1.38e-4 | 🚪 Gate mean: 29.8246%
+📐 GRADS -> Max: [spell_w: 0.2797] | Valve: 0.022 | Gate: 0.0069 | RAM: 394MB
+   🔧 gate_b: -3.4452
+➡️  Step 20200 | Cosine Loss: 0.5213 | LR: 1.38e-4 | 🚪 Gate mean: 31.1069%
+📐 GRADS -> Max: [spell_w: 0.3456] | Valve: 0.0187 | Gate: 0.0045 | RAM: 402MB
+   🔧 gate_b: -3.4489
+➡️  Step 20250 | Cosine Loss: 0.5198 | LR: 1.38e-4 | 🚪 Gate mean: 30.6664%
+📐 GRADS -> Max: [spell_w: 0.4198] | Valve: 0.0172 | Gate: 0.0043 | RAM: 411MB
+   🔧 gate_b: -3.4501
+➡️  Step 20300 | Cosine Loss: 0.5086 | LR: 1.38e-4 | 🚪 Gate mean: 29.8146%
+📐 GRADS -> Max: [spell_w: 0.2261] | Valve: 0.018 | Gate: 0.0053 | RAM: 419MB
+   🔧 gate_b: -3.4541
+➡️  Step 20350 | Cosine Loss: 0.5163 | LR: 1.38e-4 | 🚪 Gate mean: 30.1866%
+📐 GRADS -> Max: [spell_w: 0.2853] | Valve: 0.0223 | Gate: 0.0061 | RAM: 428MB
+   🔧 gate_b: -3.4559
+➡️  Step 20400 | Cosine Loss: 0.5199 | LR: 1.38e-4 | 🚪 Gate mean: 30.3057%
+📐 GRADS -> Max: [spell_w: 0.2421] | Valve: 0.0173 | Gate: 0.0034 | RAM: 436MB
+   🔧 gate_b: -3.4584
+➡️  Step 20450 | Cosine Loss: 0.5222 | LR: 1.38e-4 | 🚪 Gate mean: 31.1271%
+📐 GRADS -> Max: [spell_w: 0.3445] | Valve: 0.0183 | Gate: 0.0056 | RAM: 445MB
+   🔧 gate_b: -3.4605
+➡️  Step 20500 | Cosine Loss: 0.5328 | LR: 1.37e-4 | 🚪 Gate mean: 30.1725%
+📐 GRADS -> Max: [spell_w: 0.3399] | Valve: 0.0185 | Gate: 0.0035 | RAM: 453MB
+   🔧 gate_b: -3.4613
+➡️  Step 20550 | Cosine Loss: 0.5161 | LR: 1.37e-4 | 🚪 Gate mean: 31.1143%
+📐 GRADS -> Max: [spell_w: 0.285] | Valve: 0.0184 | Gate: 0.0057 | RAM: 461MB
+   🔧 gate_b: -3.4629
+➡️  Step 20600 | Cosine Loss: 0.5098 | LR: 1.37e-4 | 🚪 Gate mean: 30.4586%
+📐 GRADS -> Max: [spell_w: 0.2857] | Valve: 0.0188 | Gate: 0.0041 | RAM: 470MB
+   🔧 gate_b: -3.4653
+➡️  Step 20650 | Cosine Loss: 0.5129 | LR: 1.37e-4 | 🚪 Gate mean: 31.1971%
+📐 GRADS -> Max: [spell_w: 0.2097] | Valve: 0.0174 | Gate: 0.0038 | RAM: 479MB
+   🔧 gate_b: -3.4667
+➡️  Step 20700 | Cosine Loss: 0.5262 | LR: 1.37e-4 | 🚪 Gate mean: 31.8819%
+📐 GRADS -> Max: [spell_w: 0.4781] | Valve: 0.0174 | Gate: 0.003 | RAM: 487MB
+   🔧 gate_b: -3.4696
+➡️  Step 20750 | Cosine Loss: 0.5133 | LR: 1.37e-4 | 🚪 Gate mean: 31.3947%
+📐 GRADS -> Max: [spell_w: 0.2586] | Valve: 0.0182 | Gate: 0.002 | RAM: 495MB
+   🔧 gate_b: -3.471
+➡️  Step 20800 | Cosine Loss: 0.5164 | LR: 1.37e-4 | 🚪 Gate mean: 31.9144%
+📐 GRADS -> Max: [spell_w: 0.2671] | Valve: 0.018 | Gate: 0.0043 | RAM: 504MB
+   🔧 gate_b: -3.4727
+➡️  Step 20850 | Cosine Loss: 0.5137 | LR: 1.37e-4 | 🚪 Gate mean: 30.6829%
+📐 GRADS -> Max: [spell_w: 0.2443] | Valve: 0.0188 | Gate: 0.0085 | RAM: 512MB
+   🔧 gate_b: -3.4748
+➡️  Step 20900 | Cosine Loss: 0.5126 | LR: 1.37e-4 | 🚪 Gate mean: 31.237%
+📐 GRADS -> Max: [spell_w: 0.3066] | Valve: 0.0202 | Gate: 0.0033 | RAM: 521MB
+   🔧 gate_b: -3.477
+➡️  Step 20950 | Cosine Loss: 0.5157 | LR: 1.37e-4 | 🚪 Gate mean: 30.8022%
+📐 GRADS -> Max: [spell_w: 0.2651] | Valve: 0.019 | Gate: 0.0032 | RAM: 529MB
+   🔧 gate_b: -3.478
+➡️  Step 21000 | Cosine Loss: 0.5141 | LR: 1.37e-4 | 🚪 Gate mean: 31.3791%
+📐 GRADS -> Max: [spell_w: 0.2182] | Valve: 0.0194 | Gate: 0.007 | RAM: 538MB
+💾 Auto-Saving Checkpoint Step 21000...
+   🔧 gate_b: -3.4803
+➡️  Step 21050 | Cosine Loss: 0.5306 | LR: 1.37e-4 | 🚪 Gate mean: 30.6638%
+📐 GRADS -> Max: [spell_w: 0.2366] | Valve: 0.0187 | Gate: 0.0049 | RAM: 395MB
+   🔧 gate_b: -3.4827
+➡️  Step 21100 | Cosine Loss: 0.5082 | LR: 1.37e-4 | 🚪 Gate mean: 32.1953%
+📐 GRADS -> Max: [spell_w: 0.2426] | Valve: 0.0203 | Gate: 0.0068 | RAM: 395MB
+   🔧 gate_b: -3.4868
+➡️  Step 21150 | Cosine Loss: 0.5178 | LR: 1.37e-4 | 🚪 Gate mean: 31.5366%
+📐 GRADS -> Max: [spell_w: 0.2622] | Valve: 0.0175 | Gate: 0.0029 | RAM: 396MB
+   🔧 gate_b: -3.4889
+➡️  Step 21200 | Cosine Loss: 0.5351 | LR: 1.37e-4 | 🚪 Gate mean: 31.2768%
+📐 GRADS -> Max: [spell_w: 0.3428] | Valve: 0.0203 | Gate: 0.0088 | RAM: 404MB
+   🔧 gate_b: -3.4917
+➡️  Step 21250 | Cosine Loss: 0.5091 | LR: 1.37e-4 | 🚪 Gate mean: 30.5962%
+📐 GRADS -> Max: [spell_w: 0.3309] | Valve: 0.0179 | Gate: 0.0079 | RAM: 413MB
+   🔧 gate_b: -3.4953
+➡️  Step 21300 | Cosine Loss: 0.5101 | LR: 1.36e-4 | 🚪 Gate mean: 32.8154%
+📐 GRADS -> Max: [spell_w: 0.2857] | Valve: 0.0191 | Gate: 0.0045 | RAM: 421MB
+   🔧 gate_b: -3.4974
+➡️  Step 21350 | Cosine Loss: 0.52 | LR: 1.36e-4 | 🚪 Gate mean: 31.3529%
+📐 GRADS -> Max: [spell_w: 0.2491] | Valve: 0.0175 | Gate: 0.003 | RAM: 430MB
+   🔧 gate_b: -3.4995
+➡️  Step 21400 | Cosine Loss: 0.4982 | LR: 1.36e-4 | 🚪 Gate mean: 30.8474%
+📐 GRADS -> Max: [spell_w: 0.2227] | Valve: 0.0196 | Gate: 0.0032 | RAM: 438MB
+   🔧 gate_b: -3.5011
+➡️  Step 21450 | Cosine Loss: 0.5084 | LR: 1.36e-4 | 🚪 Gate mean: 31.4768%
+📐 GRADS -> Max: [spell_w: 0.4573] | Valve: 0.019 | Gate: 0.0033 | RAM: 447MB
+   🔧 gate_b: -3.5029
+➡️  Step 21500 | Cosine Loss: 0.505 | LR: 1.36e-4 | 🚪 Gate mean: 31.6347%
+📐 GRADS -> Max: [spell_w: 0.2623] | Valve: 0.0192 | Gate: 0.0026 | RAM: 387MB
+   🔧 gate_b: -3.506
+➡️  Step 21550 | Cosine Loss: 0.5272 | LR: 1.36e-4 | 🚪 Gate mean: 30.8072%
+📐 GRADS -> Max: [spell_w: 0.3761] | Valve: 0.019 | Gate: 0.0027 | RAM: 406MB
+   🔧 gate_b: -3.5072
+➡️  Step 21600 | Cosine Loss: 0.5385 | LR: 1.36e-4 | 🚪 Gate mean: 30.7414%
+📐 GRADS -> Max: [spell_w: 0.2738] | Valve: 0.0184 | Gate: 0.0065 | RAM: 406MB
+   🔧 gate_b: -3.5097
+➡️  Step 21650 | Cosine Loss: 0.5188 | LR: 1.36e-4 | 🚪 Gate mean: 31.3406%
+📐 GRADS -> Max: [spell_w: 0.4957] | Valve: 0.0188 | Gate: 0.002 | RAM: 407MB
+   🔧 gate_b: -3.5117
+➡️  Step 21700 | Cosine Loss: 0.4965 | LR: 1.36e-4 | 🚪 Gate mean: 31.9521%
+📐 GRADS -> Max: [spell_w: 0.2761] | Valve: 0.0192 | Gate: 0.0036 | RAM: 389MB
+   🔧 gate_b: -3.5133
+➡️  Step 21750 | Cosine Loss: 0.5079 | LR: 1.36e-4 | 🚪 Gate mean: 31.9899%
+📐 GRADS -> Max: [spell_w: 0.2794] | Valve: 0.0189 | Gate: 0.0056 | RAM: 389MB
+   🔧 gate_b: -3.5166
+➡️  Step 21800 | Cosine Loss: 0.4931 | LR: 1.36e-4 | 🚪 Gate mean: 32.0046%
+📐 GRADS -> Max: [spell_w: 0.3315] | Valve: 0.0197 | Gate: 0.0035 | RAM: 390MB
+   🔧 gate_b: -3.5199
+➡️  Step 21850 | Cosine Loss: 0.5255 | LR: 1.36e-4 | 🚪 Gate mean: 32.0872%
+📐 GRADS -> Max: [spell_w: 0.4044] | Valve: 0.0181 | Gate: 0.0028 | RAM: 402MB
+   🔧 gate_b: -3.5213
+➡️  Step 21900 | Cosine Loss: 0.5133 | LR: 1.36e-4 | 🚪 Gate mean: 30.656%
+📐 GRADS -> Max: [spell_w: 0.4824] | Valve: 0.0189 | Gate: 0.0035 | RAM: 409MB
+   🔧 gate_b: -3.5231
+➡️  Step 21950 | Cosine Loss: 0.5279 | LR: 1.36e-4 | 🚪 Gate mean: 32.0215%
+📐 GRADS -> Max: [spell_w: 0.2411] | Valve: 0.0183 | Gate: 0.0065 | RAM: 391MB
+   🔧 gate_b: -3.5255
+➡️  Step 22000 | Cosine Loss: 0.5252 | LR: 1.36e-4 | 🚪 Gate mean: 30.5122%
+📐 GRADS -> Max: [spell_w: 0.3408] | Valve: 0.0184 | Gate: 0.0053 | RAM: 392MB
+💾 Auto-Saving Checkpoint Step 22000...
+   🔧 gate_b: -3.5277
+➡️  Step 22050 | Cosine Loss: 0.5045 | LR: 1.35e-4 | 🚪 Gate mean: 31.1485%
+📐 GRADS -> Max: [spell_w: 0.3018] | Valve: 0.017 | Gate: 0.0049 | RAM: 410MB
+   🔧 gate_b: -3.5301
+➡️  Step 22100 | Cosine Loss: 0.5288 | LR: 1.35e-4 | 🚪 Gate mean: 31.3109%
+📐 GRADS -> Max: [spell_w: 0.2022] | Valve: 0.0193 | Gate: 0.0025 | RAM: 411MB
+   🔧 gate_b: -3.5311
+➡️  Step 22150 | Cosine Loss: 0.5289 | LR: 1.35e-4 | 🚪 Gate mean: 31.24%
+📐 GRADS -> Max: [spell_w: 0.2361] | Valve: 0.0228 | Gate: 0.0063 | RAM: 411MB
+   🔧 gate_b: -3.5345
+➡️  Step 22200 | Cosine Loss: 0.504 | LR: 1.35e-4 | 🚪 Gate mean: 31.5549%
+📐 GRADS -> Max: [spell_w: 0.3171] | Valve: 0.0175 | Gate: 0.0035 | RAM: 412MB
+   🔧 gate_b: -3.5372
+➡️  Step 22250 | Cosine Loss: 0.5143 | LR: 1.35e-4 | 🚪 Gate mean: 31.1335%
+📐 GRADS -> Max: [spell_w: 0.3354] | Valve: 0.0201 | Gate: 0.0033 | RAM: 420MB
+   🔧 gate_b: -3.5383
+➡️  Step 22300 | Cosine Loss: 0.508 | LR: 1.35e-4 | 🚪 Gate mean: 32.6512%
+📐 GRADS -> Max: [spell_w: 0.25] | Valve: 0.0192 | Gate: 0.0058 | RAM: 429MB
+   🔧 gate_b: -3.5392
+➡️  Step 22350 | Cosine Loss: 0.5104 | LR: 1.35e-4 | 🚪 Gate mean: 31.8595%
+📐 GRADS -> Max: [spell_w: 0.2385] | Valve: 0.0193 | Gate: 0.0029 | RAM: 437MB
+   🔧 gate_b: -3.5414
+➡️  Step 22400 | Cosine Loss: 0.5023 | LR: 1.35e-4 | 🚪 Gate mean: 31.7607%
+📐 GRADS -> Max: [spell_w: 0.3555] | Valve: 0.0202 | Gate: 0.0038 | RAM: 445MB
+   🔧 gate_b: -3.5446
+➡️  Step 22450 | Cosine Loss: 0.5045 | LR: 1.35e-4 | 🚪 Gate mean: 31.029%
+📐 GRADS -> Max: [spell_w: 0.268] | Valve: 0.018 | Gate: 0.0064 | RAM: 454MB
+   🔧 gate_b: -3.5469
+➡️  Step 22500 | Cosine Loss: 0.5263 | LR: 1.35e-4 | 🚪 Gate mean: 30.9341%
+📐 GRADS -> Max: [spell_w: 0.2445] | Valve: 0.0178 | Gate: 0.0056 | RAM: 462MB
+   🔧 gate_b: -3.5482
+➡️  Step 22550 | Cosine Loss: 0.5308 | LR: 1.35e-4 | 🚪 Gate mean: 31.6034%
+📐 GRADS -> Max: [spell_w: 0.2661] | Valve: 0.0177 | Gate: 0.0053 | RAM: 471MB
+   🔧 gate_b: -3.5514
+➡️  Step 22600 | Cosine Loss: 0.5122 | LR: 1.35e-4 | 🚪 Gate mean: 32.5393%
+📐 GRADS -> Max: [spell_w: 0.3775] | Valve: 0.0189 | Gate: 0.0071 | RAM: 479MB
+   🔧 gate_b: -3.5528
+➡️  Step 22650 | Cosine Loss: 0.509 | LR: 1.35e-4 | 🚪 Gate mean: 31.6292%
+📐 GRADS -> Max: [spell_w: 0.2769] | Valve: 0.0207 | Gate: 0.0051 | RAM: 488MB
+   🔧 gate_b: -3.5549
+➡️  Step 22700 | Cosine Loss: 0.5153 | LR: 1.35e-4 | 🚪 Gate mean: 30.9983%
+📐 GRADS -> Max: [spell_w: 0.2146] | Valve: 0.0168 | Gate: 0.0054 | RAM: 496MB
+   🔧 gate_b: -3.5569
+➡️  Step 22750 | Cosine Loss: 0.5211 | LR: 1.35e-4 | 🚪 Gate mean: 31.6072%
+📐 GRADS -> Max: [spell_w: 0.3921] | Valve: 0.0193 | Gate: 0.004 | RAM: 505MB
+   🔧 gate_b: -3.5594
+➡️  Step 22800 | Cosine Loss: 0.5352 | LR: 1.34e-4 | 🚪 Gate mean: 31.5014%
+📐 GRADS -> Max: [spell_w: 0.2503] | Valve: 0.0177 | Gate: 0.0084 | RAM: 513MB
+   🔧 gate_b: -3.5618
+➡️  Step 22850 | Cosine Loss: 0.5067 | LR: 1.34e-4 | 🚪 Gate mean: 31.9804%
+📐 GRADS -> Max: [spell_w: 0.2648] | Valve: 0.0186 | Gate: 0.0014 | RAM: 521MB
+   🔧 gate_b: -3.5647
+➡️  Step 22900 | Cosine Loss: 0.5364 | LR: 1.34e-4 | 🚪 Gate mean: 31.6778%
+📐 GRADS -> Max: [spell_w: 0.2419] | Valve: 0.017 | Gate: 0.0032 | RAM: 530MB
+   🔧 gate_b: -3.5661
+➡️  Step 22950 | Cosine Loss: 0.5227 | LR: 1.34e-4 | 🚪 Gate mean: 31.1387%
+📐 GRADS -> Max: [spell_w: 0.3478] | Valve: 0.0189 | Gate: 0.0019 | RAM: 412MB
+   🔧 gate_b: -3.5687
+➡️  Step 23000 | Cosine Loss: 0.5112 | LR: 1.34e-4 | 🚪 Gate mean: 31.8726%
+📐 GRADS -> Max: [spell_w: 0.3094] | Valve: 0.0187 | Gate: 0.0056 | RAM: 412MB
+💾 Auto-Saving Checkpoint Step 23000...
+   🔧 gate_b: -3.5696
+➡️  Step 23050 | Cosine Loss: 0.5186 | LR: 1.34e-4 | 🚪 Gate mean: 33.4391%
+📐 GRADS -> Max: [spell_w: 0.2834] | Valve: 0.0202 | Gate: 0.0044 | RAM: 412MB
+   🔧 gate_b: -3.572
+➡️  Step 23100 | Cosine Loss: 0.5145 | LR: 1.34e-4 | 🚪 Gate mean: 32.1603%
+📐 GRADS -> Max: [spell_w: 0.2775] | Valve: 0.0185 | Gate: 0.0034 | RAM: 413MB
+   🔧 gate_b: -3.5746
+➡️  Step 23150 | Cosine Loss: 0.5188 | LR: 1.34e-4 | 🚪 Gate mean: 31.4782%
+📐 GRADS -> Max: [spell_w: 0.2498] | Valve: 0.018 | Gate: 0.0051 | RAM: 413MB
+   🔧 gate_b: -3.5762
+➡️  Step 23200 | Cosine Loss: 0.5243 | LR: 1.34e-4 | 🚪 Gate mean: 31.4825%
+📐 GRADS -> Max: [spell_w: 0.247] | Valve: 0.0179 | Gate: 0.0056 | RAM: 422MB
+   🔧 gate_b: -3.5792
+➡️  Step 23250 | Cosine Loss: 0.5065 | LR: 1.34e-4 | 🚪 Gate mean: 32.9307%
+📐 GRADS -> Max: [spell_w: 0.3741] | Valve: 0.0213 | Gate: 0.0041 | RAM: 430MB
+   🔧 gate_b: -3.5809
+➡️  Step 23300 | Cosine Loss: 0.5195 | LR: 1.34e-4 | 🚪 Gate mean: 33.0261%
+📐 GRADS -> Max: [spell_w: 0.3623] | Valve: 0.0195 | Gate: 0.0058 | RAM: 439MB
+   🔧 gate_b: -3.5831
+➡️  Step 23350 | Cosine Loss: 0.514 | LR: 1.34e-4 | 🚪 Gate mean: 33.5386%
+📐 GRADS -> Max: [spell_w: 0.3154] | Valve: 0.0172 | Gate: 0.0118 | RAM: 447MB
+   🔧 gate_b: -3.5852
+➡️  Step 23400 | Cosine Loss: 0.5165 | LR: 1.34e-4 | 🚪 Gate mean: 32.7405%
+📐 GRADS -> Max: [spell_w: 0.3119] | Valve: 0.021 | Gate: 0.0059 | RAM: 455MB
+   🔧 gate_b: -3.5875
+➡️  Step 23450 | Cosine Loss: 0.5217 | LR: 1.34e-4 | 🚪 Gate mean: 32.596%
+📐 GRADS -> Max: [spell_w: 0.2561] | Valve: 0.0213 | Gate: 0.003 | RAM: 464MB
+   🔧 gate_b: -3.589
+➡️  Step 23500 | Cosine Loss: 0.5147 | LR: 1.34e-4 | 🚪 Gate mean: 32.5118%
+📐 GRADS -> Max: [spell_w: 0.3271] | Valve: 0.0186 | Gate: 0.0067 | RAM: 472MB
+   🔧 gate_b: -3.5918
+➡️  Step 23550 | Cosine Loss: 0.5139 | LR: 1.33e-4 | 🚪 Gate mean: 31.7955%
+📐 GRADS -> Max: [spell_w: 0.3762] | Valve: 0.0181 | Gate: 0.0024 | RAM: 481MB
+   🔧 gate_b: -3.5951
+➡️  Step 23600 | Cosine Loss: 0.5046 | LR: 1.33e-4 | 🚪 Gate mean: 32.3032%
+📐 GRADS -> Max: [spell_w: 0.5162] | Valve: 0.0193 | Gate: 0.0073 | RAM: 489MB
+   🔧 gate_b: -3.5961
+➡️  Step 23650 | Cosine Loss: 0.5247 | LR: 1.33e-4 | 🚪 Gate mean: 31.5234%
+📐 GRADS -> Max: [spell_w: 0.3078] | Valve: 0.0175 | Gate: 0.0026 | RAM: 406MB
+   🔧 gate_b: -3.5976
+➡️  Step 23700 | Cosine Loss: 0.5221 | LR: 1.33e-4 | 🚪 Gate mean: 32.1342%
+📐 GRADS -> Max: [spell_w: 0.2375] | Valve: 0.019 | Gate: 0.0052 | RAM: 425MB
+   🔧 gate_b: -3.5991
+➡️  Step 23750 | Cosine Loss: 0.5274 | LR: 1.33e-4 | 🚪 Gate mean: 32.7138%
+📐 GRADS -> Max: [spell_w: 0.3528] | Valve: 0.019 | Gate: 0.0064 | RAM: 425MB
+   🔧 gate_b: -3.6017
+➡️  Step 23800 | Cosine Loss: 0.5121 | LR: 1.33e-4 | 🚪 Gate mean: 33.039%
+📐 GRADS -> Max: [spell_w: 0.2962] | Valve: 0.0183 | Gate: 0.005 | RAM: 407MB
+   🔧 gate_b: -3.6053
+➡️  Step 23850 | Cosine Loss: 0.5243 | LR: 1.33e-4 | 🚪 Gate mean: 32.1724%
+📐 GRADS -> Max: [spell_w: 0.2951] | Valve: 0.0176 | Gate: 0.0053 | RAM: 407MB
+   🔧 gate_b: -3.606
+➡️  Step 23900 | Cosine Loss: 0.5207 | LR: 1.33e-4 | 🚪 Gate mean: 33.0946%
+📐 GRADS -> Max: [spell_w: 0.3035] | Valve: 0.0184 | Gate: 0.0051 | RAM: 408MB
+   🔧 gate_b: -3.6072
+➡️  Step 23950 | Cosine Loss: 0.5038 | LR: 1.33e-4 | 🚪 Gate mean: 32.1445%
+📐 GRADS -> Max: [spell_w: 0.418] | Valve: 0.0173 | Gate: 0.0059 | RAM: 420MB
+   🔧 gate_b: -3.6101
+➡️  Step 24000 | Cosine Loss: 0.5039 | LR: 1.33e-4 | 🚪 Gate mean: 32.2523%
+📐 GRADS -> Max: [spell_w: 0.2134] | Valve: 0.0191 | Gate: 0.0032 | RAM: 421MB
+💾 Auto-Saving Checkpoint Step 24000...
+   🔧 gate_b: -3.6124
+➡️  Step 24050 | Cosine Loss: 0.5091 | LR: 1.33e-4 | 🚪 Gate mean: 32.9469%
+📐 GRADS -> Max: [spell_w: 0.3951] | Valve: 0.0187 | Gate: 0.0138 | RAM: 421MB
+```

@@ -224,6 +224,8 @@ end
 ```
 
 ```elixir
+# Currently unused, wanted to leave it in to show the different things I tried
+
 defmodule DLM.SinkhornOT do
   import Nx.Defn
 
@@ -235,7 +237,7 @@ defmodule DLM.SinkhornOT do
   end
 
   # ⚡ FIX 1: Bump the default epsilon up to 10.0 to handle your 512D spatial scale
-  defn compute(pred, target, epsilon \\ 10.0, max_iters \\ 5) do
+  defn compute(pred, target, epsilon \\ 10.0, max_iters \\ 30) do
     c = cost_matrix(pred, target)
     k = Nx.exp(Nx.divide(Nx.negate(c), epsilon))
     
@@ -292,9 +294,18 @@ defmodule DLM.TinySSM do
     Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
   end
 
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
   defn apply_svd(x, u, v) do
     hidden = Nx.dot(x, u)
-    activated = gelu(hidden) 
+    
+    # 🛡️ The Shield: normalizes variance to 1.0 BEFORE the tanh
+    normed_hidden = rms_norm(hidden) 
+    activated = Nx.tanh(normed_hidden)
+    
     Nx.dot(activated, v)
   end
 
@@ -310,11 +321,14 @@ defmodule DLM.TinySSM do
     
     # ⚡ The Dynamic Gate
     gate_proj = apply_svd(x_t, du, dv)
-    delta = Nx.max(softplus(gate_proj), 1.0e-4) # Minimum step size for stability
+
+    # ⚡ Shift the projection by -3.0 so the initial delta is ~0.048
+    shifted_gate = Nx.subtract(gate_proj, 3.0)
+    delta = Nx.max(softplus(shifted_gate), 0.01)
     
     # Dynamic Friction & Force
     a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
-    b_bar = Nx.multiply(delta, b_proj)
+    b_bar = b_proj
     
     h_new = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
     
@@ -328,12 +342,27 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 28, ...>>, true}
 ```
 
 ```elixir
 defmodule DLM.HybridMuon7 do
   import Nx.Defn
+
+  # ⚡ The Norm Limiter
+  defn limit_norm(tensor, max_norm \\ 10.0) do
+    # Calculate current Frobenius norm
+    current_norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2)))
+    
+    # If current_norm > max_norm, scale down. Otherwise, scale = 1.0
+    scale_factor = Nx.select(
+      current_norm > max_norm,
+      Nx.divide(max_norm, Nx.add(current_norm, 1.0e-8)),
+      1.0
+    )
+    
+    Nx.multiply(tensor, scale_factor)
+  end
 
   # -------------------------------------------------------------------------
   # AdamW (For 1D Friction/Inertia vectors)
@@ -341,7 +370,7 @@ defmodule DLM.HybridMuon7 do
   defn adam_step(p, g, m, v, step, lr) do
     beta1 = 0.9
     beta2 = 0.999
-    weight_decay = 0.01
+    flat_decay = 1.0e-4
 
     m_new = Nx.add(Nx.multiply(beta1, m), Nx.multiply(1.0 - beta1, g))
     v_new = Nx.add(Nx.multiply(beta2, v), Nx.multiply(1.0 - beta2, Nx.pow(g, 2)))
@@ -351,10 +380,13 @@ defmodule DLM.HybridMuon7 do
 
     update_val = Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), 1.0e-8)))
 
-    p_decayed = Nx.subtract(p, Nx.multiply(Nx.multiply(lr, weight_decay), p))
+    p_decayed = Nx.subtract(p, Nx.multiply(flat_decay, p))
     p_new = Nx.subtract(p_decayed, update_val)
 
-    {p_new, m_new, v_new}
+    # ⚡ Apply the hard ceiling!
+    p_clipped = limit_norm(p_new, 20.0)
+
+    {p_clipped, m_new, v_new}
   end
 
   # -------------------------------------------------------------------------
@@ -384,7 +416,7 @@ defmodule DLM.HybridMuon7 do
   # -------------------------------------------------------------------------
   defn muon_step(p, g, m, v, lr) do
     beta1 = 0.95 # Muon standard momentum
-    weight_decay = 0.01
+    flat_decay = 1.0e-4
     
     # Update Momentum
     m_new = Nx.add(Nx.multiply(beta1, m), Nx.multiply(1.0 - beta1, g))
@@ -395,16 +427,17 @@ defmodule DLM.HybridMuon7 do
     # ⚡ THE FIX: Keep it entirely in the Nx Graph
     r = Nx.axis_size(p, 0)
     c = Nx.axis_size(p, 1)
-    scale = Nx.max(r, c) |> Nx.as_type(:f32)
+    scale = Nx.divide(Nx.max(r, c), 5.0) |> Nx.as_type(:f32)
     
     scaled_update = Nx.multiply(ortho_update, scale)
 
     # Apply weight decay and step
-    p_decayed = Nx.subtract(p, Nx.multiply(Nx.multiply(lr, weight_decay), p))
+    p_decayed = Nx.subtract(p, Nx.multiply(flat_decay, p))
     p_new = Nx.subtract(p_decayed, Nx.multiply(lr, scaled_update))
-    
+    # ⚡ Apply the hard ceiling!
+    p_clipped = limit_norm(p_new, 20.0)
     # Note: Muon doesn't use 'v' (variance), we just pass it back to keep the tuple shapes identical
-    {p_new, m_new, v}
+    {p_clipped, m_new, v}
   end
 
   # -------------------------------------------------------------------------
@@ -432,7 +465,7 @@ defmodule DLM.HybridMuon7 do
     new_params = {a_new, bu_new, bv_new, cu_new, cv_new, du_new, dv_new}
     new_ms = {ma_new, mbu_new, mbv_new, mcu_new, mcv_new, mdu_new, mdv_new}
     new_vs = {va_new, vbu_new, vbv_new, vcu_new, vcv_new, vdu_new, vdv_new}
-
+    
     {new_params, new_ms, new_vs, new_step}
   end
 end
@@ -441,7 +474,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.HybridMuon7, <<70, 79, 82, 49, 0, 0, 39, ...>>, true}
+{:module, DLM.HybridMuon7, <<70, 79, 82, 49, 0, 0, 44, ...>>, true}
 ```
 
 ```elixir
@@ -464,8 +497,8 @@ defmodule DLM.PhysicsGenesis do
     {cv, k5} = Nx.Random.normal(k4, 0.0, 0.02, shape: {@rank, @dim})
 
     # ⚡ NEW: d: Dynamic Gating Matrices (Initialized near zero)
-    {du, k6} = Nx.Random.normal(k5, 0.0, 0.001, shape: {@dim, @rank})
-    {dv, next_key} = Nx.Random.normal(k6, 0.0, 0.001, shape: {@rank, @dim})
+    {du, k6} = Nx.Random.normal(k5, 0.0, 0.02, shape: {@dim, @rank})
+    {dv, next_key} = Nx.Random.normal(k6, 0.0, 0.02, shape: {@rank, @dim})
 
     {{a, bu, bv, cu, cv, du, dv}, next_key}
   end
@@ -481,6 +514,113 @@ end
 
 ```
 {:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 16, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Physics test
+
+```elixir
+defmodule DLM.Phase2_Eval do
+  import Nx.Defn
+
+  # Run this on a held-out validation batch (not your training data)
+  defn compute_accuracy(input_tokens, target_tokens, h_init, params, frozen_embeds) do
+    # 1. Map inputs to continuous space
+    input_coords =
+      Nx.take(frozen_embeds, Nx.flatten(input_tokens))
+      |> Nx.reshape({Nx.axis_size(input_tokens, 0), Nx.axis_size(input_tokens, 1), 512})
+    
+    inputs_time_first = Nx.transpose(input_coords, axes: [1, 0, 2])
+    targets_time_first = Nx.transpose(target_tokens, axes: [1, 0])
+
+    # 2. Run the pure physics engine (No noise injection here!)
+    result =
+      while {i = 0, correct_top1 = 0.0, total_chars = 0.0,
+             h = h_init, inputs = inputs_time_first, targets = targets_time_first, 
+             p = params, f_embs = frozen_embeds},
+            Nx.less(i, Nx.axis_size(inputs, 0)) do
+      
+        {pred_coord, h_new} = DLM.TinySSM.forward(inputs[i], h, p)
+        
+        # 3. Calculate Cosine Similarities against ALL tokens
+        pred_norm = DLM.Loss.l2_normalize(pred_coord)
+        similarities = Nx.dot(pred_norm, Nx.transpose(f_embs))
+        
+        # 4. Did the physics engine point closest to the true target?
+        predicted_indices = Nx.argmax(similarities, axis: -1)
+        true_indices = targets[i]
+        
+        # Count matches
+        matches = Nx.equal(predicted_indices, true_indices) |> Nx.sum()
+        
+        {i + 1, 
+         Nx.add(correct_top1, matches), 
+         Nx.add(total_chars, Nx.axis_size(true_indices, 0)), 
+         h_new, inputs, targets, p, f_embs}
+      end
+
+    total_correct = elem(result, 1)
+    total_count = elem(result, 2)
+    
+    # Return accuracy as a percentage
+    Nx.multiply(Nx.divide(total_correct, total_count), 100.0)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase2_Eval, <<70, 79, 82, 49, 0, 0, 21, ...>>, true}
+```
+
+```elixir
+# 1. Load the completed Phase 1 state
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+
+# 2. Unpack it (we only want the embeds, we can throw away the Phase 1 denoiser weights for now)
+{cpu_embeds, _w1, _w2, _key} = phase1_p
+
+# 3. Push the finalized map to the GPU and L2 Normalize it one last time to be safe
+frozen_map = cpu_embeds
+             |> Nx.backend_copy(gpu)
+             |> DLM.Loss.l2_normalize()
+
+phase2_p = File.read!("v37_DLM_Phase_2_lr3e5_softnn_checkpoint_step_10000.bin") |> :erlang.binary_to_term()
+
+# 1. Grab a chunk of text the model hasn't seen during training
+val_text = "The quick brown fox jumps over the lazy dog. It was the best of times, it was the worst of times."
+
+# 2. Convert to ASCII tensor
+val_tokens = val_text |> to_charlist() |> Nx.tensor(type: :s32)
+seq_len = Nx.size(val_tokens) - 1
+
+# 3. Shift by One & add Batch Dimension {1, seq_len}
+input_tokens = Nx.slice_along_axis(val_tokens, 0, seq_len, axis: 0) |> Nx.new_axis(0)
+target_tokens = Nx.slice_along_axis(val_tokens, 1, seq_len, axis: 0) |> Nx.new_axis(0)
+
+# 4. Initialize a blank hidden state for Batch Size 1
+h_init = Nx.broadcast(0.0, {1, 512})
+
+# 5. Run the evaluation!
+accuracy_tensor = DLM.Phase2_Eval.compute_accuracy(input_tokens, target_tokens, h_init, phase2_p, frozen_map)
+
+# Print the result
+accuracy = Nx.to_number(accuracy_tensor)
+IO.puts("Phase 2 Top-1 Physics Accuracy: #{Float.round(accuracy, 2)}%")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Phase 2 Top-1 Physics Accuracy: 36.46%
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
 ```
 
 <!-- livebook:{"branch_parent_index":0} -->
@@ -504,19 +644,14 @@ defmodule DLM.Inference do
     Nx.argmax(similarities, axis: -1) |> Nx.squeeze()
   end
 
-  # ⚡ Replaces your old nearest_neighbor function
-  # ⚡ Updated sample_neighbor function
-  defn sample_neighbor(predicted_vector, frozen_embeds, key, temperature \\ 0.8) do
+  defn sample_neighbor(predicted_vector, frozen_embeds, key, temperature \\ 0.025) do # ⚡ Drop default temp to match training
     # 1. Normalize and get similarities [-1.0 to 1.0]
     pred_norm = DLM.Loss.l2_normalize(predicted_vector)
     similarities = Nx.dot(pred_norm, Nx.transpose(frozen_embeds)) |> Nx.squeeze()
     
-    # ⚡ THE FIX: Stretch the bounded cosine similarities into standard logit ranges
-    logit_scale = Nx.tensor(30.0, type: :f32)
-    scaled_logits = Nx.multiply(similarities, logit_scale)
-
-    # 2. Scale by Temperature
-    logits = Nx.divide(scaled_logits, Nx.add(temperature, 1.0e-5))
+    # ⚡ 2. REMOVED THE 30.0 HACK. Just use the sampling temperature directly.
+    # A temp of 0.1 perfectly matches the soft_nn_loss scaling!
+    logits = Nx.divide(similarities, Nx.add(temperature, 1.0e-5))
 
     # 3. Gumbel-Max Trick
     {uniform_noise, next_key} = Nx.Random.uniform(key, 0.0, 1.0, shape: Nx.shape(logits))
@@ -576,7 +711,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.Inference, <<70, 79, 82, 49, 0, 0, 30, ...>>, {:generate, 4}}
+{:module, DLM.Inference, <<70, 79, 82, 49, 0, 0, 29, ...>>, {:generate, 4}}
 ```
 
 ```elixir
@@ -591,7 +726,7 @@ frozen_map = cpu_embeds
              |> Nx.backend_copy(gpu)
              |> DLM.Loss.l2_normalize()
 
-phase2_p = File.read!("v33_DLM_Phase_2_cos_checkpoint_step_13000.bin") |> :erlang.binary_to_term()
+phase2_p = File.read!("v37_DLM_Phase_2_lr3e5_softnn_checkpoint_step_10000.bin") |> :erlang.binary_to_term()
 
 prompt = "Hello, my name is "
 
@@ -605,7 +740,7 @@ IO.puts("#{generation}")
 <!-- livebook:{"output":true} -->
 
 ```
-Hello, my name is *CHI: oh the so the see the some the some the s the she she she stand the so the she she she so the see the se
+Hello, my name is `quing........................................................................................................
 ```
 
 <!-- livebook:{"output":true} -->
@@ -629,7 +764,7 @@ defmodule DLM.Phase2Trainer do
                   |> stop_grad()
 
     # 2. ⚡ THE SWAP: Use Cosine Distance instead of MSE
-    DLM.Loss.cosine_distance(predicted_latents, true_coords)
+    DLM.Loss.soft_nn_loss(predicted_latents, true_coords, 0.1)
   end
 
   defn compute_sequence_loss(input_tokens, target_tokens, h_init, predictor_params, noise_key, noise_scale, frozen_embeds) do
@@ -749,8 +884,8 @@ end
 ```
 
 ```elixir
-run_prefix  = "v33_DLM_Phase_2_cos"  
-total_steps = 30000
+run_prefix  = "v37_DLM_Phase_2_lr3e5_20n"  
+total_steps = 40000
 
 # ⚡ 2. CHECK RESUME STATE (No more base_weights passed in!)
 {load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
@@ -807,7 +942,7 @@ else
       gpu_batch = Nx.backend_copy(cpu_batch, gpu)
       
       # ⚡ DYNAMIC LEARNING RATE SCHEDULER
-      max_lr = 1.2e-5     # Enough power to reach the canyon, slow enough to stay in it
+      max_lr = 3.0e-5    # Enough power to reach the canyon, slow enough to stay in it
       warmup_steps = 800  # Give the fluid more time to build momentum
 
       current_lr =
@@ -846,7 +981,7 @@ else
         bv_norm = bv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
         dv_norm = dv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
 
-        IO.puts("➡️  Step #{step} | Cosine Loss: #{Float.round(loss_val, 4)} | LR: #{Float.round(current_lr, 6)} | bv: #{Float.round(bv_norm, 4)} | dv: #{Float.round(dv_norm, 4)}")
+        IO.puts("➡️  Step #{step} | Soft NN Loss: #{Float.round(loss_val, 4)} | LR: #{Float.round(current_lr, 6)} | bv: #{Float.round(bv_norm, 4)} | dv: #{Float.round(dv_norm, 4)}")
       end
 
       # 💾 DYNAMIC CHECKPOINT SAVING
@@ -877,292 +1012,311 @@ end
 
 ```
 warning: variable "step_count" is unused (if the variable is not meant to be used, prefix it with an underscore)
-└─ pep2.livemd#cell:3yasz3jbymx637se:44
+└─ pep2.livemd#cell:sfbqh7vg7pjnufkj:44
 
-✨ No checkpoints found for 'v33_DLM_Phase_2_cos'. Starting FRESH from Genesis.
+✨ No checkpoints found for 'v37_DLM_Phase_2_lr3e5_20n'. Starting FRESH from Genesis.
+
+22:15:14.518 [info] XLA service 0x7c8b4805ea00 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+22:15:14.520 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+22:15:14.520 [info] Using BFC allocator.
+
+22:15:14.520 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+22:15:14.520 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
 🌌 Phase 1 Frozen Manifold Loaded & Normalized!
 🧠 Loading LPSSM 128seqlen training data CPU Memory...
-✨ Igniting brand new Genesis weights for v33_DLM_Phase_2_cos...
+✨ Igniting brand new Genesis weights for v37_DLM_Phase_2_lr3e5_20n...
 
-23:00:31.099 [info] Merging Dots in computation: region_0.13
+22:15:15.498 [info] Merging Dots in computation: region_0.18
 
-23:00:31.099 [info] Merging Dots in computation: region_14.30.clone
-➡️  Step 0 | Cosine Loss: 0.9982 | LR: 0.0 | bv: 7.2268 | dv: 0.361
-➡️  Step 50 | Cosine Loss: 0.9767 | LR: 1.0e-6 | bv: 7.2268 | dv: 0.3638
-➡️  Step 100 | Cosine Loss: 0.9132 | LR: 2.0e-6 | bv: 7.2269 | dv: 0.3964
-➡️  Step 150 | Cosine Loss: 0.8225 | LR: 2.0e-6 | bv: 7.2274 | dv: 0.4834
-➡️  Step 200 | Cosine Loss: 0.7543 | LR: 3.0e-6 | bv: 7.2295 | dv: 0.6221
-➡️  Step 250 | Cosine Loss: 0.697 | LR: 4.0e-6 | bv: 7.2359 | dv: 0.7862
-➡️  Step 300 | Cosine Loss: 0.6589 | LR: 5.0e-6 | bv: 7.2503 | dv: 0.9612
-➡️  Step 350 | Cosine Loss: 0.6464 | LR: 5.0e-6 | bv: 7.274 | dv: 1.1336
-➡️  Step 400 | Cosine Loss: 0.6427 | LR: 6.0e-6 | bv: 7.3052 | dv: 1.2937
-➡️  Step 450 | Cosine Loss: 0.6406 | LR: 7.0e-6 | bv: 7.3455 | dv: 1.4438
-➡️  Step 500 | Cosine Loss: 0.6423 | LR: 8.0e-6 | bv: 7.4028 | dv: 1.5901
-➡️  Step 550 | Cosine Loss: 0.6402 | LR: 8.0e-6 | bv: 7.4832 | dv: 1.7338
-➡️  Step 600 | Cosine Loss: 0.631 | LR: 9.0e-6 | bv: 7.5862 | dv: 1.88
-➡️  Step 650 | Cosine Loss: 0.6338 | LR: 1.0e-5 | bv: 7.7092 | dv: 2.045
-➡️  Step 700 | Cosine Loss: 0.6323 | LR: 1.1e-5 | bv: 7.8495 | dv: 2.2406
-➡️  Step 750 | Cosine Loss: 0.6309 | LR: 1.1e-5 | bv: 8.0033 | dv: 2.4701
-➡️  Step 800 | Cosine Loss: 0.6207 | LR: 1.2e-5 | bv: 8.1664 | dv: 2.7463
-➡️  Step 850 | Cosine Loss: 0.624 | LR: 1.2e-5 | bv: 8.3131 | dv: 3.0307
-➡️  Step 900 | Cosine Loss: 0.6227 | LR: 1.2e-5 | bv: 8.4531 | dv: 3.3173
-➡️  Step 950 | Cosine Loss: 0.617 | LR: 1.2e-5 | bv: 8.5789 | dv: 3.6018
-➡️  Step 1000 | Cosine Loss: 0.6193 | LR: 1.2e-5 | bv: 8.6974 | dv: 3.887
+22:15:15.498 [info] Merging Dots in computation: region_19.46.clone
+
+22:16:16.530 [info] Merging Dots in computation: region_2.3
+
+22:16:16.530 [info] Merging Dots in computation: region_6.7
+
+22:16:16.530 [info] Merging Dots in computation: region_10.11
+
+22:16:16.530 [info] Merging Dots in computation: region_14.15
+
+22:16:16.530 [info] Merging Dots in computation: region_18.19
+
+22:16:16.530 [info] Merging Dots in computation: region_22.23
+➡️  Step 0 | Soft NN Loss: 3.562 | LR: 0.0 | bv: 7.2502 | dv: 0.3614
+➡️  Step 50 | Soft NN Loss: 3.5381 | LR: 2.0e-6 | bv: 7.214 | dv: 0.3602
+➡️  Step 100 | Soft NN Loss: 3.4987 | LR: 4.0e-6 | bv: 7.1784 | dv: 0.3673
+➡️  Step 150 | Soft NN Loss: 3.4658 | LR: 6.0e-6 | bv: 7.1442 | dv: 0.3985
+➡️  Step 200 | Soft NN Loss: 3.4203 | LR: 8.0e-6 | bv: 7.1133 | dv: 0.4633
+➡️  Step 250 | Soft NN Loss: 3.3886 | LR: 9.0e-6 | bv: 7.0874 | dv: 0.5636
+➡️  Step 300 | Soft NN Loss: 3.3433 | LR: 1.1e-5 | bv: 7.0679 | dv: 0.6945
+➡️  Step 350 | Soft NN Loss: 3.3194 | LR: 1.3e-5 | bv: 7.0555 | dv: 0.8475
+➡️  Step 400 | Soft NN Loss: 3.2719 | LR: 1.5e-5 | bv: 7.05 | dv: 1.0112
+➡️  Step 450 | Soft NN Loss: 3.2647 | LR: 1.7e-5 | bv: 7.0515 | dv: 1.175
+➡️  Step 500 | Soft NN Loss: 3.2632 | LR: 1.9e-5 | bv: 7.0591 | dv: 1.3336
+➡️  Step 550 | Soft NN Loss: 3.2263 | LR: 2.1e-5 | bv: 7.0719 | dv: 1.4806
+➡️  Step 600 | Soft NN Loss: 3.2431 | LR: 2.3e-5 | bv: 7.0886 | dv: 1.6209
+➡️  Step 650 | Soft NN Loss: 3.2203 | LR: 2.4e-5 | bv: 7.1092 | dv: 1.7665
+➡️  Step 700 | Soft NN Loss: 3.1053 | LR: 2.6e-5 | bv: 7.1325 | dv: 1.9092
+➡️  Step 750 | Soft NN Loss: 3.1295 | LR: 2.8e-5 | bv: 7.1597 | dv: 2.0542
+➡️  Step 800 | Soft NN Loss: 3.1769 | LR: 3.0e-5 | bv: 7.1911 | dv: 2.2031
+➡️  Step 850 | Soft NN Loss: 3.0826 | LR: 3.0e-5 | bv: 7.2234 | dv: 2.3463
+➡️  Step 900 | Soft NN Loss: 3.2032 | LR: 3.0e-5 | bv: 7.2534 | dv: 2.4672
+➡️  Step 950 | Soft NN Loss: 3.0876 | LR: 3.0e-5 | bv: 7.2819 | dv: 2.5828
+➡️  Step 1000 | Soft NN Loss: 3.0128 | LR: 3.0e-5 | bv: 7.3067 | dv: 2.7008
 💾 Checkpoint reached! Saving Step 1000...
-➡️  Step 1050 | Cosine Loss: 0.6111 | LR: 1.2e-5 | bv: 8.8094 | dv: 4.1647
-➡️  Step 1100 | Cosine Loss: 0.6238 | LR: 1.2e-5 | bv: 8.914 | dv: 4.4192
-➡️  Step 1150 | Cosine Loss: 0.6182 | LR: 1.2e-5 | bv: 9.0174 | dv: 4.6522
-➡️  Step 1200 | Cosine Loss: 0.6072 | LR: 1.2e-5 | bv: 9.1184 | dv: 4.8647
-➡️  Step 1250 | Cosine Loss: 0.605 | LR: 1.2e-5 | bv: 9.2178 | dv: 5.0672
-➡️  Step 1300 | Cosine Loss: 0.6111 | LR: 1.2e-5 | bv: 9.314 | dv: 5.2615
-➡️  Step 1350 | Cosine Loss: 0.6093 | LR: 1.2e-5 | bv: 9.4034 | dv: 5.441
-➡️  Step 1400 | Cosine Loss: 0.6069 | LR: 1.2e-5 | bv: 9.488 | dv: 5.6159
-➡️  Step 1450 | Cosine Loss: 0.6 | LR: 1.2e-5 | bv: 9.5671 | dv: 5.7844
-➡️  Step 1500 | Cosine Loss: 0.6045 | LR: 1.2e-5 | bv: 9.6415 | dv: 5.9434
-➡️  Step 1550 | Cosine Loss: 0.5939 | LR: 1.2e-5 | bv: 9.7146 | dv: 6.0965
-➡️  Step 1600 | Cosine Loss: 0.6005 | LR: 1.2e-5 | bv: 9.7875 | dv: 6.2442
-➡️  Step 1650 | Cosine Loss: 0.5903 | LR: 1.2e-5 | bv: 9.8551 | dv: 6.3799
-➡️  Step 1700 | Cosine Loss: 0.5867 | LR: 1.2e-5 | bv: 9.9205 | dv: 6.5093
-➡️  Step 1750 | Cosine Loss: 0.5905 | LR: 1.2e-5 | bv: 9.9909 | dv: 6.6388
-➡️  Step 1800 | Cosine Loss: 0.5903 | LR: 1.2e-5 | bv: 10.0609 | dv: 6.755
-➡️  Step 1850 | Cosine Loss: 0.5868 | LR: 1.2e-5 | bv: 10.1306 | dv: 6.866
-➡️  Step 1900 | Cosine Loss: 0.5855 | LR: 1.2e-5 | bv: 10.2017 | dv: 6.9775
-➡️  Step 1950 | Cosine Loss: 0.5927 | LR: 1.2e-5 | bv: 10.2729 | dv: 7.0756
-➡️  Step 2000 | Cosine Loss: 0.5874 | LR: 1.2e-5 | bv: 10.3479 | dv: 7.1703
+➡️  Step 1050 | Soft NN Loss: 3.0829 | LR: 3.0e-5 | bv: 7.3288 | dv: 2.8263
+➡️  Step 1100 | Soft NN Loss: 3.0361 | LR: 3.0e-5 | bv: 7.3467 | dv: 2.9619
+➡️  Step 1150 | Soft NN Loss: 2.9817 | LR: 3.0e-5 | bv: 7.3627 | dv: 3.1064
+➡️  Step 1200 | Soft NN Loss: 2.9974 | LR: 3.0e-5 | bv: 7.3772 | dv: 3.2568
+➡️  Step 1250 | Soft NN Loss: 3.0278 | LR: 3.0e-5 | bv: 7.391 | dv: 3.4065
+➡️  Step 1300 | Soft NN Loss: 2.9194 | LR: 3.0e-5 | bv: 7.4037 | dv: 3.5481
+➡️  Step 1350 | Soft NN Loss: 2.8455 | LR: 3.0e-5 | bv: 7.4161 | dv: 3.6885
+➡️  Step 1400 | Soft NN Loss: 2.8497 | LR: 3.0e-5 | bv: 7.4256 | dv: 3.8307
+➡️  Step 1450 | Soft NN Loss: 2.8808 | LR: 3.0e-5 | bv: 7.4344 | dv: 3.9831
+➡️  Step 1500 | Soft NN Loss: 2.9398 | LR: 3.0e-5 | bv: 7.4427 | dv: 4.1515
+➡️  Step 1550 | Soft NN Loss: 2.8826 | LR: 3.0e-5 | bv: 7.4499 | dv: 4.314
+➡️  Step 1600 | Soft NN Loss: 2.8664 | LR: 3.0e-5 | bv: 7.4569 | dv: 4.4783
+➡️  Step 1650 | Soft NN Loss: 2.9027 | LR: 3.0e-5 | bv: 7.4645 | dv: 4.6429
+➡️  Step 1700 | Soft NN Loss: 2.7824 | LR: 3.0e-5 | bv: 7.4722 | dv: 4.8035
+➡️  Step 1750 | Soft NN Loss: 2.7797 | LR: 3.0e-5 | bv: 7.4777 | dv: 4.9522
+➡️  Step 1800 | Soft NN Loss: 2.7675 | LR: 3.0e-5 | bv: 7.4818 | dv: 5.0924
+➡️  Step 1850 | Soft NN Loss: 2.8464 | LR: 3.0e-5 | bv: 7.4849 | dv: 5.2396
+➡️  Step 1900 | Soft NN Loss: 2.7441 | LR: 3.0e-5 | bv: 7.486 | dv: 5.3878
+➡️  Step 1950 | Soft NN Loss: 2.8035 | LR: 3.0e-5 | bv: 7.486 | dv: 5.529
+➡️  Step 2000 | Soft NN Loss: 2.7627 | LR: 3.0e-5 | bv: 7.4861 | dv: 5.679
 💾 Checkpoint reached! Saving Step 2000...
-➡️  Step 2050 | Cosine Loss: 0.5831 | LR: 1.2e-5 | bv: 10.4203 | dv: 7.2603
-➡️  Step 2100 | Cosine Loss: 0.581 | LR: 1.2e-5 | bv: 10.4919 | dv: 7.3399
-➡️  Step 2150 | Cosine Loss: 0.5949 | LR: 1.2e-5 | bv: 10.561 | dv: 7.4122
-➡️  Step 2200 | Cosine Loss: 0.592 | LR: 1.2e-5 | bv: 10.6326 | dv: 7.4834
-➡️  Step 2250 | Cosine Loss: 0.5907 | LR: 1.2e-5 | bv: 10.7033 | dv: 7.5524
-➡️  Step 2300 | Cosine Loss: 0.5686 | LR: 1.2e-5 | bv: 10.7768 | dv: 7.6212
-➡️  Step 2350 | Cosine Loss: 0.5762 | LR: 1.2e-5 | bv: 10.8435 | dv: 7.6842
-➡️  Step 2400 | Cosine Loss: 0.5727 | LR: 1.2e-5 | bv: 10.9058 | dv: 7.7478
-➡️  Step 2450 | Cosine Loss: 0.5687 | LR: 1.2e-5 | bv: 10.9669 | dv: 7.8187
-➡️  Step 2500 | Cosine Loss: 0.5673 | LR: 1.2e-5 | bv: 11.0324 | dv: 7.8937
-➡️  Step 2550 | Cosine Loss: 0.5663 | LR: 1.2e-5 | bv: 11.0993 | dv: 7.9607
-➡️  Step 2600 | Cosine Loss: 0.5633 | LR: 1.2e-5 | bv: 11.1697 | dv: 8.0319
-➡️  Step 2650 | Cosine Loss: 0.5665 | LR: 1.2e-5 | bv: 11.2425 | dv: 8.1191
-➡️  Step 2700 | Cosine Loss: 0.5554 | LR: 1.2e-5 | bv: 11.3234 | dv: 8.2173
-➡️  Step 2750 | Cosine Loss: 0.5589 | LR: 1.2e-5 | bv: 11.4076 | dv: 8.3117
-➡️  Step 2800 | Cosine Loss: 0.563 | LR: 1.2e-5 | bv: 11.4865 | dv: 8.4003
-➡️  Step 2850 | Cosine Loss: 0.5596 | LR: 1.2e-5 | bv: 11.5612 | dv: 8.4839
-➡️  Step 2900 | Cosine Loss: 0.5706 | LR: 1.2e-5 | bv: 11.6357 | dv: 8.5666
-➡️  Step 2950 | Cosine Loss: 0.5677 | LR: 1.2e-5 | bv: 11.7104 | dv: 8.6554
-➡️  Step 3000 | Cosine Loss: 0.5582 | LR: 1.2e-5 | bv: 11.7952 | dv: 8.751
+➡️  Step 2050 | Soft NN Loss: 2.7498 | LR: 3.0e-5 | bv: 7.4863 | dv: 5.8414
+➡️  Step 2100 | Soft NN Loss: 2.7607 | LR: 3.0e-5 | bv: 7.4873 | dv: 6.0202
+➡️  Step 2150 | Soft NN Loss: 2.7595 | LR: 3.0e-5 | bv: 7.4875 | dv: 6.1815
+➡️  Step 2200 | Soft NN Loss: 2.7794 | LR: 3.0e-5 | bv: 7.4869 | dv: 6.3181
+➡️  Step 2250 | Soft NN Loss: 2.7541 | LR: 3.0e-5 | bv: 7.4867 | dv: 6.4403
+➡️  Step 2300 | Soft NN Loss: 2.7228 | LR: 3.0e-5 | bv: 7.4881 | dv: 6.5587
+➡️  Step 2350 | Soft NN Loss: 2.7658 | LR: 3.0e-5 | bv: 7.4896 | dv: 6.671
+➡️  Step 2400 | Soft NN Loss: 2.688 | LR: 3.0e-5 | bv: 7.4909 | dv: 6.7913
+➡️  Step 2450 | Soft NN Loss: 2.713 | LR: 3.0e-5 | bv: 7.4916 | dv: 6.9171
+➡️  Step 2500 | Soft NN Loss: 2.8097 | LR: 3.0e-5 | bv: 7.4915 | dv: 7.0461
+➡️  Step 2550 | Soft NN Loss: 2.7811 | LR: 3.0e-5 | bv: 7.4906 | dv: 7.1636
+➡️  Step 2600 | Soft NN Loss: 2.6978 | LR: 3.0e-5 | bv: 7.4902 | dv: 7.2792
+➡️  Step 2650 | Soft NN Loss: 2.7139 | LR: 3.0e-5 | bv: 7.4902 | dv: 7.3965
+➡️  Step 2700 | Soft NN Loss: 2.6645 | LR: 3.0e-5 | bv: 7.4916 | dv: 7.4832
+➡️  Step 2750 | Soft NN Loss: 2.7247 | LR: 3.0e-5 | bv: 7.4929 | dv: 7.5667
+➡️  Step 2800 | Soft NN Loss: 2.6555 | LR: 3.0e-5 | bv: 7.4933 | dv: 7.6777
+➡️  Step 2850 | Soft NN Loss: 2.7342 | LR: 3.0e-5 | bv: 7.4942 | dv: 7.7924
+➡️  Step 2900 | Soft NN Loss: 2.7516 | LR: 3.0e-5 | bv: 7.497 | dv: 7.8976
+➡️  Step 2950 | Soft NN Loss: 2.6892 | LR: 3.0e-5 | bv: 7.4996 | dv: 8.0122
+➡️  Step 3000 | Soft NN Loss: 2.6368 | LR: 3.0e-5 | bv: 7.5009 | dv: 8.128
 💾 Checkpoint reached! Saving Step 3000...
-➡️  Step 3050 | Cosine Loss: 0.5475 | LR: 1.2e-5 | bv: 11.8835 | dv: 8.8479
-➡️  Step 3100 | Cosine Loss: 0.5675 | LR: 1.2e-5 | bv: 11.9726 | dv: 8.9397
-➡️  Step 3150 | Cosine Loss: 0.5657 | LR: 1.2e-5 | bv: 12.0619 | dv: 9.0335
-➡️  Step 3200 | Cosine Loss: 0.5481 | LR: 1.2e-5 | bv: 12.1577 | dv: 9.1355
-➡️  Step 3250 | Cosine Loss: 0.5594 | LR: 1.2e-5 | bv: 12.2501 | dv: 9.234
-➡️  Step 3300 | Cosine Loss: 0.551 | LR: 1.2e-5 | bv: 12.3393 | dv: 9.3302
-➡️  Step 3350 | Cosine Loss: 0.562 | LR: 1.2e-5 | bv: 12.4335 | dv: 9.4327
-➡️  Step 3400 | Cosine Loss: 0.5572 | LR: 1.2e-5 | bv: 12.5217 | dv: 9.5275
-➡️  Step 3450 | Cosine Loss: 0.5597 | LR: 1.2e-5 | bv: 12.6077 | dv: 9.6177
-➡️  Step 3500 | Cosine Loss: 0.5453 | LR: 1.2e-5 | bv: 12.6957 | dv: 9.7083
-➡️  Step 3550 | Cosine Loss: 0.5476 | LR: 1.2e-5 | bv: 12.7815 | dv: 9.7943
-➡️  Step 3600 | Cosine Loss: 0.5433 | LR: 1.2e-5 | bv: 12.8652 | dv: 9.8765
-➡️  Step 3650 | Cosine Loss: 0.5471 | LR: 1.2e-5 | bv: 12.9507 | dv: 9.961
-➡️  Step 3700 | Cosine Loss: 0.5328 | LR: 1.2e-5 | bv: 13.0388 | dv: 10.0514
-➡️  Step 3750 | Cosine Loss: 0.5284 | LR: 1.2e-5 | bv: 13.1287 | dv: 10.1483
-➡️  Step 3800 | Cosine Loss: 0.5365 | LR: 1.2e-5 | bv: 13.2193 | dv: 10.2463
-➡️  Step 3850 | Cosine Loss: 0.5306 | LR: 1.2e-5 | bv: 13.308 | dv: 10.3441
-➡️  Step 3900 | Cosine Loss: 0.5553 | LR: 1.2e-5 | bv: 13.3968 | dv: 10.4439
-➡️  Step 3950 | Cosine Loss: 0.5323 | LR: 1.2e-5 | bv: 13.4839 | dv: 10.5367
-➡️  Step 4000 | Cosine Loss: 0.5396 | LR: 1.2e-5 | bv: 13.5662 | dv: 10.6237
+➡️  Step 3050 | Soft NN Loss: 2.6548 | LR: 3.0e-5 | bv: 7.5005 | dv: 8.2383
+➡️  Step 3100 | Soft NN Loss: 2.6871 | LR: 3.0e-5 | bv: 7.5001 | dv: 8.3534
+➡️  Step 3150 | Soft NN Loss: 2.7292 | LR: 3.0e-5 | bv: 7.4999 | dv: 8.4629
+➡️  Step 3200 | Soft NN Loss: 2.7136 | LR: 3.0e-5 | bv: 7.5002 | dv: 8.5637
+➡️  Step 3250 | Soft NN Loss: 2.7172 | LR: 3.0e-5 | bv: 7.5013 | dv: 8.6643
+➡️  Step 3300 | Soft NN Loss: 2.6838 | LR: 3.0e-5 | bv: 7.5023 | dv: 8.7416
+➡️  Step 3350 | Soft NN Loss: 2.6912 | LR: 3.0e-5 | bv: 7.5026 | dv: 8.8196
+➡️  Step 3400 | Soft NN Loss: 2.7288 | LR: 3.0e-5 | bv: 7.5021 | dv: 8.9141
+➡️  Step 3450 | Soft NN Loss: 2.7445 | LR: 3.0e-5 | bv: 7.5025 | dv: 8.9975
+➡️  Step 3500 | Soft NN Loss: 2.6897 | LR: 3.0e-5 | bv: 7.5046 | dv: 9.0826
+➡️  Step 3550 | Soft NN Loss: 2.6603 | LR: 3.0e-5 | bv: 7.5056 | dv: 9.1709
+➡️  Step 3600 | Soft NN Loss: 2.6511 | LR: 3.0e-5 | bv: 7.5064 | dv: 9.2629
+➡️  Step 3650 | Soft NN Loss: 2.7392 | LR: 3.0e-5 | bv: 7.5075 | dv: 9.3676
+➡️  Step 3700 | Soft NN Loss: 2.6219 | LR: 3.0e-5 | bv: 7.5073 | dv: 9.4788
+➡️  Step 3750 | Soft NN Loss: 2.6399 | LR: 3.0e-5 | bv: 7.5081 | dv: 9.5949
+➡️  Step 3800 | Soft NN Loss: 2.6743 | LR: 3.0e-5 | bv: 7.5106 | dv: 9.7065
+➡️  Step 3850 | Soft NN Loss: 2.6677 | LR: 3.0e-5 | bv: 7.5118 | dv: 9.801
+➡️  Step 3900 | Soft NN Loss: 2.7061 | LR: 3.0e-5 | bv: 7.512 | dv: 9.8783
+➡️  Step 3950 | Soft NN Loss: 2.643 | LR: 3.0e-5 | bv: 7.5108 | dv: 9.9515
+➡️  Step 4000 | Soft NN Loss: 2.6494 | LR: 3.0e-5 | bv: 7.5095 | dv: 10.0325
 💾 Checkpoint reached! Saving Step 4000...
-➡️  Step 4050 | Cosine Loss: 0.5113 | LR: 1.2e-5 | bv: 13.6463 | dv: 10.7098
-➡️  Step 4100 | Cosine Loss: 0.5348 | LR: 1.2e-5 | bv: 13.7265 | dv: 10.7975
-➡️  Step 4150 | Cosine Loss: 0.5287 | LR: 1.2e-5 | bv: 13.8086 | dv: 10.8885
-➡️  Step 4200 | Cosine Loss: 0.5167 | LR: 1.2e-5 | bv: 13.8923 | dv: 10.9791
-➡️  Step 4250 | Cosine Loss: 0.515 | LR: 1.2e-5 | bv: 13.976 | dv: 11.0683
-➡️  Step 4300 | Cosine Loss: 0.5296 | LR: 1.2e-5 | bv: 14.06 | dv: 11.1606
-➡️  Step 4350 | Cosine Loss: 0.5058 | LR: 1.2e-5 | bv: 14.1428 | dv: 11.2524
-➡️  Step 4400 | Cosine Loss: 0.5231 | LR: 1.2e-5 | bv: 14.2229 | dv: 11.3436
-➡️  Step 4450 | Cosine Loss: 0.527 | LR: 1.2e-5 | bv: 14.3002 | dv: 11.4309
-➡️  Step 4500 | Cosine Loss: 0.5015 | LR: 1.2e-5 | bv: 14.376 | dv: 11.5138
-➡️  Step 4550 | Cosine Loss: 0.5136 | LR: 1.2e-5 | bv: 14.4511 | dv: 11.596
-➡️  Step 4600 | Cosine Loss: 0.5064 | LR: 1.2e-5 | bv: 14.5247 | dv: 11.6767
-➡️  Step 4650 | Cosine Loss: 0.5476 | LR: 1.1e-5 | bv: 14.5973 | dv: 11.757
-➡️  Step 4700 | Cosine Loss: 0.5132 | LR: 1.1e-5 | bv: 14.6723 | dv: 11.8404
-➡️  Step 4750 | Cosine Loss: 0.5306 | LR: 1.1e-5 | bv: 14.7466 | dv: 11.9226
-➡️  Step 4800 | Cosine Loss: 0.5196 | LR: 1.1e-5 | bv: 14.8211 | dv: 12.0005
-➡️  Step 4850 | Cosine Loss: 0.5232 | LR: 1.1e-5 | bv: 14.8957 | dv: 12.0774
-➡️  Step 4900 | Cosine Loss: 0.5141 | LR: 1.1e-5 | bv: 14.9725 | dv: 12.1583
-➡️  Step 4950 | Cosine Loss: 0.5175 | LR: 1.1e-5 | bv: 15.0484 | dv: 12.24
-➡️  Step 5000 | Cosine Loss: 0.5257 | LR: 1.1e-5 | bv: 15.1328 | dv: 12.3245
+➡️  Step 4050 | Soft NN Loss: 2.5421 | LR: 2.9e-5 | bv: 7.508 | dv: 10.109
+➡️  Step 4100 | Soft NN Loss: 2.633 | LR: 2.9e-5 | bv: 7.5057 | dv: 10.1837
+➡️  Step 4150 | Soft NN Loss: 2.6651 | LR: 2.9e-5 | bv: 7.5044 | dv: 10.2603
+➡️  Step 4200 | Soft NN Loss: 2.6397 | LR: 2.9e-5 | bv: 7.5042 | dv: 10.339
+➡️  Step 4250 | Soft NN Loss: 2.6125 | LR: 2.9e-5 | bv: 7.5043 | dv: 10.4188
+➡️  Step 4300 | Soft NN Loss: 2.7087 | LR: 2.9e-5 | bv: 7.5032 | dv: 10.495
+➡️  Step 4350 | Soft NN Loss: 2.5788 | LR: 2.9e-5 | bv: 7.5025 | dv: 10.5631
+➡️  Step 4400 | Soft NN Loss: 2.6902 | LR: 2.9e-5 | bv: 7.5025 | dv: 10.637
+➡️  Step 4450 | Soft NN Loss: 2.6714 | LR: 2.9e-5 | bv: 7.5025 | dv: 10.7031
+➡️  Step 4500 | Soft NN Loss: 2.5435 | LR: 2.9e-5 | bv: 7.501 | dv: 10.7654
+➡️  Step 4550 | Soft NN Loss: 2.6433 | LR: 2.9e-5 | bv: 7.4986 | dv: 10.8193
+➡️  Step 4600 | Soft NN Loss: 2.5976 | LR: 2.9e-5 | bv: 7.4955 | dv: 10.8664
+➡️  Step 4650 | Soft NN Loss: 2.6833 | LR: 2.9e-5 | bv: 7.4923 | dv: 10.9089
+➡️  Step 4700 | Soft NN Loss: 2.5844 | LR: 2.9e-5 | bv: 7.4906 | dv: 10.9615
+➡️  Step 4750 | Soft NN Loss: 2.68 | LR: 2.9e-5 | bv: 7.4895 | dv: 11.0197
+➡️  Step 4800 | Soft NN Loss: 2.6889 | LR: 2.9e-5 | bv: 7.4887 | dv: 11.0737
+➡️  Step 4850 | Soft NN Loss: 2.6145 | LR: 2.9e-5 | bv: 7.4871 | dv: 11.1273
+➡️  Step 4900 | Soft NN Loss: 2.682 | LR: 2.9e-5 | bv: 7.4846 | dv: 11.1832
+➡️  Step 4950 | Soft NN Loss: 2.6678 | LR: 2.9e-5 | bv: 7.4816 | dv: 11.2438
+➡️  Step 5000 | Soft NN Loss: 2.6256 | LR: 2.9e-5 | bv: 7.4787 | dv: 11.3044
 💾 Checkpoint reached! Saving Step 5000...
-➡️  Step 5050 | Cosine Loss: 0.5122 | LR: 1.1e-5 | bv: 15.2176 | dv: 12.4046
-➡️  Step 5100 | Cosine Loss: 0.5196 | LR: 1.1e-5 | bv: 15.3026 | dv: 12.4842
-➡️  Step 5150 | Cosine Loss: 0.5217 | LR: 1.1e-5 | bv: 15.3874 | dv: 12.5665
-➡️  Step 5200 | Cosine Loss: 0.4922 | LR: 1.1e-5 | bv: 15.4737 | dv: 12.6487
-➡️  Step 5250 | Cosine Loss: 0.5105 | LR: 1.1e-5 | bv: 15.5586 | dv: 12.7296
-➡️  Step 5300 | Cosine Loss: 0.5183 | LR: 1.1e-5 | bv: 15.6459 | dv: 12.814
-➡️  Step 5350 | Cosine Loss: 0.5008 | LR: 1.1e-5 | bv: 15.7323 | dv: 12.8936
-➡️  Step 5400 | Cosine Loss: 0.4965 | LR: 1.1e-5 | bv: 15.8118 | dv: 12.9679
-➡️  Step 5450 | Cosine Loss: 0.5095 | LR: 1.1e-5 | bv: 15.8885 | dv: 13.041
-➡️  Step 5500 | Cosine Loss: 0.5032 | LR: 1.1e-5 | bv: 15.9675 | dv: 13.1189
-➡️  Step 5550 | Cosine Loss: 0.4912 | LR: 1.1e-5 | bv: 16.0461 | dv: 13.1992
-➡️  Step 5600 | Cosine Loss: 0.5024 | LR: 1.1e-5 | bv: 16.1229 | dv: 13.2795
-➡️  Step 5650 | Cosine Loss: 0.4896 | LR: 1.1e-5 | bv: 16.203 | dv: 13.3629
-➡️  Step 5700 | Cosine Loss: 0.4814 | LR: 1.1e-5 | bv: 16.2844 | dv: 13.4421
-➡️  Step 5750 | Cosine Loss: 0.4801 | LR: 1.1e-5 | bv: 16.3641 | dv: 13.5108
-➡️  Step 5800 | Cosine Loss: 0.4837 | LR: 1.1e-5 | bv: 16.4363 | dv: 13.5784
-➡️  Step 5850 | Cosine Loss: 0.4942 | LR: 1.1e-5 | bv: 16.507 | dv: 13.6488
-➡️  Step 5900 | Cosine Loss: 0.5095 | LR: 1.1e-5 | bv: 16.5805 | dv: 13.7188
-➡️  Step 5950 | Cosine Loss: 0.4978 | LR: 1.1e-5 | bv: 16.6521 | dv: 13.7866
-➡️  Step 6000 | Cosine Loss: 0.5016 | LR: 1.1e-5 | bv: 16.7223 | dv: 13.8589
+➡️  Step 5050 | Soft NN Loss: 2.6859 | LR: 2.9e-5 | bv: 7.4755 | dv: 11.3646
+➡️  Step 5100 | Soft NN Loss: 2.7662 | LR: 2.9e-5 | bv: 7.4731 | dv: 11.4116
+➡️  Step 5150 | Soft NN Loss: 2.7024 | LR: 2.9e-5 | bv: 7.4718 | dv: 11.4571
+➡️  Step 5200 | Soft NN Loss: 2.6102 | LR: 2.9e-5 | bv: 7.4697 | dv: 11.5058
+➡️  Step 5250 | Soft NN Loss: 2.5456 | LR: 2.9e-5 | bv: 7.4661 | dv: 11.5615
+➡️  Step 5300 | Soft NN Loss: 2.7358 | LR: 2.9e-5 | bv: 7.4622 | dv: 11.6289
+➡️  Step 5350 | Soft NN Loss: 2.6342 | LR: 2.9e-5 | bv: 7.4588 | dv: 11.6867
+➡️  Step 5400 | Soft NN Loss: 2.6112 | LR: 2.9e-5 | bv: 7.4554 | dv: 11.7264
+➡️  Step 5450 | Soft NN Loss: 2.6296 | LR: 2.9e-5 | bv: 7.4536 | dv: 11.7531
+➡️  Step 5500 | Soft NN Loss: 2.6038 | LR: 2.9e-5 | bv: 7.4517 | dv: 11.7836
+➡️  Step 5550 | Soft NN Loss: 2.5832 | LR: 2.9e-5 | bv: 7.4489 | dv: 11.8281
+➡️  Step 5600 | Soft NN Loss: 2.6772 | LR: 2.9e-5 | bv: 7.4468 | dv: 11.88
+➡️  Step 5650 | Soft NN Loss: 2.6624 | LR: 2.9e-5 | bv: 7.4442 | dv: 11.929
+➡️  Step 5700 | Soft NN Loss: 2.5759 | LR: 2.9e-5 | bv: 7.4411 | dv: 11.9791
+➡️  Step 5750 | Soft NN Loss: 2.5082 | LR: 2.9e-5 | bv: 7.4373 | dv: 12.033
+➡️  Step 5800 | Soft NN Loss: 2.6066 | LR: 2.9e-5 | bv: 7.4328 | dv: 12.0829
+➡️  Step 5850 | Soft NN Loss: 2.6415 | LR: 2.9e-5 | bv: 7.4276 | dv: 12.1274
+➡️  Step 5900 | Soft NN Loss: 2.6554 | LR: 2.9e-5 | bv: 7.4226 | dv: 12.1719
+➡️  Step 5950 | Soft NN Loss: 2.6455 | LR: 2.9e-5 | bv: 7.4173 | dv: 12.2082
+➡️  Step 6000 | Soft NN Loss: 2.6999 | LR: 2.9e-5 | bv: 7.4127 | dv: 12.2335
 💾 Checkpoint reached! Saving Step 6000...
-➡️  Step 6050 | Cosine Loss: 0.4952 | LR: 1.1e-5 | bv: 16.7903 | dv: 13.9348
-➡️  Step 6100 | Cosine Loss: 0.5 | LR: 1.1e-5 | bv: 16.8568 | dv: 14.0109
-➡️  Step 6150 | Cosine Loss: 0.4819 | LR: 1.1e-5 | bv: 16.9268 | dv: 14.0861
-➡️  Step 6200 | Cosine Loss: 0.4963 | LR: 1.1e-5 | bv: 16.9958 | dv: 14.1548
-➡️  Step 6250 | Cosine Loss: 0.4807 | LR: 1.1e-5 | bv: 17.0644 | dv: 14.226
-➡️  Step 6300 | Cosine Loss: 0.4758 | LR: 1.1e-5 | bv: 17.1334 | dv: 14.2934
-➡️  Step 6350 | Cosine Loss: 0.4793 | LR: 1.1e-5 | bv: 17.2056 | dv: 14.3587
-➡️  Step 6400 | Cosine Loss: 0.5 | LR: 1.1e-5 | bv: 17.2759 | dv: 14.4211
-➡️  Step 6450 | Cosine Loss: 0.4788 | LR: 1.1e-5 | bv: 17.3482 | dv: 14.4811
-➡️  Step 6500 | Cosine Loss: 0.4872 | LR: 1.1e-5 | bv: 17.419 | dv: 14.5395
-➡️  Step 6550 | Cosine Loss: 0.4818 | LR: 1.1e-5 | bv: 17.4891 | dv: 14.6022
-➡️  Step 6600 | Cosine Loss: 0.4822 | LR: 1.1e-5 | bv: 17.5573 | dv: 14.6646
-➡️  Step 6650 | Cosine Loss: 0.4828 | LR: 1.1e-5 | bv: 17.6208 | dv: 14.7241
-➡️  Step 6700 | Cosine Loss: 0.4634 | LR: 1.1e-5 | bv: 17.6817 | dv: 14.7844
-➡️  Step 6750 | Cosine Loss: 0.4918 | LR: 1.1e-5 | bv: 17.7396 | dv: 14.8475
-➡️  Step 6800 | Cosine Loss: 0.4722 | LR: 1.1e-5 | bv: 17.795 | dv: 14.9102
-➡️  Step 6850 | Cosine Loss: 0.4828 | LR: 1.1e-5 | bv: 17.8478 | dv: 14.9747
-➡️  Step 6900 | Cosine Loss: 0.4844 | LR: 1.1e-5 | bv: 17.9034 | dv: 15.0395
-➡️  Step 6950 | Cosine Loss: 0.5098 | LR: 1.1e-5 | bv: 17.9593 | dv: 15.0993
-➡️  Step 7000 | Cosine Loss: 0.4823 | LR: 1.1e-5 | bv: 18.0144 | dv: 15.155
+➡️  Step 6050 | Soft NN Loss: 2.6572 | LR: 2.9e-5 | bv: 7.4086 | dv: 12.2598
+➡️  Step 6100 | Soft NN Loss: 2.6516 | LR: 2.9e-5 | bv: 7.4043 | dv: 12.2794
+➡️  Step 6150 | Soft NN Loss: 2.6284 | LR: 2.9e-5 | bv: 7.3998 | dv: 12.3003
+➡️  Step 6200 | Soft NN Loss: 2.6102 | LR: 2.9e-5 | bv: 7.3956 | dv: 12.3218
+➡️  Step 6250 | Soft NN Loss: 2.5668 | LR: 2.9e-5 | bv: 7.3912 | dv: 12.3429
+➡️  Step 6300 | Soft NN Loss: 2.4795 | LR: 2.9e-5 | bv: 7.3861 | dv: 12.3763
+➡️  Step 6350 | Soft NN Loss: 2.5192 | LR: 2.9e-5 | bv: 7.3827 | dv: 12.4188
+➡️  Step 6400 | Soft NN Loss: 2.6552 | LR: 2.9e-5 | bv: 7.379 | dv: 12.4695
+➡️  Step 6450 | Soft NN Loss: 2.6229 | LR: 2.8e-5 | bv: 7.3773 | dv: 12.5223
+➡️  Step 6500 | Soft NN Loss: 2.6529 | LR: 2.8e-5 | bv: 7.3756 | dv: 12.5662
+➡️  Step 6550 | Soft NN Loss: 2.592 | LR: 2.8e-5 | bv: 7.3737 | dv: 12.6042
+➡️  Step 6600 | Soft NN Loss: 2.5963 | LR: 2.8e-5 | bv: 7.3718 | dv: 12.6377
+➡️  Step 6650 | Soft NN Loss: 2.6023 | LR: 2.8e-5 | bv: 7.3699 | dv: 12.6641
+➡️  Step 6700 | Soft NN Loss: 2.4573 | LR: 2.8e-5 | bv: 7.3675 | dv: 12.6873
+➡️  Step 6750 | Soft NN Loss: 2.6681 | LR: 2.8e-5 | bv: 7.3651 | dv: 12.7146
+➡️  Step 6800 | Soft NN Loss: 2.5097 | LR: 2.8e-5 | bv: 7.3633 | dv: 12.7411
+➡️  Step 6850 | Soft NN Loss: 2.6581 | LR: 2.8e-5 | bv: 7.3617 | dv: 12.7633
+➡️  Step 6900 | Soft NN Loss: 2.6747 | LR: 2.8e-5 | bv: 7.3605 | dv: 12.7922
+➡️  Step 6950 | Soft NN Loss: 2.6014 | LR: 2.8e-5 | bv: 7.3577 | dv: 12.8268
+➡️  Step 7000 | Soft NN Loss: 2.6296 | LR: 2.8e-5 | bv: 7.3543 | dv: 12.8561
 💾 Checkpoint reached! Saving Step 7000...
-➡️  Step 7050 | Cosine Loss: 0.4768 | LR: 1.1e-5 | bv: 18.0704 | dv: 15.2128
-➡️  Step 7100 | Cosine Loss: 0.4769 | LR: 1.1e-5 | bv: 18.1276 | dv: 15.2694
-➡️  Step 7150 | Cosine Loss: 0.4601 | LR: 1.1e-5 | bv: 18.1818 | dv: 15.3222
-➡️  Step 7200 | Cosine Loss: 0.4795 | LR: 1.1e-5 | bv: 18.2354 | dv: 15.3749
-➡️  Step 7250 | Cosine Loss: 0.4814 | LR: 1.1e-5 | bv: 18.2884 | dv: 15.4228
-➡️  Step 7300 | Cosine Loss: 0.4803 | LR: 1.1e-5 | bv: 18.3411 | dv: 15.4731
-➡️  Step 7350 | Cosine Loss: 0.4612 | LR: 1.1e-5 | bv: 18.3917 | dv: 15.5262
-➡️  Step 7400 | Cosine Loss: 0.4858 | LR: 1.1e-5 | bv: 18.4462 | dv: 15.5815
-➡️  Step 7450 | Cosine Loss: 0.4621 | LR: 1.1e-5 | bv: 18.4974 | dv: 15.6315
-➡️  Step 7500 | Cosine Loss: 0.466 | LR: 1.1e-5 | bv: 18.5486 | dv: 15.6867
-➡️  Step 7550 | Cosine Loss: 0.4799 | LR: 1.0e-5 | bv: 18.599 | dv: 15.7473
-➡️  Step 7600 | Cosine Loss: 0.4551 | LR: 1.0e-5 | bv: 18.6508 | dv: 15.8085
-➡️  Step 7650 | Cosine Loss: 0.4674 | LR: 1.0e-5 | bv: 18.7038 | dv: 15.8684
-➡️  Step 7700 | Cosine Loss: 0.4761 | LR: 1.0e-5 | bv: 18.7586 | dv: 15.9281
-➡️  Step 7750 | Cosine Loss: 0.4754 | LR: 1.0e-5 | bv: 18.8139 | dv: 15.9832
-➡️  Step 7800 | Cosine Loss: 0.4854 | LR: 1.0e-5 | bv: 18.8683 | dv: 16.0323
-➡️  Step 7850 | Cosine Loss: 0.4494 | LR: 1.0e-5 | bv: 18.9211 | dv: 16.0762
-➡️  Step 7900 | Cosine Loss: 0.4789 | LR: 1.0e-5 | bv: 18.9751 | dv: 16.1221
-➡️  Step 7950 | Cosine Loss: 0.4648 | LR: 1.0e-5 | bv: 19.0259 | dv: 16.1671
-➡️  Step 8000 | Cosine Loss: 0.4813 | LR: 1.0e-5 | bv: 19.0731 | dv: 16.2125
+➡️  Step 7050 | Soft NN Loss: 2.6549 | LR: 2.8e-5 | bv: 7.3509 | dv: 12.8923
+➡️  Step 7100 | Soft NN Loss: 2.6496 | LR: 2.8e-5 | bv: 7.3473 | dv: 12.9301
+➡️  Step 7150 | Soft NN Loss: 2.5196 | LR: 2.8e-5 | bv: 7.3447 | dv: 12.9645
+➡️  Step 7200 | Soft NN Loss: 2.6695 | LR: 2.8e-5 | bv: 7.3416 | dv: 12.9971
+➡️  Step 7250 | Soft NN Loss: 2.6116 | LR: 2.8e-5 | bv: 7.338 | dv: 13.0301
+➡️  Step 7300 | Soft NN Loss: 2.6632 | LR: 2.8e-5 | bv: 7.3342 | dv: 13.0711
+➡️  Step 7350 | Soft NN Loss: 2.5464 | LR: 2.8e-5 | bv: 7.3301 | dv: 13.1096
+➡️  Step 7400 | Soft NN Loss: 2.6182 | LR: 2.8e-5 | bv: 7.3251 | dv: 13.1467
+➡️  Step 7450 | Soft NN Loss: 2.5775 | LR: 2.8e-5 | bv: 7.3202 | dv: 13.1832
+➡️  Step 7500 | Soft NN Loss: 2.578 | LR: 2.8e-5 | bv: 7.316 | dv: 13.2229
+➡️  Step 7550 | Soft NN Loss: 2.5943 | LR: 2.8e-5 | bv: 7.3121 | dv: 13.2621
+➡️  Step 7600 | Soft NN Loss: 2.5255 | LR: 2.8e-5 | bv: 7.3082 | dv: 13.2959
+➡️  Step 7650 | Soft NN Loss: 2.5792 | LR: 2.8e-5 | bv: 7.3037 | dv: 13.3253
+➡️  Step 7700 | Soft NN Loss: 2.584 | LR: 2.8e-5 | bv: 7.2988 | dv: 13.3608
+➡️  Step 7750 | Soft NN Loss: 2.6443 | LR: 2.8e-5 | bv: 7.2943 | dv: 13.3965
+➡️  Step 7800 | Soft NN Loss: 2.6294 | LR: 2.8e-5 | bv: 7.29 | dv: 13.4341
+➡️  Step 7850 | Soft NN Loss: 2.5086 | LR: 2.8e-5 | bv: 7.2869 | dv: 13.4773
+➡️  Step 7900 | Soft NN Loss: 2.6439 | LR: 2.8e-5 | bv: 7.2843 | dv: 13.5206
+➡️  Step 7950 | Soft NN Loss: 2.5947 | LR: 2.8e-5 | bv: 7.2805 | dv: 13.5612
+➡️  Step 8000 | Soft NN Loss: 2.6423 | LR: 2.8e-5 | bv: 7.2766 | dv: 13.6006
 💾 Checkpoint reached! Saving Step 8000...
-➡️  Step 8050 | Cosine Loss: 0.481 | LR: 1.0e-5 | bv: 19.121 | dv: 16.264
-➡️  Step 8100 | Cosine Loss: 0.4698 | LR: 1.0e-5 | bv: 19.166 | dv: 16.3171
-➡️  Step 8150 | Cosine Loss: 0.4832 | LR: 1.0e-5 | bv: 19.2113 | dv: 16.3643
-➡️  Step 8200 | Cosine Loss: 0.4797 | LR: 1.0e-5 | bv: 19.2529 | dv: 16.4042
-➡️  Step 8250 | Cosine Loss: 0.4702 | LR: 1.0e-5 | bv: 19.2945 | dv: 16.444
-➡️  Step 8300 | Cosine Loss: 0.4589 | LR: 1.0e-5 | bv: 19.3389 | dv: 16.4851
-➡️  Step 8350 | Cosine Loss: 0.4654 | LR: 1.0e-5 | bv: 19.3865 | dv: 16.5256
-➡️  Step 8400 | Cosine Loss: 0.4699 | LR: 1.0e-5 | bv: 19.434 | dv: 16.5666
-➡️  Step 8450 | Cosine Loss: 0.463 | LR: 1.0e-5 | bv: 19.4797 | dv: 16.6014
-➡️  Step 8500 | Cosine Loss: 0.4758 | LR: 1.0e-5 | bv: 19.5219 | dv: 16.6337
-➡️  Step 8550 | Cosine Loss: 0.4755 | LR: 1.0e-5 | bv: 19.5665 | dv: 16.6726
-➡️  Step 8600 | Cosine Loss: 0.4579 | LR: 1.0e-5 | bv: 19.6142 | dv: 16.7128
-➡️  Step 8650 | Cosine Loss: 0.4745 | LR: 1.0e-5 | bv: 19.6592 | dv: 16.7487
-➡️  Step 8700 | Cosine Loss: 0.4612 | LR: 1.0e-5 | bv: 19.7028 | dv: 16.7839
-➡️  Step 8750 | Cosine Loss: 0.4775 | LR: 1.0e-5 | bv: 19.7474 | dv: 16.8223
-➡️  Step 8800 | Cosine Loss: 0.4771 | LR: 1.0e-5 | bv: 19.7889 | dv: 16.8606
-➡️  Step 8850 | Cosine Loss: 0.4708 | LR: 1.0e-5 | bv: 19.8266 | dv: 16.8984
-➡️  Step 8900 | Cosine Loss: 0.4697 | LR: 1.0e-5 | bv: 19.8622 | dv: 16.9336
-➡️  Step 8950 | Cosine Loss: 0.4684 | LR: 1.0e-5 | bv: 19.9012 | dv: 16.9648
-➡️  Step 9000 | Cosine Loss: 0.4589 | LR: 1.0e-5 | bv: 19.9388 | dv: 16.9972
+➡️  Step 8050 | Soft NN Loss: 2.5919 | LR: 2.8e-5 | bv: 7.2721 | dv: 13.6433
+➡️  Step 8100 | Soft NN Loss: 2.6599 | LR: 2.8e-5 | bv: 7.2667 | dv: 13.686
+➡️  Step 8150 | Soft NN Loss: 2.623 | LR: 2.7e-5 | bv: 7.2617 | dv: 13.724
+➡️  Step 8200 | Soft NN Loss: 2.6102 | LR: 2.7e-5 | bv: 7.2583 | dv: 13.7539
+➡️  Step 8250 | Soft NN Loss: 2.6208 | LR: 2.7e-5 | bv: 7.2545 | dv: 13.7808
+➡️  Step 8300 | Soft NN Loss: 2.5755 | LR: 2.7e-5 | bv: 7.2498 | dv: 13.8043
+➡️  Step 8350 | Soft NN Loss: 2.5622 | LR: 2.7e-5 | bv: 7.2453 | dv: 13.8285
+➡️  Step 8400 | Soft NN Loss: 2.5917 | LR: 2.7e-5 | bv: 7.2413 | dv: 13.8503
+➡️  Step 8450 | Soft NN Loss: 2.4768 | LR: 2.7e-5 | bv: 7.2386 | dv: 13.8724
+➡️  Step 8500 | Soft NN Loss: 2.6426 | LR: 2.7e-5 | bv: 7.2358 | dv: 13.8885
+➡️  Step 8550 | Soft NN Loss: 2.6027 | LR: 2.7e-5 | bv: 7.2333 | dv: 13.9039
+➡️  Step 8600 | Soft NN Loss: 2.5603 | LR: 2.7e-5 | bv: 7.2315 | dv: 13.9277
+➡️  Step 8650 | Soft NN Loss: 2.5896 | LR: 2.7e-5 | bv: 7.2298 | dv: 13.9648
+➡️  Step 8700 | Soft NN Loss: 2.6218 | LR: 2.7e-5 | bv: 7.2279 | dv: 14.0038
+➡️  Step 8750 | Soft NN Loss: 2.6897 | LR: 2.7e-5 | bv: 7.2252 | dv: 14.0395
+➡️  Step 8800 | Soft NN Loss: 2.6729 | LR: 2.7e-5 | bv: 7.2214 | dv: 14.0729
+➡️  Step 8850 | Soft NN Loss: 2.6326 | LR: 2.7e-5 | bv: 7.2163 | dv: 14.102
+➡️  Step 8900 | Soft NN Loss: 2.583 | LR: 2.7e-5 | bv: 7.2115 | dv: 14.1377
+➡️  Step 8950 | Soft NN Loss: 2.5759 | LR: 2.7e-5 | bv: 7.2069 | dv: 14.1766
+➡️  Step 9000 | Soft NN Loss: 2.5833 | LR: 2.7e-5 | bv: 7.2033 | dv: 14.2119
 💾 Checkpoint reached! Saving Step 9000...
-➡️  Step 9050 | Cosine Loss: 0.4663 | LR: 1.0e-5 | bv: 19.9774 | dv: 17.0294
-➡️  Step 9100 | Cosine Loss: 0.4668 | LR: 1.0e-5 | bv: 20.0141 | dv: 17.0652
-➡️  Step 9150 | Cosine Loss: 0.4593 | LR: 1.0e-5 | bv: 20.0455 | dv: 17.099
-➡️  Step 9200 | Cosine Loss: 0.4634 | LR: 1.0e-5 | bv: 20.08 | dv: 17.1334
-➡️  Step 9250 | Cosine Loss: 0.4671 | LR: 1.0e-5 | bv: 20.1134 | dv: 17.1663
-➡️  Step 9300 | Cosine Loss: 0.4604 | LR: 1.0e-5 | bv: 20.1441 | dv: 17.1965
-➡️  Step 9350 | Cosine Loss: 0.4562 | LR: 1.0e-5 | bv: 20.1782 | dv: 17.2287
-➡️  Step 9400 | Cosine Loss: 0.4627 | LR: 1.0e-5 | bv: 20.2134 | dv: 17.2624
-➡️  Step 9450 | Cosine Loss: 0.4877 | LR: 1.0e-5 | bv: 20.2481 | dv: 17.2963
-➡️  Step 9500 | Cosine Loss: 0.4437 | LR: 1.0e-5 | bv: 20.2854 | dv: 17.331
-➡️  Step 9550 | Cosine Loss: 0.4537 | LR: 1.0e-5 | bv: 20.3238 | dv: 17.363
-➡️  Step 9600 | Cosine Loss: 0.4565 | LR: 1.0e-5 | bv: 20.3607 | dv: 17.3925
-➡️  Step 9650 | Cosine Loss: 0.4685 | LR: 9.0e-6 | bv: 20.3948 | dv: 17.4206
-➡️  Step 9700 | Cosine Loss: 0.4683 | LR: 9.0e-6 | bv: 20.4299 | dv: 17.4535
-➡️  Step 9750 | Cosine Loss: 0.4494 | LR: 9.0e-6 | bv: 20.4621 | dv: 17.4861
-➡️  Step 9800 | Cosine Loss: 0.474 | LR: 9.0e-6 | bv: 20.4967 | dv: 17.522
-➡️  Step 9850 | Cosine Loss: 0.477 | LR: 9.0e-6 | bv: 20.5337 | dv: 17.5608
-➡️  Step 9900 | Cosine Loss: 0.4525 | LR: 9.0e-6 | bv: 20.5708 | dv: 17.5921
-➡️  Step 9950 | Cosine Loss: 0.4613 | LR: 9.0e-6 | bv: 20.6058 | dv: 17.6185
-➡️  Step 10000 | Cosine Loss: 0.4509 | LR: 9.0e-6 | bv: 20.6403 | dv: 17.6509
+➡️  Step 9050 | Soft NN Loss: 2.5756 | LR: 2.7e-5 | bv: 7.1998 | dv: 14.2429
+➡️  Step 9100 | Soft NN Loss: 2.5628 | LR: 2.7e-5 | bv: 7.1953 | dv: 14.2748
+➡️  Step 9150 | Soft NN Loss: 2.5566 | LR: 2.7e-5 | bv: 7.1902 | dv: 14.3146
+➡️  Step 9200 | Soft NN Loss: 2.5274 | LR: 2.7e-5 | bv: 7.1849 | dv: 14.3648
+➡️  Step 9250 | Soft NN Loss: 2.5862 | LR: 2.7e-5 | bv: 7.1798 | dv: 14.4093
+➡️  Step 9300 | Soft NN Loss: 2.5848 | LR: 2.7e-5 | bv: 7.1751 | dv: 14.4456
+➡️  Step 9350 | Soft NN Loss: 2.6173 | LR: 2.7e-5 | bv: 7.1707 | dv: 14.4832
+➡️  Step 9400 | Soft NN Loss: 2.6337 | LR: 2.7e-5 | bv: 7.1659 | dv: 14.5185
+➡️  Step 9450 | Soft NN Loss: 2.6346 | LR: 2.7e-5 | bv: 7.1616 | dv: 14.5522
+➡️  Step 9500 | Soft NN Loss: 2.5403 | LR: 2.6e-5 | bv: 7.1576 | dv: 14.5855
+➡️  Step 9550 | Soft NN Loss: 2.5816 | LR: 2.6e-5 | bv: 7.1533 | dv: 14.6115
+➡️  Step 9600 | Soft NN Loss: 2.6044 | LR: 2.6e-5 | bv: 7.1485 | dv: 14.633
+➡️  Step 9650 | Soft NN Loss: 2.6393 | LR: 2.6e-5 | bv: 7.1435 | dv: 14.6573
+➡️  Step 9700 | Soft NN Loss: 2.5517 | LR: 2.6e-5 | bv: 7.1391 | dv: 14.6802
+➡️  Step 9750 | Soft NN Loss: 2.5493 | LR: 2.6e-5 | bv: 7.1356 | dv: 14.7024
+➡️  Step 9800 | Soft NN Loss: 2.673 | LR: 2.6e-5 | bv: 7.1323 | dv: 14.7339
+➡️  Step 9850 | Soft NN Loss: 2.6478 | LR: 2.6e-5 | bv: 7.1296 | dv: 14.7723
+➡️  Step 9900 | Soft NN Loss: 2.6023 | LR: 2.6e-5 | bv: 7.1273 | dv: 14.8112
+➡️  Step 9950 | Soft NN Loss: 2.6053 | LR: 2.6e-5 | bv: 7.1245 | dv: 14.8406
+➡️  Step 10000 | Soft NN Loss: 2.5412 | LR: 2.6e-5 | bv: 7.1213 | dv: 14.8593
 💾 Checkpoint reached! Saving Step 10000...
-➡️  Step 10050 | Cosine Loss: 0.4764 | LR: 9.0e-6 | bv: 20.6789 | dv: 17.6871
-➡️  Step 10100 | Cosine Loss: 0.4652 | LR: 9.0e-6 | bv: 20.719 | dv: 17.7217
-➡️  Step 10150 | Cosine Loss: 0.4677 | LR: 9.0e-6 | bv: 20.7532 | dv: 17.7506
-➡️  Step 10200 | Cosine Loss: 0.4451 | LR: 9.0e-6 | bv: 20.7851 | dv: 17.7779
-➡️  Step 10250 | Cosine Loss: 0.4479 | LR: 9.0e-6 | bv: 20.8158 | dv: 17.8031
-➡️  Step 10300 | Cosine Loss: 0.4665 | LR: 9.0e-6 | bv: 20.8437 | dv: 17.8304
-➡️  Step 10350 | Cosine Loss: 0.4603 | LR: 9.0e-6 | bv: 20.8722 | dv: 17.855
-➡️  Step 10400 | Cosine Loss: 0.4692 | LR: 9.0e-6 | bv: 20.901 | dv: 17.877
-➡️  Step 10450 | Cosine Loss: 0.4716 | LR: 9.0e-6 | bv: 20.9292 | dv: 17.8971
-➡️  Step 10500 | Cosine Loss: 0.4707 | LR: 9.0e-6 | bv: 20.9541 | dv: 17.919
-➡️  Step 10550 | Cosine Loss: 0.4485 | LR: 9.0e-6 | bv: 20.9786 | dv: 17.9435
-➡️  Step 10600 | Cosine Loss: 0.4395 | LR: 9.0e-6 | bv: 21.0072 | dv: 17.9711
-➡️  Step 10650 | Cosine Loss: 0.4489 | LR: 9.0e-6 | bv: 21.0394 | dv: 17.9972
-➡️  Step 10700 | Cosine Loss: 0.4351 | LR: 9.0e-6 | bv: 21.0701 | dv: 18.0165
-➡️  Step 10750 | Cosine Loss: 0.4592 | LR: 9.0e-6 | bv: 21.1007 | dv: 18.0344
-➡️  Step 10800 | Cosine Loss: 0.4689 | LR: 9.0e-6 | bv: 21.1287 | dv: 18.0537
-➡️  Step 10850 | Cosine Loss: 0.4545 | LR: 9.0e-6 | bv: 21.1556 | dv: 18.0727
-➡️  Step 10900 | Cosine Loss: 0.4634 | LR: 9.0e-6 | bv: 21.1827 | dv: 18.0937
-➡️  Step 10950 | Cosine Loss: 0.4519 | LR: 9.0e-6 | bv: 21.2087 | dv: 18.1168
-➡️  Step 11000 | Cosine Loss: 0.4601 | LR: 9.0e-6 | bv: 21.2342 | dv: 18.1342
+➡️  Step 10050 | Soft NN Loss: 2.6456 | LR: 2.6e-5 | bv: 7.1179 | dv: 14.8697
+➡️  Step 10100 | Soft NN Loss: 2.5818 | LR: 2.6e-5 | bv: 7.1141 | dv: 14.8818
+➡️  Step 10150 | Soft NN Loss: 2.5746 | LR: 2.6e-5 | bv: 7.1105 | dv: 14.9006
+➡️  Step 10200 | Soft NN Loss: 2.5511 | LR: 2.6e-5 | bv: 7.1065 | dv: 14.9212
+➡️  Step 10250 | Soft NN Loss: 2.5431 | LR: 2.6e-5 | bv: 7.1022 | dv: 14.939
+➡️  Step 10300 | Soft NN Loss: 2.6161 | LR: 2.6e-5 | bv: 7.0971 | dv: 14.9467
+➡️  Step 10350 | Soft NN Loss: 2.6196 | LR: 2.6e-5 | bv: 7.0908 | dv: 14.9521
+➡️  Step 10400 | Soft NN Loss: 2.5888 | LR: 2.6e-5 | bv: 7.0848 | dv: 14.9603
+➡️  Step 10450 | Soft NN Loss: 2.6125 | LR: 2.6e-5 | bv: 7.079 | dv: 14.9725
+➡️  Step 10500 | Soft NN Loss: 2.5957 | LR: 2.6e-5 | bv: 7.073 | dv: 14.9898
+➡️  Step 10550 | Soft NN Loss: 2.541 | LR: 2.6e-5 | bv: 7.067 | dv: 15.0102
+➡️  Step 10600 | Soft NN Loss: 2.493 | LR: 2.6e-5 | bv: 7.0609 | dv: 15.0314
+➡️  Step 10650 | Soft NN Loss: 2.5558 | LR: 2.6e-5 | bv: 7.055 | dv: 15.0531
+➡️  Step 10700 | Soft NN Loss: 2.4865 | LR: 2.6e-5 | bv: 7.0494 | dv: 15.0712
+➡️  Step 10750 | Soft NN Loss: 2.6159 | LR: 2.5e-5 | bv: 7.043 | dv: 15.0848
+➡️  Step 10800 | Soft NN Loss: 2.5543 | LR: 2.5e-5 | bv: 7.0366 | dv: 15.1056
+➡️  Step 10850 | Soft NN Loss: 2.5717 | LR: 2.5e-5 | bv: 7.0313 | dv: 15.126
+➡️  Step 10900 | Soft NN Loss: 2.5895 | LR: 2.5e-5 | bv: 7.0264 | dv: 15.1399
+➡️  Step 10950 | Soft NN Loss: 2.5914 | LR: 2.5e-5 | bv: 7.0207 | dv: 15.1433
+➡️  Step 11000 | Soft NN Loss: 2.5661 | LR: 2.5e-5 | bv: 7.0159 | dv: 15.1436
 💾 Checkpoint reached! Saving Step 11000...
-➡️  Step 11050 | Cosine Loss: 0.4641 | LR: 9.0e-6 | bv: 21.2609 | dv: 18.1471
-➡️  Step 11100 | Cosine Loss: 0.4585 | LR: 9.0e-6 | bv: 21.288 | dv: 18.1626
-➡️  Step 11150 | Cosine Loss: 0.4563 | LR: 9.0e-6 | bv: 21.3128 | dv: 18.1786
-➡️  Step 11200 | Cosine Loss: 0.4634 | LR: 9.0e-6 | bv: 21.3397 | dv: 18.2
-➡️  Step 11250 | Cosine Loss: 0.4494 | LR: 9.0e-6 | bv: 21.3676 | dv: 18.2231
-➡️  Step 11300 | Cosine Loss: 0.4647 | LR: 9.0e-6 | bv: 21.3964 | dv: 18.2466
-➡️  Step 11350 | Cosine Loss: 0.4423 | LR: 9.0e-6 | bv: 21.4261 | dv: 18.2691
-➡️  Step 11400 | Cosine Loss: 0.4668 | LR: 9.0e-6 | bv: 21.4561 | dv: 18.2868
-➡️  Step 11450 | Cosine Loss: 0.4452 | LR: 8.0e-6 | bv: 21.4833 | dv: 18.3003
-➡️  Step 11500 | Cosine Loss: 0.4743 | LR: 8.0e-6 | bv: 21.5128 | dv: 18.3145
-➡️  Step 11550 | Cosine Loss: 0.456 | LR: 8.0e-6 | bv: 21.5419 | dv: 18.3282
-➡️  Step 11600 | Cosine Loss: 0.4562 | LR: 8.0e-6 | bv: 21.5715 | dv: 18.3417
-➡️  Step 11650 | Cosine Loss: 0.4596 | LR: 8.0e-6 | bv: 21.6011 | dv: 18.3548
-➡️  Step 11700 | Cosine Loss: 0.4585 | LR: 8.0e-6 | bv: 21.6308 | dv: 18.3714
-➡️  Step 11750 | Cosine Loss: 0.4384 | LR: 8.0e-6 | bv: 21.6618 | dv: 18.3884
-➡️  Step 11800 | Cosine Loss: 0.4372 | LR: 8.0e-6 | bv: 21.6895 | dv: 18.4028
-➡️  Step 11850 | Cosine Loss: 0.454 | LR: 8.0e-6 | bv: 21.715 | dv: 18.4127
-➡️  Step 11900 | Cosine Loss: 0.4504 | LR: 8.0e-6 | bv: 21.7394 | dv: 18.4211
-➡️  Step 11950 | Cosine Loss: 0.4398 | LR: 8.0e-6 | bv: 21.7663 | dv: 18.4352
-➡️  Step 12000 | Cosine Loss: 0.4617 | LR: 8.0e-6 | bv: 21.7898 | dv: 18.4486
+➡️  Step 11050 | Soft NN Loss: 2.6746 | LR: 2.5e-5 | bv: 7.0117 | dv: 15.1455
+➡️  Step 11100 | Soft NN Loss: 2.595 | LR: 2.5e-5 | bv: 7.0071 | dv: 15.1489
+➡️  Step 11150 | Soft NN Loss: 2.5895 | LR: 2.5e-5 | bv: 7.0012 | dv: 15.1547
+➡️  Step 11200 | Soft NN Loss: 2.5933 | LR: 2.5e-5 | bv: 6.9958 | dv: 15.1523
+➡️  Step 11250 | Soft NN Loss: 2.5403 | LR: 2.5e-5 | bv: 6.9906 | dv: 15.1424
+➡️  Step 11300 | Soft NN Loss: 2.5861 | LR: 2.5e-5 | bv: 6.9861 | dv: 15.1315
+➡️  Step 11350 | Soft NN Loss: 2.535 | LR: 2.5e-5 | bv: 6.9812 | dv: 15.1297
+➡️  Step 11400 | Soft NN Loss: 2.6216 | LR: 2.5e-5 | bv: 6.9754 | dv: 15.1361
+➡️  Step 11450 | Soft NN Loss: 2.5657 | LR: 2.5e-5 | bv: 6.9696 | dv: 15.1465
+➡️  Step 11500 | Soft NN Loss: 2.7075 | LR: 2.5e-5 | bv: 6.9632 | dv: 15.1573
+➡️  Step 11550 | Soft NN Loss: 2.5877 | LR: 2.5e-5 | bv: 6.9568 | dv: 15.1675
+➡️  Step 11600 | Soft NN Loss: 2.5613 | LR: 2.5e-5 | bv: 6.9501 | dv: 15.1785
+➡️  Step 11650 | Soft NN Loss: 2.5856 | LR: 2.5e-5 | bv: 6.944 | dv: 15.1853
+➡️  Step 11700 | Soft NN Loss: 2.503 | LR: 2.5e-5 | bv: 6.9386 | dv: 15.1911
+➡️  Step 11750 | Soft NN Loss: 2.5192 | LR: 2.5e-5 | bv: 6.9334 | dv: 15.2051
+➡️  Step 11800 | Soft NN Loss: 2.4801 | LR: 2.5e-5 | bv: 6.9283 | dv: 15.2168
+➡️  Step 11850 | Soft NN Loss: 2.5889 | LR: 2.4e-5 | bv: 6.9237 | dv: 15.226
+➡️  Step 11900 | Soft NN Loss: 2.569 | LR: 2.4e-5 | bv: 6.9194 | dv: 15.2382
+➡️  Step 11950 | Soft NN Loss: 2.5695 | LR: 2.4e-5 | bv: 6.9146 | dv: 15.2542
+➡️  Step 12000 | Soft NN Loss: 2.5274 | LR: 2.4e-5 | bv: 6.9096 | dv: 15.2684
 💾 Checkpoint reached! Saving Step 12000...
-➡️  Step 12050 | Cosine Loss: 0.4691 | LR: 8.0e-6 | bv: 21.8142 | dv: 18.4637
-➡️  Step 12100 | Cosine Loss: 0.4464 | LR: 8.0e-6 | bv: 21.8369 | dv: 18.4803
-➡️  Step 12150 | Cosine Loss: 0.4644 | LR: 8.0e-6 | bv: 21.8593 | dv: 18.4968
-➡️  Step 12200 | Cosine Loss: 0.4633 | LR: 8.0e-6 | bv: 21.8815 | dv: 18.5095
-➡️  Step 12250 | Cosine Loss: 0.457 | LR: 8.0e-6 | bv: 21.902 | dv: 18.5209
-➡️  Step 12300 | Cosine Loss: 0.4511 | LR: 8.0e-6 | bv: 21.9224 | dv: 18.5317
-➡️  Step 12350 | Cosine Loss: 0.4558 | LR: 8.0e-6 | bv: 21.9438 | dv: 18.5473
-➡️  Step 12400 | Cosine Loss: 0.4555 | LR: 8.0e-6 | bv: 21.969 | dv: 18.5643
-➡️  Step 12450 | Cosine Loss: 0.4659 | LR: 8.0e-6 | bv: 21.994 | dv: 18.5839
-➡️  Step 12500 | Cosine Loss: 0.4332 | LR: 8.0e-6 | bv: 22.0171 | dv: 18.6009
-➡️  Step 12550 | Cosine Loss: 0.4556 | LR: 8.0e-6 | bv: 22.0429 | dv: 18.6175
-➡️  Step 12600 | Cosine Loss: 0.4642 | LR: 8.0e-6 | bv: 22.0704 | dv: 18.6314
-➡️  Step 12650 | Cosine Loss: 0.4368 | LR: 8.0e-6 | bv: 22.0957 | dv: 18.6434
-➡️  Step 12700 | Cosine Loss: 0.4505 | LR: 8.0e-6 | bv: 22.1176 | dv: 18.6523
-➡️  Step 12750 | Cosine Loss: 0.4617 | LR: 8.0e-6 | bv: 22.1399 | dv: 18.6591
-➡️  Step 12800 | Cosine Loss: 0.4692 | LR: 8.0e-6 | bv: 22.164 | dv: 18.6679
-➡️  Step 12850 | Cosine Loss: 0.4418 | LR: 8.0e-6 | bv: 22.1882 | dv: 18.6754
-➡️  Step 12900 | Cosine Loss: 0.4768 | LR: 8.0e-6 | bv: 22.2096 | dv: 18.681
-➡️  Step 12950 | Cosine Loss: 0.4503 | LR: 8.0e-6 | bv: 22.2319 | dv: 18.6871
-➡️  Step 13000 | Cosine Loss: 0.426 | LR: 8.0e-6 | bv: 22.2534 | dv: 18.6918
+➡️  Step 12050 | Soft NN Loss: 2.6 | LR: 2.4e-5 | bv: 6.9039 | dv: 15.2705
+➡️  Step 12100 | Soft NN Loss: 2.5406 | LR: 2.4e-5 | bv: 6.8978 | dv: 15.2673
+➡️  Step 12150 | Soft NN Loss: 2.556 | LR: 2.4e-5 | bv: 6.891 | dv: 15.2678
+➡️  Step 12200 | Soft NN Loss: 2.6248 | LR: 2.4e-5 | bv: 6.8842 | dv: 15.2744
+➡️  Step 12250 | Soft NN Loss: 2.5938 | LR: 2.4e-5 | bv: 6.8774 | dv: 15.2834
+➡️  Step 12300 | Soft NN Loss: 2.5791 | LR: 2.4e-5 | bv: 6.8699 | dv: 15.2988
+➡️  Step 12350 | Soft NN Loss: 2.5653 | LR: 2.4e-5 | bv: 6.8623 | dv: 15.3123
+➡️  Step 12400 | Soft NN Loss: 2.4941 | LR: 2.4e-5 | bv: 6.8545 | dv: 15.3201
+➡️  Step 12450 | Soft NN Loss: 2.548 | LR: 2.4e-5 | bv: 6.8466 | dv: 15.3259
+➡️  Step 12500 | Soft NN Loss: 2.4557 | LR: 2.4e-5 | bv: 6.8392 | dv: 15.3279
+➡️  Step 12550 | Soft NN Loss: 2.6282 | LR: 2.4e-5 | bv: 6.8328 | dv: 15.3247
+➡️  Step 12600 | Soft NN Loss: 2.4988 | LR: 2.4e-5 | bv: 6.8262 | dv: 15.3193
+➡️  Step 12650 | Soft NN Loss: 2.5001 | LR: 2.4e-5 | bv: 6.8201 | dv: 15.3157
+➡️  Step 12700 | Soft NN Loss: 2.5659 | LR: 2.4e-5 | bv: 6.8134 | dv: 15.3055
+➡️  Step 12750 | Soft NN Loss: 2.5687 | LR: 2.4e-5 | bv: 6.8075 | dv: 15.2942
+➡️  Step 12800 | Soft NN Loss: 2.6276 | LR: 2.4e-5 | bv: 6.8013 | dv: 15.2839
+➡️  Step 12850 | Soft NN Loss: 2.4927 | LR: 2.4e-5 | bv: 6.7944 | dv: 15.2745
+➡️  Step 12900 | Soft NN Loss: 2.6059 | LR: 2.3e-5 | bv: 6.7876 | dv: 15.2671
+➡️  Step 12950 | Soft NN Loss: 2.54 | LR: 2.3e-5 | bv: 6.7809 | dv: 15.2661
+➡️  Step 13000 | Soft NN Loss: 2.4711 | LR: 2.3e-5 | bv: 6.7737 | dv: 15.2702
 💾 Checkpoint reached! Saving Step 13000...
-➡️  Step 13050 | Cosine Loss: 0.4658 | LR: 8.0e-6 | bv: 22.2748 | dv: 18.6963
-➡️  Step 13100 | Cosine Loss: 0.4483 | LR: 7.0e-6 | bv: 22.2967 | dv: 18.7048
-➡️  Step 13150 | Cosine Loss: 0.4721 | LR: 7.0e-6 | bv: 22.3199 | dv: 18.7135
-➡️  Step 13200 | Cosine Loss: 0.4445 | LR: 7.0e-6 | bv: 22.3389 | dv: 18.72
+➡️  Step 13050 | Soft NN Loss: 2.6256 | LR: 2.3e-5 | bv: 6.768 | dv: 15.2806
 ```

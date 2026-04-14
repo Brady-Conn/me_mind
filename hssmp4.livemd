@@ -1,0 +1,1695 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# HSSMP4
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  # 1. Maps discrete tokens to their perfect 512D spatial coordinates
+  defn get_real_coordinates(batch_tokens, frozen_embeds) do
+    Nx.take(frozen_embeds, Nx.flatten(batch_tokens))
+      |> Nx.reshape({Nx.axis_size(batch_tokens, 0), Nx.axis_size(batch_tokens, 1), 512})
+      |> stop_grad()
+  end
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN for Rank 2 Tensors)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # pred and target are {batch_size, dim}
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    # 1. Batched Dot Product: {batch, dim} x {dim, batch} -> {batch, batch}
+    # This creates a similarity matrix comparing every pred to every target in the batch
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 2. Create Identity Targets -> {batch, batch}
+    batch_size = Nx.axis_size(pred, 0)
+    # ⚡ THE FIX: Pass a 2D tuple {32, 32} instead of a 1D tuple {32}
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    # 3. Manual Dense Log-Softmax
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))ozen_w2,
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 30, ...>>, true}
+```
+
+```elixir
+defmodule DLM.SinkhornOT do
+  import Nx.Defn
+
+  defn cost_matrix(pred, target) do
+    p_exp = Nx.new_axis(pred, 1)
+    t_exp = Nx.new_axis(target, 0)
+    diff = Nx.subtract(p_exp, t_exp)
+    Nx.sum(Nx.pow(diff, 2), axes: [-1])
+  end
+
+  # ⚡ FIX 1: Bump the default epsilon up to 10.0 to handle your 512D spatial scale
+  defn compute(pred, target, epsilon \\ 10.0, max_iters \\ 5) do
+    c = cost_matrix(pred, target)
+    k = Nx.exp(Nx.divide(Nx.negate(c), epsilon))
+    
+    batch_size = Nx.axis_size(pred, 0)
+    mass = 1.0 / batch_size
+    mu = Nx.broadcast(mass, {batch_size})
+    nu = Nx.broadcast(mass, {batch_size})
+
+    {_final_k, u_final, v_final, _mu, _nu, _i} =
+      while {k_mat = k, 
+             u = Nx.broadcast(1.0, {batch_size}), 
+             _v = Nx.broadcast(1.0, {batch_size}), 
+             m = mu, n = nu, i = 0},
+            Nx.less(i, max_iters) do
+            
+        # ⚡ FIX 2: Add 1.0e-8 to the denominator to mathematically prevent NaN crashes
+        denom_v = Nx.add(Nx.dot(Nx.transpose(k_mat), u), 1.0e-8)
+        v_new = Nx.divide(n, denom_v)
+        
+        denom_u = Nx.add(Nx.dot(k_mat, v_new), 1.0e-8)
+        u_new = Nx.divide(m, denom_u)
+
+        {k_mat, u_new, v_new, m, n, i + 1}
+      end
+
+    u_exp = Nx.new_axis(u_final, 1)
+    v_exp = Nx.new_axis(v_final, 0)
+    p = Nx.multiply(Nx.multiply(u_exp, k), v_exp)
+
+    Nx.sum(Nx.multiply(p, c))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SinkhornOT, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Main SSM
+
+```elixir
+defmodule DLM.Main_SSM do
+  import Nx.Defn
+
+  defn swish(x) do
+    x * Nx.sigmoid(x)
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn softplus(x) do
+    # ⚡ UNBREAKABLE SOFTPLUS: Guaranteed stable in forward AND backward passes
+    Nx.max(x, 0.0) + Nx.log1p(Nx.exp(-Nx.abs(x)))
+  end
+
+  defn apply_svd_weight(x, u, v) do
+    x |> Nx.dot(u) |> softplus() |> Nx.dot(v)
+  end
+
+  # ⚡ The core physics step (Used heavily by the new Master Loop)
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2) do
+    # 1. Local Mixers
+    mix1 = apply_svd_weight(x_p2, mu1, mv1)
+    mix2 = apply_svd_weight(x_p1, mu2, mv2)
+    x_mixed = Nx.add(x_t, Nx.add(mix1, mix2))
+    
+    # 2. Input Force
+    b_proj = apply_svd_weight(x_mixed, bu, bv)
+    delta = Nx.tensor(0.1, type: :f32)
+    
+    # 3. Friction
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    b_bar = Nx.multiply(delta, b_proj)
+    
+    # 4. Momentum Update
+    h_new = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    
+    # 5. Output Velocity
+    out_proj = apply_svd_weight(h_new, cu, cv)
+    
+    # 6. Skip Connection
+    skip = apply_svd_weight(x_t, du, dv)
+    
+    y_t = Nx.add(out_proj, skip)
+    
+    {y_t, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM, <<70, 79, 82, 49, 0, 0, 31, ...>>, true}
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  # ⚡ 1. The defn-safe clip helper
+  defn clip_grad(g) do
+    Nx.clip(g, -1.0, 1.0)
+  end
+
+  defn newton_schulz(g, iters \\ 5) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) + 1.0e-7
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, iters) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_update(grad, lr) do
+    clipped = Nx.clip(grad, -1.0, 1.0)
+    Nx.subtract(0.0, Nx.multiply(lr, newton_schulz(clipped)))
+  end
+
+  defn adam_update(param, grad, m, v, step, lr) do
+    safe_step = step + 1.0
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  defn step(params, grads, ms, vs, step_count, lr) do
+    # ⚡ Unpack 19 elements
+    {p_a, p_bu, p_bv, p_cu, p_cv, p_du, p_dv, p_mu1, p_mv1, p_mu2, p_mv2, 
+     p_gw, p_gb, p_spell_w, p_spell_b, p_valve_w, p_valve_b, p_out_w, p_out_b} = params
+  
+    {g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv, g_mu1, g_mv1, g_mu2, g_mv2, 
+     g_gw, g_gb, g_spell_w, g_spell_b, g_valve_w, g_valve_b, g_out_w, g_out_b} = grads
+  
+    {m_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv, m_mu1, m_mv1, m_mu2, m_mv2, 
+     m_gw, m_gb, m_spell_w, m_spell_b, m_valve_w, m_valve_b, m_out_w, m_out_b} = ms
+  
+    {v_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv, v_mu1, v_mv1, v_mu2, v_mv2, 
+     v_gw, v_gb, v_spell_w, v_spell_b, v_valve_w, v_valve_b, v_out_w, v_out_b} = vs
+
+    # ⚡ 2. Clip the Adam gradients BEFORE the update
+    cg_gw = clip_grad(g_gw)
+    cg_gb = clip_grad(g_gb)
+    cg_spell_b = clip_grad(g_spell_b)
+    cg_valve_b = clip_grad(g_valve_b)
+    cg_out_b = clip_grad(g_out_b)
+
+    
+    # ⚡ Adam for scalars, biases, and the 1D gate weight
+    {up_a, nm_a, nv_a} = adam_update(p_a, g_a, m_a, v_a, step_count, lr)
+    {up_gw, nm_gw, nv_gw} = adam_update(p_gw, cg_gw, m_gw, v_gw, step_count, lr)
+    {up_gb, nm_gb, nv_gb} = adam_update(p_gb, cg_gb, m_gb, v_gb, step_count, lr)
+    {up_spell_b, nm_spell_b, nv_spell_b} = adam_update(p_spell_b, cg_spell_b, m_spell_b, v_spell_b, step_count, lr)
+    {up_valve_b, nm_valve_b, nv_valve_b} = adam_update(p_valve_b, cg_valve_b, m_valve_b, v_valve_b, step_count, lr)
+    {up_out_b, nm_out_b, nv_out_b} = adam_update(p_out_b, cg_out_b, m_out_b, v_out_b, step_count, lr)
+    
+    # ⚡ Muon for SVD and Dense 2D Matrices
+    up_bu = p_bu + muon_update(g_bu, lr)
+    up_bv = p_bv + muon_update(g_bv, lr)
+    up_cu = p_cu + muon_update(g_cu, lr)
+    up_cv = p_cv + muon_update(g_cv, lr)
+    up_du = p_du + muon_update(g_du, lr)
+    up_dv = p_dv + muon_update(g_dv, lr)
+    up_mu1 = p_mu1 + muon_update(g_mu1, lr)
+    up_mv1 = p_mv1 + muon_update(g_mv1, lr)
+    up_mu2 = p_mu2 + muon_update(g_mu2, lr)
+    up_mv2 = p_mv2 + muon_update(g_mv2, lr)
+    up_spell_w = p_spell_w + muon_update(g_spell_w, lr)
+    up_valve_w = p_valve_w + muon_update(g_valve_w, lr)
+    up_out_w = p_out_w + muon_update(g_out_w, lr)
+  
+    # Repack
+    new_params = {up_a, up_bu, up_bv, up_cu, up_cv, up_du, up_dv, up_mu1, up_mv1, up_mu2, up_mv2, 
+                  up_gw, up_gb, up_spell_w, up_spell_b, up_valve_w, up_valve_b, up_out_w, up_out_b}
+  
+    new_ms = {nm_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv, m_mu1, m_mv1, m_mu2, m_mv2, 
+              nm_gw, nm_gb, m_spell_w, nm_spell_b, m_valve_w, nm_valve_b, m_out_w, nm_out_b}
+  
+    new_vs = {nv_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv, v_mu1, v_mv1, v_mu2, v_mv2, 
+              nv_gw, nv_gb, v_spell_w, nv_spell_b, v_valve_w, nv_valve_b, v_out_w, nv_out_b}
+  
+    {new_params, new_ms, new_vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.MuonHybrid, <<70, 79, 82, 49, 0, 0, 49, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Main_SSM_Genesis do
+  @dim 512
+  @rank 256
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    
+    # ⚡ Keep your new -2.0 high friction for the upper layers!
+    {a_diag, key} = Nx.Random.normal(key, -0.1, 0.01, shape: {@dim})
+    
+    {b_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {b_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {c_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {c_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {d_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {d_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    
+    # 1. The Boundary Gate
+    {gate_w, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, 1})
+    gate_b = Nx.tensor([-3.0], type: :f32)
+
+    # 2. ⚡ The Spell Feature Generator
+    {spell_w, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @dim})
+    spell_b = Nx.broadcast(0.0, {@dim})
+
+    # 3. ⚡ The Syntax Valve (Swish Gate)
+    {valve_w, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @dim})
+    valve_b = Nx.broadcast(0.0, {@dim})
+
+    # 4. ⚡ Latent Output Projection
+    {out_w, _key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @dim})
+    out_b = Nx.broadcast(0.0, {@dim})
+
+    # 19 Parameters Total
+    {a_diag, b_u, b_v, c_u, c_v, d_u, d_v, mx_u1, mx_v1, mx_u2, mx_v2, 
+     gate_w, gate_b, spell_w, spell_b, valve_w, valve_b, out_w, out_b}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = DLM.Tree.map(params, zero_like)
+    vs = DLM.Tree.map(params, zero_like)
+    {ms, vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM_Genesis, <<70, 79, 82, 49, 0, 0, 18, ...>>, {:init_optimizer, 1}}
+```
+
+```elixir
+defmodule DLM.TinySSM do
+  import Nx.Defn
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    activated = gelu(hidden) 
+    Nx.dot(activated, v)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn forward(x_t, h_prev, params) do
+    # ⚡ Unpack the 7 parameters
+    {a, bu, bv, cu, cv, du, dv} = params
+
+    b_proj = apply_svd(x_t, bu, bv)
+    
+    # ⚡ The Dynamic Gate
+    gate_proj = apply_svd(x_t, du, dv)
+    delta = Nx.max(softplus(gate_proj), 1.0e-4) # Minimum step size for stability
+    
+    # Dynamic Friction & Force
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    b_bar = Nx.multiply(delta, b_proj)
+    
+    h_new = Nx.tanh(Nx.add(Nx.multiply(a_bar, h_prev), b_bar))
+    
+    predicted_vector = apply_svd(h_new, cu, cv)
+    
+    {predicted_vector, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
+```
+
+## Layer 2
+
+```elixir
+defmodule DLM.Surgery do
+  def upgrade_to_tier3(old_ckpt_path, new_prefix, gpu) do
+    IO.puts("🔪 Performing Tensor Surgery on #{old_ckpt_path}...")
+    ckpt = File.read!(old_ckpt_path) |> :erlang.binary_to_term()
+    
+    # 1. Unpack the 15 Phase 3 parameters
+    {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, _old_lmw, _old_lmb, g1_w, g1_b} = ckpt.params
+    
+    # 2. Re-pack the 13 parameters for the Mid Level (Discarding the old head)
+    mid_p = {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, g1_w, g1_b}
+    
+    # 3. Initialize a brand new Top Level (15 parameters, including g2 and the new head)
+    key = Nx.Random.key(42)
+    {top_p, _} = DLM.Main_SSM_Genesis.init_phase3(key) 
+    # (Assuming your init function generates the a...mv2, lm_w, lm_b, g2_w, and -3.0 g2_b)
+    
+    # 4. Initialize fresh optimizer states for the paired {mid, top} tuple
+    zero_mid = DLM.Tree.map(mid_p, fn t -> Nx.broadcast(0.0, Nx.shape(t)) end)
+    zero_top = DLM.Tree.map(top_p, fn t -> Nx.broadcast(0.0, Nx.shape(t)) end)
+    
+    # 5. Save the new 3-Tier Genesis Checkpoint
+    state = %{
+      params: {mid_p, top_p},
+      ms: {zero_mid, zero_top},
+      vs: {zero_mid, zero_top},
+      step: 0,
+      h_base: Nx.broadcast(0.0, {1, 512}),
+      h_mid: Nx.broadcast(0.0, {1, 512}), # The old h_top is now h_mid
+      h_top: Nx.broadcast(0.0, {1, 512})  # Brand new grammatical memory
+    }
+    
+    File.write!("#{new_prefix}_checkpoint_step_0.bin", :erlang.term_to_binary(state))
+    IO.puts("✅ Surgery Complete. Ready for Phase 4.")
+  end
+end
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+DLM.Surgery.upgrade_to_tier3("v34_DLM_Phase_3_Top_Biased_checkpoint_step_80000.bin", "v35_level_2", gpu)
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inferece
+
+```elixir
+defmodule DLM.BLiMP do
+  import Nx.Defn
+
+  # ⚡ 1. The Evaluation Forward Pass (Phase 4: Latent Future CPC)
+  defn eval_loss(tokens, h1_init, h2_init, h3_init, p1, p2, p3, f_map) do
+    seq_len = Nx.axis_size(tokens, 1)
+    
+    # ⚡ Use pure Elixir 'min' to keep these as compile-time integers!
+    horizon = 24
+    safe_horizon = min(horizon, seq_len - 1)
+    eval_len = seq_len - safe_horizon
+
+    input_tokens = Nx.slice_along_axis(tokens, 0, eval_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(tokens, safe_horizon, eval_len, axis: 1)
+
+    # ⚡ Map inputs and targets to continuous space
+    clean_in_coords = Nx.take(f_map, Nx.flatten(input_tokens))
+                      |> Nx.reshape({1, eval_len, 512})
+    in_t = Nx.transpose(clean_in_coords, axes: [1, 0, 2])
+
+    clean_targ_coords = Nx.take(f_map, Nx.flatten(target_tokens))
+                        |> Nx.reshape({1, eval_len, 512})
+    targ_t = Nx.transpose(clean_targ_coords, axes: [1, 0, 2])
+
+    zero_frame = Nx.broadcast(0.0, {1, 512})
+
+    result =
+      while {i = 0, total_loss = 0.0, 
+             h1 = h1_init, h2 = h2_init, h3 = h3_init,
+             h1_targ = h1_init, h2_targ = h2_init,
+             xp1_2 = zero_frame, xp2_2 = zero_frame,
+             xp1_3 = zero_frame, xp2_3 = zero_frame,
+             xp1_2_targ = zero_frame, xp2_2_targ = zero_frame,
+             x_in = in_t, y_targ = targ_t,
+             p1_val = p1, p2_val = p2, p3_val = p3, map_val = f_map}, 
+            Nx.less(i, eval_len) do
+            
+        x_in_curr = x_in[i]
+        x_targ_curr = y_targ[i]
+
+        # ⚡ Unpack Parameters
+        {a2, bu2, bv2, cu2, cv2, du2, dv2, mu1_2, mv1_2, mu2_2, mv2_2, 
+         gw2, gb2, _sw2, _sb2, _vw2, _vb2, _ow2, _ob2} = p2_val
+
+        {a3, bu3, bv3, cu3, cv3, du3, dv3, mu1_3, mv1_3, mu2_3, mv2_3, 
+         gw3, gb3, sw3, sb3, vw3, vb3, ow3, ob3} = p3_val
+
+        # ==========================================
+        # 🧊 INPUT TRACK
+        # ==========================================
+        {_y1, h1_new} = DLM.TinySSM.forward(x_in_curr, h1, p1_val)
+
+        g2 = Nx.sigmoid(Nx.add(Nx.dot(h1_new, gw2), gb2))
+        
+        {_y2, h2_candidate} = DLM.Main_SSM.ssm_recurrence(
+          h1_new, xp1_2, xp2_2, h2, 
+          a2, bu2, bv2, cu2, cv2, du2, dv2, mu1_2, mv1_2, mu2_2, mv2_2
+        )
+
+        h2_new = Nx.add(Nx.multiply(g2, h2_candidate), Nx.multiply(Nx.subtract(1.0, g2), h2))
+        h1_flushed = Nx.multiply(h1_new, Nx.subtract(1.0, g2))
+
+        # ==========================================
+        # 🎯 TARGET TRACK (Frozen L1 & L2)
+        # ==========================================
+        {_y1_targ, h1_targ_new} = DLM.TinySSM.forward(x_targ_curr, h1_targ, p1_val)
+
+        g2_targ = Nx.sigmoid(Nx.add(Nx.dot(h1_targ_new, gw2), gb2))
+        
+        {_y2_targ, h2_targ_candidate} = DLM.Main_SSM.ssm_recurrence(
+          h1_targ_new, xp1_2_targ, xp2_2_targ, h2_targ, 
+          a2, bu2, bv2, cu2, cv2, du2, dv2, mu1_2, mv1_2, mu2_2, mv2_2
+        )
+
+        h2_targ_new = Nx.add(Nx.multiply(g2_targ, h2_targ_candidate), Nx.multiply(Nx.subtract(1.0, g2_targ), h2_targ))
+        h1_targ_flushed = Nx.multiply(h1_targ_new, Nx.subtract(1.0, g2_targ))
+
+        # ==========================================
+        # 🔥 LEVEL 3: ACTIVE GRAMMAR ENGINE
+        # ==========================================
+        g3 = Nx.sigmoid(Nx.add(Nx.dot(h2_new, gw3), gb3))
+        
+        {_y3, h3_candidate} = DLM.Main_SSM.ssm_recurrence(
+          h2_new, xp1_3, xp2_3, h3, 
+          a3, bu3, bv3, cu3, cv3, du3, dv3, mu1_3, mv1_3, mu2_3, mv2_3
+        )
+
+        h3_new = Nx.add(Nx.multiply(g3, h3_candidate), Nx.multiply(Nx.subtract(1.0, g3), h3))
+        
+        # L3 flushes L2 for the NEXT step
+        h2_flushed = Nx.multiply(h2_new, Nx.subtract(1.0, g3)) 
+
+        # ⚡ Syntax Fusion
+        f_concept3 = Nx.add(Nx.dot(h2_new, sw3), sb3)
+        v_syntax3 = DLM.Main_SSM.swish(Nx.add(Nx.dot(h3_new, vw3), vb3))
+        
+        h_fused3 = DLM.Main_SSM.rms_norm(Nx.multiply(v_syntax3, f_concept3))
+        pred_latent3 = Nx.add(Nx.dot(h_fused3, ow3), ob3)
+
+        # ⚡ THE FIX: Compare the continuous evolutionary tracks, ignoring the flush!
+        raw_delta = Nx.subtract(h2_targ_candidate, h2_candidate)
+
+        safe_delta = Nx.add(raw_delta, 1.0e-7)
+        safe_pred = Nx.add(pred_latent3, 1.0e-7)
+
+        step_loss = DLM.Loss.cosine_distance(safe_pred, safe_delta)
+
+        {i + 1, total_loss + step_loss, 
+         h1_flushed, h2_flushed, h3_new, 
+         h1_targ_flushed, h2_targ_new, 
+         xp1_2, xp2_2, xp1_3, xp2_3, 
+         xp1_2_targ, xp2_2_targ,
+         x_in, y_targ, p1_val, p2_val, p3_val, map_val}
+      end
+      
+    # Return average sequence Cosine Loss
+    Nx.divide(elem(result, 1), eval_len)
+  end
+
+  # ⚡ 2. The Elixir Wrapper
+  def evaluate_sentence(sentence, p1, p2, map_val, p3, gpu) do
+    tokens = sentence |> to_charlist() |> Nx.tensor(type: :s32) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+    blank_h = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+
+    loss_tensor = eval_loss(tokens, blank_h, blank_h, blank_h, p1, p2, p3, map_val)
+    Nx.to_number(loss_tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.BLiMP, <<70, 79, 82, 49, 0, 0, 39, ...>>, {:evaluate_sentence, 6}}
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+blimp_file = "./data/determiner_noun_agreement_1.jsonl" 
+
+# ==============================================================================
+# 1. LOAD THE 3-TIER CASCADE
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1 Frozen Manifold...")
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+{cpu_embeds, _w1, _w2, _key} = phase1_p
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+IO.puts("⚙️ Loading Phase 2 Level 1 (Physics Engine)...")
+base_checkpoint = File.read!("v33_DLM_Phase_2_cos_checkpoint_step_13000.bin") |> :erlang.binary_to_term()
+frozen_base_p = DLM.Tree.map(base_checkpoint, &Nx.backend_copy(&1, gpu))
+
+IO.puts("🧠 Loading Phase 3 Level 2 (Bigram Chunker)...")
+mid_checkpoint = File.read!("v34_DLM_Phase_3_Top_256_lowLR_checkpoint_step_44000.bin") |> :erlang.binary_to_term()
+# Adjust .params below if your Phase 3 checkpoint was saved directly as a tuple instead of a map
+frozen_mid_p = DLM.Tree.map(mid_checkpoint.params, &Nx.backend_copy(&1, gpu))
+
+IO.puts("👑 Loading Phase 4 Level 3 (Grammar Engine)...")
+# Make sure to point this exactly to the 36k step checkpoint you just stopped!
+top_checkpoint = File.read!("v34_DLM_Phase_4_clip_h8_ec05_lr15_checkpoint_step_4000.bin") |> :erlang.binary_to_term()
+# Depending on how your CheckpointManager saves, you might need top_checkpoint.params here too
+top3_p = DLM.Tree.map(top_checkpoint.params, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# 2. RUN BLIMP EVALUATION
+# ==============================================================================
+IO.puts("📖 Reading BLiMP Dataset: #{blimp_file}")
+
+# Parse the JSON Lines
+pairs = 
+  File.read!(blimp_file)
+  |> String.split("\n", trim: true)
+  |> Enum.map(&Jason.decode!/1)
+
+total_pairs = length(pairs)
+IO.puts("⚖️ Evaluating #{total_pairs} minimalist pairs...")
+
+# Tally the results
+{passes, total_loss_diff} = 
+  Enum.reduce(pairs, {0, 0.0}, fn pair, {pass_count, diff_acc} ->
+    good_sentence = pair["sentence_good"]
+    bad_sentence = pair["sentence_bad"]
+
+    # ⚡ Updated: Pass all 3 levels (frozen_base_p, frozen_mid_p, frozen_map, top3_p)
+    good_loss = DLM.BLiMP.evaluate_sentence(good_sentence, frozen_base_p, frozen_mid_p, frozen_map, top3_p, gpu)
+    bad_loss  = DLM.BLiMP.evaluate_sentence(bad_sentence, frozen_base_p, frozen_mid_p, frozen_map, top3_p, gpu)
+
+    # Did the model assign a lower loss (higher probability) to the grammatically correct sentence?
+    is_pass? = good_loss < bad_loss
+    
+    new_pass_count = if is_pass?, do: pass_count + 1, else: pass_count
+
+    {new_pass_count, diff_acc + (bad_loss - good_loss)}
+  end)
+
+# Calculate final metrics
+accuracy = (passes / total_pairs) * 100.0
+avg_margin = total_loss_diff / total_pairs
+
+IO.puts(String.duplicate("=", 50))
+IO.puts("🏆 BLiMP EVALUATION RESULTS")
+IO.puts(String.duplicate("=", 50))
+IO.puts("Dataset:   #{blimp_file}")
+IO.puts("Accuracy:  #{Float.round(accuracy, 2)}% (#{passes}/#{total_pairs})")
+IO.puts("Margin:    #{Float.round(avg_margin, 4)} (Avg loss difference)")
+IO.puts(String.duplicate("=", 50))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Phase 1 Frozen Manifold...
+⚙️ Loading Phase 2 Level 1 (Physics Engine)...
+🧠 Loading Phase 3 Level 2 (Bigram Chunker)...
+👑 Loading Phase 4 Level 3 (Grammar Engine)...
+📖 Reading BLiMP Dataset: ./data/determiner_noun_agreement_1.jsonl
+⚖️ Evaluating 1000 minimalist pairs...
+==================================================
+🏆 BLiMP EVALUATION RESULTS
+==================================================
+Dataset:   ./data/determiner_noun_agreement_1.jsonl
+Accuracy:  48.5% (485/1000)
+Margin:    -0.0018 (Avg loss difference)
+==================================================
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.HierarchyBridge do
+  import Nx.Defn
+
+  # Assume we have the base state and the previous top state
+  defn bridge_step(h_base, h_top_prev, top_params, boundary_weights) do
+    # 1. ⚡ Calculate the Boundary Gate (g)
+    # Project 512D -> 1D, then Sigmoid to force it between 0.0 and 1.0
+    boundary_logit = Nx.dot(h_base, boundary_weights)
+    g = Nx.sigmoid(boundary_logit) 
+
+    # 2. ⚡ Calculate the potential next state for the Top Level
+    # We feed the Base's 512D summary into the Top Level as its "input"
+    {_predicted_chunk, h_top_candidate} = DLM.TinySSM.forward(h_base, h_top_prev, top_params)
+
+    # 3. ⚡ The Continuous Update (Linear Interpolation)
+    # If g=0 (mid-word), it ignores the input and keeps h_top_prev.
+    # If g=1 (word end), it fully updates to h_top_candidate.
+    h_top_new = Nx.add(
+      Nx.multiply(g, h_top_candidate),
+      Nx.multiply(Nx.subtract(1.0, g), h_top_prev)
+    )
+
+    # 4. ⚡ The Soft Reset (Crucial)
+    # If the base layer just passed a completed concept up to the top, 
+    # it needs to flush its own memory to start building the next concept.
+    h_base_flushed = Nx.multiply(h_base, Nx.subtract(1.0, g))
+
+    {h_top_new, h_base_flushed, g}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.HierarchyBridge, <<70, 79, 82, 49, 0, 0, 13, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Phase4_Trainer do
+  import Nx.Defn
+
+  # ⚡ 1. The 3-Level Cascade Forward Pass (Latent Future CPC)
+  defn compute_sequence_loss(input_tokens, target_tokens, h_base_init, h_mid_init, h_top_init, frozen_base_p, frozen_mid_p, frozen_map, top3_p) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+
+    # Map inputs to continuous space
+    clean_in_coords = DLM.Loss.get_real_coordinates(input_tokens, frozen_map)
+    inputs_time = Nx.transpose(clean_in_coords, axes: [1, 0, 2])
+    
+    # Map targets to continuous space
+    clean_targ_coords = DLM.Loss.get_real_coordinates(target_tokens, frozen_map)
+    targets_time = Nx.transpose(clean_targ_coords, axes: [1, 0, 2]) 
+
+    zero_frame = Nx.broadcast(0.0, Nx.shape(h_top_init))
+
+    # ⚡ Added all Target variables to the accumulator state
+    result =
+      while {i = 0, total_loss = 0.0, total_g3 = 0.0, total_g2 = 0.0,
+             h1 = h_base_init, h2 = h_mid_init, h3 = h_top_init,
+             h1_targ = h_base_init, h2_targ = h_mid_init,
+             xp1_2 = zero_frame, xp2_2 = zero_frame,
+             xp1_3 = zero_frame, xp2_3 = zero_frame,
+             xp1_2_targ = zero_frame, xp2_2_targ = zero_frame,
+             in_t = inputs_time, targ_t = targets_time,
+             p1 = frozen_base_p, p2 = frozen_mid_p, p3 = top3_p, f_map = frozen_map}, 
+            Nx.less(i, seq_len) do
+            
+        x_in_curr = in_t[i]
+        x_targ_curr = targ_t[i]
+
+        # ⚡ FIX: Unpack parameters BEFORE using them!
+        {a2, bu2, bv2, cu2, cv2, du2, dv2, mu1_2, mv1_2, mu2_2, mv2_2, 
+         gw2, gb2, _sw2, _sb2, _vw2, _vb2, _ow2, _ob2} = p2
+         
+        {a3, bu3, bv3, cu3, cv3, du3, dv3, mu1_3, mv1_3, mu2_3, mv2_3, 
+         gw3, gb3, sw3, sb3, vw3, vb3, ow3, ob3} = p3
+
+        # ==========================================
+        # 🧊 INPUT TRACK
+        # ==========================================
+        {_y1, h1_new} = DLM.TinySSM.forward(x_in_curr, h1, p1)
+
+        g2 = Nx.sigmoid(Nx.add(Nx.dot(h1_new, gw2), gb2))
+        batch_avg_g2 = Nx.mean(g2) 
+        
+        {_y2, h2_candidate} = DLM.Main_SSM.ssm_recurrence(
+          h1_new, xp1_2, xp2_2, h2, 
+          a2, bu2, bv2, cu2, cv2, du2, dv2, mu1_2, mv1_2, mu2_2, mv2_2
+        )
+
+        h2_new = Nx.add(Nx.multiply(g2, h2_candidate), Nx.multiply(Nx.subtract(1.0, g2), h2))
+        h1_flushed = Nx.multiply(h1_new, Nx.subtract(1.0, g2))
+
+        # ==========================================
+        # 🎯 TARGET TRACK (+20 Horizon)
+        # ==========================================
+        {_y1_targ, h1_targ_new} = DLM.TinySSM.forward(x_targ_curr, h1_targ, p1)
+
+        g2_targ = Nx.sigmoid(Nx.add(Nx.dot(h1_targ_new, gw2), gb2))
+        
+        {_y2_targ, h2_targ_candidate} = DLM.Main_SSM.ssm_recurrence(
+          h1_targ_new, xp1_2_targ, xp2_2_targ, h2_targ, 
+          a2, bu2, bv2, cu2, cv2, du2, dv2, mu1_2, mv1_2, mu2_2, mv2_2
+        )
+
+        # Notice the target track doesn't get flushed by L3, providing a pure future state
+        h2_targ_new = Nx.add(Nx.multiply(g2_targ, h2_targ_candidate), Nx.multiply(Nx.subtract(1.0, g2_targ), h2_targ))
+        h1_targ_flushed = Nx.multiply(h1_targ_new, Nx.subtract(1.0, g2_targ))
+
+        # ==========================================
+        # 🔥 LEVEL 3: ACTIVE GRAMMAR ENGINE
+        # ==========================================
+        g3 = Nx.sigmoid(Nx.add(Nx.dot(h2_new, gw3), gb3))
+        batch_avg_g3 = Nx.mean(g3) 
+        
+        {_y3, h3_candidate} = DLM.Main_SSM.ssm_recurrence(
+          h2_new, xp1_3, xp2_3, h3, 
+          a3, bu3, bv3, cu3, cv3, du3, dv3, mu1_3, mv1_3, mu2_3, mv2_3
+        )
+
+        h3_new = Nx.add(Nx.multiply(g3, h3_candidate), Nx.multiply(Nx.subtract(1.0, g3), h3))
+        
+        # L3 flushes L2 for the NEXT step
+        h2_flushed = Nx.multiply(h2_new, Nx.subtract(1.0, g3)) 
+
+        # ⚡ Syntax Fusion
+        f_concept3 = Nx.add(Nx.dot(h2_new, sw3), sb3)
+        v_syntax3 = DLM.Main_SSM.swish(Nx.add(Nx.dot(h3_new, vw3), vb3))
+        
+        h_fused3 = DLM.Main_SSM.rms_norm(Nx.multiply(v_syntax3, f_concept3))
+        pred_latent3 = Nx.add(Nx.dot(h_fused3, ow3), ob3)
+
+        # ⚡ THE FIX: Compare the continuous evolutionary tracks, ignoring the flush!
+        raw_delta = Nx.subtract(h2_targ_candidate, h2_candidate)
+
+        safe_delta = Nx.add(raw_delta, 1.0e-7)
+        safe_pred = Nx.add(pred_latent3, 1.0e-7)
+
+        step_loss = DLM.Loss.cosine_distance(safe_pred, safe_delta)
+
+        # Ensure all 21 items are returned in the exact same order!
+        {i + 1, total_loss + step_loss, total_g3 + batch_avg_g3, total_g2 + batch_avg_g2, 
+         h1_flushed, h2_flushed, h3_new, 
+         h1_targ_flushed, h2_targ_new, 
+         xp1_2, xp2_2, xp1_3, xp2_3, 
+         xp1_2_targ, xp2_2_targ,
+         in_t, targ_t, p1, p2, p3, f_map}
+      end
+      
+    {Nx.divide(elem(result, 1), seq_len), 
+     elem(result, 4), elem(result, 5), elem(result, 6), 
+     Nx.divide(elem(result, 2), seq_len), 
+     Nx.divide(elem(result, 3), seq_len)} 
+  end
+
+  # ⚡ 2. The Gradient Tape
+  defn compute_grad_and_step(input_tokens, target_tokens, h1_init, h2_init, h3_init, frozen_base_p, frozen_mid_p, frozen_map, top3_p) do
+    {_loss, raw_grads} = value_and_grad(top3_p, fn p3 ->
+      {avg_loss, _h1, _h2, _h3, avg_g3, _avg_g2} = 
+        compute_sequence_loss(input_tokens, target_tokens, h1_init, h2_init, h3_init, frozen_base_p, frozen_mid_p, frozen_map, p3)
+      
+      # ⚡ THE 0.01 TOLL BOOTH 
+      energy_cost = Nx.tensor(0.01, type: :f32) 
+      gentle_penalty = Nx.multiply(energy_cost, avg_g3)
+
+      Nx.add(avg_loss, gentle_penalty)
+    end)
+
+    {pure_loss, next_h1, next_h2, next_h3, avg_g3, avg_g2} = 
+      compute_sequence_loss(input_tokens, target_tokens, h1_init, h2_init, h3_init, frozen_base_p, frozen_mid_p, frozen_map, top3_p)
+    
+    {pure_loss, raw_grads, next_h1, next_h2, next_h3, avg_g3, avg_g2}
+  end
+
+  # ⚡ 4. TELEMETRY HELPER
+  def grad_norms(grads) do
+    {g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv, g_mu1, g_mv1, g_mu2, g_mv2, 
+     g_gw, g_gb, g_spell_w, g_spell_b, g_valve_w, g_valve_b, g_out_w, g_out_b} = grads
+    
+    calc = fn g -> g |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4) end
+    
+    [
+      a_diag: calc.(g_a), b_u: calc.(g_bu), b_v: calc.(g_bv),
+      c_u: calc.(g_cu), c_v: calc.(g_cv), d_u: calc.(g_du), d_v: calc.(g_dv),
+      mx_u1: calc.(g_mu1), mx_v1: calc.(g_mv1), mx_u2: calc.(g_mu2), mx_v2: calc.(g_mv2),
+      gate_w: calc.(g_gw), gate_b: calc.(g_gb), 
+      spell_w: calc.(g_spell_w), spell_b: calc.(g_spell_b), 
+      valve_w: calc.(g_valve_w), valve_b: calc.(g_valve_b), 
+      out_w: calc.(g_out_w), out_b: calc.(g_out_b)
+    ]
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase4_Trainer, <<70, 79, 82, 49, 0, 0, 57, ...>>, {:grad_norms, 1}}
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Handles resuming and saving states for the Hierarchical DLM.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("✨ Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("✨ No checkpoints found for '#{run_prefix}'. Starting FRESH.")
+        {:fresh, 0}
+      end
+    else
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("🚀 Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+
+  # ⚡ NEW: Clean, centralized saving logic
+  def save_checkpoint(prefix, step, p, m, v, h_base, h_mid, h_top) do
+    IO.puts("💾 Auto-Saving Checkpoint Step #{step}...")
+    
+    state = %{
+      params: DLM.Tree.map(p, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      ms: DLM.Tree.map(m, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      vs: DLM.Tree.map(v, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      step: step,
+      h_base: Nx.backend_copy(h_base, Nx.BinaryBackend),
+      h_mid: Nx.backend_copy(h_mid, Nx.BinaryBackend),
+      h_top: Nx.backend_copy(h_top, Nx.BinaryBackend)
+    }
+    
+    File.write!("#{prefix}_checkpoint_step_#{step}.bin", :erlang.term_to_binary(state))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.CheckpointManager, <<70, 79, 82, 49, 0, 0, 24, ...>>, {:save_checkpoint, 8}}
+```
+
+```elixir
+run_prefix  = "v34_DLM_Phase_4_clip_h8_ec05_lr15"  
+total_steps = 100000
+batch_size = 32
+seq_len = 128
+save_interval = 1000
+
+# ==============================================================================
+# 1. LOAD FROZEN FOUNDATIONS (Manifold + L1 + L2)
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1 Frozen Manifold...")
+%{params: phase1_p} = File.read!("phase1_shape_diffusion_COMPLETE.bin") |> :erlang.binary_to_term()
+{cpu_embeds, _w1, _w2, _key} = phase1_p
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+IO.puts("⚙️ Loading Phase 2 Level 1 (Physics Engine)...")
+base_checkpoint = File.read!("v33_DLM_Phase_2_cos_checkpoint_step_13000.bin") |> :erlang.binary_to_term()
+frozen_base_p = DLM.Tree.map(base_checkpoint, &Nx.backend_copy(&1, gpu))
+
+IO.puts("🧠 Loading Phase 3 Level 2 (Bigram Chunker)...")
+# Swap this string with exactly whatever you named your final Level 2 checkpoint!
+mid_checkpoint = File.read!("v34_DLM_Phase_3_Top_256_lowLR_checkpoint_step_44000.bin") |> :erlang.binary_to_term()
+frozen_mid_p = DLM.Tree.map(mid_checkpoint.params, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# 2. INITIALIZE / RESUME TOP LEVEL
+# ==============================================================================
+{load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
+
+{starting_p, starting_m, starting_v, start_h_base, start_h_mid, start_h_top} =
+  if load_path == :fresh do
+    IO.puts("✨ Igniting Phase 4 Level 3 Genesis weights...")
+    raw_p3 = DLM.Main_SSM_Genesis.init_params(42)
+    {raw_m3, raw_v3} = DLM.Main_SSM_Genesis.init_optimizer(raw_p3)
+    
+    blank_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+    
+    {raw_p3, raw_m3, raw_v3, blank_h, blank_h, blank_h}
+  else
+    ckpt = File.read!(load_path) |> :erlang.binary_to_term()
+    blank_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+    
+    {
+      ckpt.params, 
+      ckpt.ms, 
+      ckpt.vs, 
+      Map.get(ckpt, :h_base, blank_h),
+      Map.get(ckpt, :h_mid, blank_h),
+      Map.get(ckpt, :h_top, blank_h)
+    }
+  end
+
+# Push standard optimizer states to GPU
+p3 = DLM.Tree.map(starting_p, &Nx.backend_copy(&1, gpu))
+m3 = DLM.Tree.map(starting_m, &Nx.backend_copy(&1, gpu))
+v3 = DLM.Tree.map(starting_v, &Nx.backend_copy(&1, gpu))
+h1 = Nx.backend_copy(start_h_base, gpu)
+h2 = Nx.backend_copy(start_h_mid, gpu)
+h3 = Nx.backend_copy(start_h_top, gpu)
+
+# ==============================================================================
+# 3. DATA STREAM
+# ==============================================================================
+IO.puts("🧠 Loading Curriculum...")
+dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+dataset = Nx.flatten(dataset_2d)
+data_stream = DLM.DataStreamer.build_infinite_stream(dataset, batch_size, seq_len)
+
+# ==============================================================================
+# 4. THE MASTER LOOP (PHASE 4: 3-TIER CASCADE)
+# ==============================================================================
+if start_step != :completed do
+  IO.puts("🚀 Entering 3-Tier Grammar Cascade Loop...")
+
+  # ⚡ The accumulator now carries h1, h2, and h3
+  {final_p3, _m3, _v3, _h1, _h2, _h3} =
+    Enum.reduce(Enum.zip(start_step..(total_steps - 1), data_stream), {p3, m3, v3, h1, h2, h3}, 
+      fn {step, cpu_batch}, {cp3, cm3, cv3, ch1, ch2, ch3} ->
+        
+        gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+        
+        # ⚡ 1. The 8-Character Horizon Shift
+        horizon = 8
+        seq_len = Nx.axis_size(gpu_batch, 1)
+        
+        inputs  = Nx.slice_along_axis(gpu_batch, 0, seq_len - horizon, axis: 1)
+        targets = Nx.slice_along_axis(gpu_batch, horizon, seq_len - horizon, axis: 1)
+
+        # ⚡ 1. Learning Rate Schedule (Goldilocks: 1.5e-4)
+        base_lr = 1.5e-5
+        min_lr = 1.5e-6
+        warmup_steps = 1000
+        
+        current_lr = 
+          if step < warmup_steps do
+            base_lr * (step / warmup_steps)
+          else
+            progress = min(max((step - warmup_steps) / (total_steps - warmup_steps), 0.0), 1.0)
+            min_lr + 0.5 * (base_lr - min_lr) * (1.0 + :math.cos(:math.pi() * progress))
+          end
+
+        # ⚡ 2. The 3-Tier Gradient Tape
+        {loss_tensor, grads, next_h1, next_h2, next_h3, avg_g3_tensor, avg_g2_tensor} = 
+          DLM.Phase4_Trainer.compute_grad_and_step(
+            inputs, targets, ch1, ch2, ch3, frozen_base_p, frozen_mid_p, frozen_map, cp3
+          )
+
+        loss_val = Nx.to_number(loss_tensor)
+        g3_val = Nx.to_number(avg_g3_tensor)
+        g2_val = Nx.to_number(avg_g2_tensor)
+
+        # ⚡ 3. Safety Check
+        if loss_val == :nan or loss_val > 20.0 do
+          IO.puts("⚠️ Step #{step}: NaN/Spike detected! Flushing Hidden States.")
+          clean_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+          {cp3, cm3, cv3, clean_h, clean_h, clean_h} 
+        else
+          # ⚡ 4. Optimizer Step (Only updating Level 3!)
+          lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+          step_tensor = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
+          
+          {up_p3, up_m3, up_v3} = DLM.MuonHybrid.step(cp3, grads, cm3, cv3, step_tensor, lr_tensor)
+
+          # ⚡ 5. Telemetry
+          if rem(step, 50) == 0 do
+            # We are back to Cross-Entropy, so BPC is mathematically valid again!
+            # bpc = loss_val / 0.69314718
+            mem = :erlang.memory(:total) |> div(1024 * 1024)
+            
+            cpu_grads = DLM.Tree.map(grads, &Nx.backend_copy(&1, Nx.BinaryBackend))
+            norms = DLM.Phase4_Trainer.grad_norms(cpu_grads)
+            
+            sorted_norms = Enum.sort_by(norms, fn {_k, v} -> v end, :desc)
+            {max_name, max_norm} = hd(sorted_norms)
+            
+            valve3_norm = Keyword.get(norms, :valve_w) 
+
+            IO.puts("➡️  Step #{step} | Cosine Loss (+8): #{Float.round(loss_val, 4)} | LR: #{Float.round(current_lr, 6)}")
+            # ⚡ Notice the Dual-Gate readout:
+            IO.puts("   ⚙️  L2 Syllable Gate: #{Float.round(g2_val * 100, 2)}% | 🧠 L3 Grammar Gate: #{Float.round(g3_val * 100, 2)}%")
+            IO.puts("   📐 L3 GRADS -> Max: [#{max_name}: #{max_norm}] | L3 Valve: #{valve3_norm} | RAM: #{mem}MB")
+          end
+
+          # ⚡ 6. Auto-Save
+          if rem(step, save_interval) == 0 and step > 0 do
+            DLM.CheckpointManager.save_checkpoint(run_prefix, step, up_p3, up_m3, up_v3, next_h1, next_h2, next_h3)
+            :erlang.garbage_collect(self())
+          end
+
+          {up_p3, up_m3, up_v3, next_h1, next_h2, next_h3}
+        end
+    end)
+
+  IO.puts("🎉 THE 3-TIER CASCADE IS COMPLETE!")
+  DLM.CheckpointManager.save_checkpoint("#{run_prefix}_final", total_steps, final_p3, m3, v3, h1, h2, h3)
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Phase 1 Frozen Manifold...
+
+14:08:07.126 [info] XLA service 0x7ef02800f230 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+14:08:07.127 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+14:08:07.127 [info] Using BFC allocator.
+
+14:08:07.128 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+14:08:07.128 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+⚙️ Loading Phase 2 Level 1 (Physics Engine)...
+🧠 Loading Phase 3 Level 2 (Bigram Chunker)...
+✨ No checkpoints found for 'v34_DLM_Phase_4_clip_h8_ec05_lr15'. Starting FRESH.
+✨ Igniting Phase 4 Level 3 Genesis weights...
+🧠 Loading Curriculum...
+🚀 Entering 3-Tier Grammar Cascade Loop...
+
+14:08:08.563 [info] Merging Dots in computation: region_0.8
+
+14:08:08.563 [info] Merging Dots in computation: region_9.40.clone.clone.clone
+
+14:10:20.851 [info] Merging Dots in computation: region_1.2
+
+14:10:20.851 [info] Merging Dots in computation: region_4.5
+
+14:10:20.851 [info] Merging Dots in computation: region_7.8
+
+14:10:20.852 [info] Merging Dots in computation: region_10.11
+
+14:10:20.852 [info] Merging Dots in computation: region_13.14
+
+14:10:20.852 [info] Merging Dots in computation: region_16.17
+
+14:10:20.852 [info] Merging Dots in computation: region_19.20
+
+14:10:20.852 [info] Merging Dots in computation: region_22.23
+
+14:10:20.852 [info] Merging Dots in computation: region_25.26
+
+14:10:20.852 [info] Merging Dots in computation: region_28.29
+
+14:10:20.852 [info] Merging Dots in computation: region_31.32
+
+14:10:20.852 [info] Merging Dots in computation: region_34.35
+
+14:10:20.852 [info] Merging Dots in computation: region_37.38
+➡️  Step 0 | Cosine Loss (+8): 1.0539 | LR: 0.0
+   ⚙️  L2 Syllable Gate: 33.63% | 🧠 L3 Grammar Gate: 5.01%
+   📐 L3 GRADS -> Max: [out_b: 466.3769] | L3 Valve: 1.7145 | RAM: 229MB
+➡️  Step 50 | Cosine Loss (+8): 1.041 | LR: 1.0e-6
+   ⚙️  L2 Syllable Gate: 35.09% | 🧠 L3 Grammar Gate: 5.06%
+   📐 L3 GRADS -> Max: [spell_w: 1.8894] | L3 Valve: 1.8423 | RAM: 228MB
+➡️  Step 100 | Cosine Loss (+8): 1.0416 | LR: 2.0e-6
+   ⚙️  L2 Syllable Gate: 34.53% | 🧠 L3 Grammar Gate: 5.04%
+   📐 L3 GRADS -> Max: [gate_w: 100.8274] | L3 Valve: 1.8685 | RAM: 229MB
+➡️  Step 150 | Cosine Loss (+8): 1.0374 | LR: 2.0e-6
+   ⚙️  L2 Syllable Gate: 33.94% | 🧠 L3 Grammar Gate: 5.0%
+   📐 L3 GRADS -> Max: [gate_w: 57.4778] | L3 Valve: 1.8537 | RAM: 230MB
+➡️  Step 200 | Cosine Loss (+8): 1.0417 | LR: 3.0e-6
+   ⚙️  L2 Syllable Gate: 33.19% | 🧠 L3 Grammar Gate: 4.99%
+   📐 L3 GRADS -> Max: [gate_w: 21.1228] | L3 Valve: 1.8443 | RAM: 230MB
+➡️  Step 250 | Cosine Loss (+8): 1.0338 | LR: 4.0e-6
+   ⚙️  L2 Syllable Gate: 34.87% | 🧠 L3 Grammar Gate: 4.93%
+   📐 L3 GRADS -> Max: [gate_w: 32.1213] | L3 Valve: 1.859 | RAM: 231MB
+➡️  Step 300 | Cosine Loss (+8): 1.0307 | LR: 5.0e-6
+   ⚙️  L2 Syllable Gate: 34.39% | 🧠 L3 Grammar Gate: 4.87%
+   📐 L3 GRADS -> Max: [gate_w: 59.6964] | L3 Valve: 1.8352 | RAM: 233MB
+➡️  Step 350 | Cosine Loss (+8): 1.0295 | LR: 5.0e-6
+   ⚙️  L2 Syllable Gate: 34.17% | 🧠 L3 Grammar Gate: 4.8%
+   📐 L3 GRADS -> Max: [gate_w: 86.8184] | L3 Valve: 1.8102 | RAM: 233MB
+➡️  Step 400 | Cosine Loss (+8): 1.0279 | LR: 6.0e-6
+   ⚙️  L2 Syllable Gate: 35.25% | 🧠 L3 Grammar Gate: 4.72%
+   📐 L3 GRADS -> Max: [gate_w: 24.8523] | L3 Valve: 1.8233 | RAM: 234MB
+➡️  Step 450 | Cosine Loss (+8): 1.0229 | LR: 7.0e-6
+   ⚙️  L2 Syllable Gate: 35.33% | 🧠 L3 Grammar Gate: 4.62%
+   📐 L3 GRADS -> Max: [gate_w: 22.1947] | L3 Valve: 1.8452 | RAM: 235MB
+➡️  Step 500 | Cosine Loss (+8): 1.0161 | LR: 8.0e-6
+   ⚙️  L2 Syllable Gate: 33.55% | 🧠 L3 Grammar Gate: 4.52%
+   📐 L3 GRADS -> Max: [out_w: 1.8832] | L3 Valve: 1.8589 | RAM: 235MB
+➡️  Step 550 | Cosine Loss (+8): 1.0126 | LR: 8.0e-6
+   ⚙️  L2 Syllable Gate: 32.99% | 🧠 L3 Grammar Gate: 4.44%
+   📐 L3 GRADS -> Max: [out_w: 1.8553] | L3 Valve: 1.8274 | RAM: 236MB
+➡️  Step 600 | Cosine Loss (+8): 1.0008 | LR: 9.0e-6
+   ⚙️  L2 Syllable Gate: 34.24% | 🧠 L3 Grammar Gate: 4.35%
+   📐 L3 GRADS -> Max: [gate_w: 19.794] | L3 Valve: 1.8774 | RAM: 237MB
+➡️  Step 650 | Cosine Loss (+8): 0.9933 | LR: 1.0e-5
+   ⚙️  L2 Syllable Gate: 33.36% | 🧠 L3 Grammar Gate: 4.37%
+   📐 L3 GRADS -> Max: [gate_w: 9.4799] | L3 Valve: 1.8884 | RAM: 238MB
+➡️  Step 700 | Cosine Loss (+8): 0.987 | LR: 1.0e-5
+   ⚙️  L2 Syllable Gate: 33.04% | 🧠 L3 Grammar Gate: 4.45%
+   📐 L3 GRADS -> Max: [spell_w: 1.8961] | L3 Valve: 1.8738 | RAM: 238MB
+➡️  Step 750 | Cosine Loss (+8): 0.9792 | LR: 1.1e-5
+   ⚙️  L2 Syllable Gate: 34.58% | 🧠 L3 Grammar Gate: 4.6%
+   📐 L3 GRADS -> Max: [gate_w: 58.1197] | L3 Valve: 1.8575 | RAM: 239MB
+➡️  Step 800 | Cosine Loss (+8): 0.964 | LR: 1.2e-5
+   ⚙️  L2 Syllable Gate: 33.27% | 🧠 L3 Grammar Gate: 4.75%
+   📐 L3 GRADS -> Max: [gate_w: 76.4949] | L3 Valve: 1.903 | RAM: 240MB
+➡️  Step 850 | Cosine Loss (+8): 0.957 | LR: 1.3e-5
+   ⚙️  L2 Syllable Gate: 33.17% | 🧠 L3 Grammar Gate: 4.96%
+   📐 L3 GRADS -> Max: [gate_w: 66.9461] | L3 Valve: 1.89 | RAM: 240MB
+➡️  Step 900 | Cosine Loss (+8): 0.9377 | LR: 1.4e-5
+   ⚙️  L2 Syllable Gate: 32.56% | 🧠 L3 Grammar Gate: 5.14%
+   📐 L3 GRADS -> Max: [gate_w: 47.0518] | L3 Valve: 1.9155 | RAM: 241MB
+➡️  Step 950 | Cosine Loss (+8): 0.925 | LR: 1.4e-5
+   ⚙️  L2 Syllable Gate: 33.36% | 🧠 L3 Grammar Gate: 5.37%
+   📐 L3 GRADS -> Max: [gate_w: 49.6543] | L3 Valve: 1.9144 | RAM: 242MB
+➡️  Step 1000 | Cosine Loss (+8): 0.9133 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.7% | 🧠 L3 Grammar Gate: 5.61%
+   📐 L3 GRADS -> Max: [gate_w: 70.4393] | L3 Valve: 1.9182 | RAM: 242MB
+💾 Auto-Saving Checkpoint Step 1000...
+➡️  Step 1050 | Cosine Loss (+8): 0.8923 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.29% | 🧠 L3 Grammar Gate: 5.81%
+   📐 L3 GRADS -> Max: [gate_w: 67.6952] | L3 Valve: 1.936 | RAM: 256MB
+➡️  Step 1100 | Cosine Loss (+8): 0.8737 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.95% | 🧠 L3 Grammar Gate: 6.05%
+   📐 L3 GRADS -> Max: [gate_w: 381.9418] | L3 Valve: 1.9599 | RAM: 257MB
+➡️  Step 1150 | Cosine Loss (+8): 0.8575 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.66% | 🧠 L3 Grammar Gate: 6.23%
+   📐 L3 GRADS -> Max: [spell_w: 1.9281] | L3 Valve: 1.9169 | RAM: 258MB
+➡️  Step 1200 | Cosine Loss (+8): 0.8387 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.95% | 🧠 L3 Grammar Gate: 6.47%
+   📐 L3 GRADS -> Max: [gate_w: 82.3015] | L3 Valve: 1.9477 | RAM: 268MB
+➡️  Step 1250 | Cosine Loss (+8): 0.8162 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.18% | 🧠 L3 Grammar Gate: 6.7%
+   📐 L3 GRADS -> Max: [gate_w: 305.5911] | L3 Valve: 1.9466 | RAM: 277MB
+➡️  Step 1300 | Cosine Loss (+8): 0.8052 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.21% | 🧠 L3 Grammar Gate: 6.89%
+   📐 L3 GRADS -> Max: [gate_w: 148.722] | L3 Valve: 1.9181 | RAM: 285MB
+➡️  Step 1350 | Cosine Loss (+8): 0.7851 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.59% | 🧠 L3 Grammar Gate: 7.09%
+   📐 L3 GRADS -> Max: [valve_w: 1.9009] | L3 Valve: 1.9009 | RAM: 249MB
+➡️  Step 1400 | Cosine Loss (+8): 0.769 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.11% | 🧠 L3 Grammar Gate: 7.26%
+   📐 L3 GRADS -> Max: [gate_w: 84.5384] | L3 Valve: 1.8724 | RAM: 250MB
+➡️  Step 1450 | Cosine Loss (+8): 0.7442 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.86% | 🧠 L3 Grammar Gate: 7.5%
+   📐 L3 GRADS -> Max: [gate_w: 539.305] | L3 Valve: 1.8882 | RAM: 251MB
+➡️  Step 1500 | Cosine Loss (+8): 0.7148 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 31.38% | 🧠 L3 Grammar Gate: 7.55%
+   📐 L3 GRADS -> Max: [gate_w: 144.0338] | L3 Valve: 1.8634 | RAM: 251MB
+➡️  Step 1550 | Cosine Loss (+8): 0.7075 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 35.07% | 🧠 L3 Grammar Gate: 7.98%
+   📐 L3 GRADS -> Max: [gate_w: 286.2481] | L3 Valve: 1.8358 | RAM: 252MB
+➡️  Step 1600 | Cosine Loss (+8): 0.6863 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.22% | 🧠 L3 Grammar Gate: 8.05%
+   📐 L3 GRADS -> Max: [gate_w: 150.8264] | L3 Valve: 1.7811 | RAM: 253MB
+➡️  Step 1650 | Cosine Loss (+8): 0.6591 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.29% | 🧠 L3 Grammar Gate: 8.18%
+   📐 L3 GRADS -> Max: [gate_w: 77.3802] | L3 Valve: 1.7798 | RAM: 253MB
+➡️  Step 1700 | Cosine Loss (+8): 0.6508 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.9% | 🧠 L3 Grammar Gate: 8.48%
+   📐 L3 GRADS -> Max: [gate_w: 407.1655] | L3 Valve: 1.7271 | RAM: 254MB
+➡️  Step 1750 | Cosine Loss (+8): 0.6355 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.41% | 🧠 L3 Grammar Gate: 8.6%
+   📐 L3 GRADS -> Max: [gate_w: 303.1184] | L3 Valve: 1.6589 | RAM: 276MB
+➡️  Step 1800 | Cosine Loss (+8): 0.6203 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.21% | 🧠 L3 Grammar Gate: 8.74%
+   📐 L3 GRADS -> Max: [gate_w: 277.8407] | L3 Valve: 1.5916 | RAM: 276MB
+➡️  Step 1850 | Cosine Loss (+8): 0.5849 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.06% | 🧠 L3 Grammar Gate: 8.83%
+   📐 L3 GRADS -> Max: [gate_w: 286.9521] | L3 Valve: 1.5775 | RAM: 269MB
+➡️  Step 1900 | Cosine Loss (+8): 0.5765 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.06% | 🧠 L3 Grammar Gate: 9.09%
+   📐 L3 GRADS -> Max: [out_w: 1.7513] | L3 Valve: 1.5284 | RAM: 270MB
+➡️  Step 1950 | Cosine Loss (+8): 0.5591 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.84% | 🧠 L3 Grammar Gate: 9.23%
+   📐 L3 GRADS -> Max: [gate_w: 267.7197] | L3 Valve: 1.4764 | RAM: 278MB
+➡️  Step 2000 | Cosine Loss (+8): 0.5434 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.0% | 🧠 L3 Grammar Gate: 9.38%
+   📐 L3 GRADS -> Max: [out_w: 1.7003] | L3 Valve: 1.4069 | RAM: 271MB
+💾 Auto-Saving Checkpoint Step 2000...
+➡️  Step 2050 | Cosine Loss (+8): 0.5254 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.73% | 🧠 L3 Grammar Gate: 9.62%
+   📐 L3 GRADS -> Max: [gate_w: 288.9404] | L3 Valve: 1.3747 | RAM: 272MB
+➡️  Step 2100 | Cosine Loss (+8): 0.5088 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.91% | 🧠 L3 Grammar Gate: 9.72%
+   📐 L3 GRADS -> Max: [gate_w: 544.1868] | L3 Valve: 1.3272 | RAM: 273MB
+➡️  Step 2150 | Cosine Loss (+8): 0.4988 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.67% | 🧠 L3 Grammar Gate: 9.85%
+   📐 L3 GRADS -> Max: [gate_w: 103.4736] | L3 Valve: 1.2448 | RAM: 260MB
+➡️  Step 2200 | Cosine Loss (+8): 0.4825 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.41% | 🧠 L3 Grammar Gate: 9.94%
+   📐 L3 GRADS -> Max: [gate_w: 130.9046] | L3 Valve: 1.1946 | RAM: 261MB
+➡️  Step 2250 | Cosine Loss (+8): 0.4695 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.09% | 🧠 L3 Grammar Gate: 10.11%
+   📐 L3 GRADS -> Max: [gate_w: 70.7889] | L3 Valve: 1.1687 | RAM: 262MB
+➡️  Step 2300 | Cosine Loss (+8): 0.4532 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.63% | 🧠 L3 Grammar Gate: 10.19%
+   📐 L3 GRADS -> Max: [gate_w: 87.499] | L3 Valve: 1.1147 | RAM: 263MB
+➡️  Step 2350 | Cosine Loss (+8): 0.4372 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.8% | 🧠 L3 Grammar Gate: 10.51%
+   📐 L3 GRADS -> Max: [gate_w: 111.232] | L3 Valve: 1.0921 | RAM: 263MB
+➡️  Step 2400 | Cosine Loss (+8): 0.4315 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.03% | 🧠 L3 Grammar Gate: 10.57%
+   📐 L3 GRADS -> Max: [gate_w: 266.8794] | L3 Valve: 1.0348 | RAM: 264MB
+➡️  Step 2450 | Cosine Loss (+8): 0.4213 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.9% | 🧠 L3 Grammar Gate: 10.91%
+   📐 L3 GRADS -> Max: [gate_w: 312.7764] | L3 Valve: 1.0204 | RAM: 265MB
+➡️  Step 2500 | Cosine Loss (+8): 0.3993 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.56% | 🧠 L3 Grammar Gate: 10.81%
+   📐 L3 GRADS -> Max: [out_w: 1.494] | L3 Valve: 0.9456 | RAM: 265MB
+➡️  Step 2550 | Cosine Loss (+8): 0.3976 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.16% | 🧠 L3 Grammar Gate: 11.14%
+   📐 L3 GRADS -> Max: [gate_w: 140.8767] | L3 Valve: 0.9353 | RAM: 266MB
+➡️  Step 2600 | Cosine Loss (+8): 0.3875 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.56% | 🧠 L3 Grammar Gate: 11.21%
+   📐 L3 GRADS -> Max: [gate_w: 102.3691] | L3 Valve: 0.8951 | RAM: 267MB
+➡️  Step 2650 | Cosine Loss (+8): 0.3794 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 35.02% | 🧠 L3 Grammar Gate: 11.53%
+   📐 L3 GRADS -> Max: [gate_w: 179.5578] | L3 Valve: 0.8832 | RAM: 268MB
+➡️  Step 2700 | Cosine Loss (+8): 0.3721 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.14% | 🧠 L3 Grammar Gate: 11.58%
+   📐 L3 GRADS -> Max: [gate_w: 105.0724] | L3 Valve: 0.858 | RAM: 268MB
+➡️  Step 2750 | Cosine Loss (+8): 0.3555 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.43% | 🧠 L3 Grammar Gate: 11.8%
+   📐 L3 GRADS -> Max: [gate_w: 356.817] | L3 Valve: 0.8136 | RAM: 269MB
+➡️  Step 2800 | Cosine Loss (+8): 0.3497 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.62% | 🧠 L3 Grammar Gate: 11.74%
+   📐 L3 GRADS -> Max: [gate_w: 61.0252] | L3 Valve: 0.7923 | RAM: 270MB
+➡️  Step 2850 | Cosine Loss (+8): 0.3364 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.01% | 🧠 L3 Grammar Gate: 11.67%
+   📐 L3 GRADS -> Max: [gate_w: 235.2278] | L3 Valve: 0.7495 | RAM: 270MB
+➡️  Step 2900 | Cosine Loss (+8): 0.3315 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.62% | 🧠 L3 Grammar Gate: 12.21%
+   📐 L3 GRADS -> Max: [gate_w: 196.3061] | L3 Valve: 0.7483 | RAM: 272MB
+➡️  Step 2950 | Cosine Loss (+8): 0.3289 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 31.84% | 🧠 L3 Grammar Gate: 11.87%
+   📐 L3 GRADS -> Max: [out_w: 1.2988] | L3 Valve: 0.7026 | RAM: 273MB
+➡️  Step 3000 | Cosine Loss (+8): 0.3196 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.92% | 🧠 L3 Grammar Gate: 12.16%
+   📐 L3 GRADS -> Max: [out_w: 1.3003] | L3 Valve: 0.6889 | RAM: 274MB
+💾 Auto-Saving Checkpoint Step 3000...
+➡️  Step 3050 | Cosine Loss (+8): 0.3128 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 35.36% | 🧠 L3 Grammar Gate: 12.71%
+   📐 L3 GRADS -> Max: [out_w: 1.2953] | L3 Valve: 0.6716 | RAM: 236MB
+➡️  Step 3100 | Cosine Loss (+8): 0.3116 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.2% | 🧠 L3 Grammar Gate: 12.64%
+   📐 L3 GRADS -> Max: [gate_w: 79.4888] | L3 Valve: 0.6325 | RAM: 236MB
+➡️  Step 3150 | Cosine Loss (+8): 0.295 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.62% | 🧠 L3 Grammar Gate: 12.52%
+   📐 L3 GRADS -> Max: [gate_w: 87.5313] | L3 Valve: 0.6231 | RAM: 242MB
+➡️  Step 3200 | Cosine Loss (+8): 0.2921 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.29% | 🧠 L3 Grammar Gate: 13.01%
+   📐 L3 GRADS -> Max: [gate_w: 89.0816] | L3 Valve: 0.6044 | RAM: 251MB
+➡️  Step 3250 | Cosine Loss (+8): 0.2833 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.99% | 🧠 L3 Grammar Gate: 12.99%
+   📐 L3 GRADS -> Max: [gate_w: 167.1559] | L3 Valve: 0.595 | RAM: 260MB
+➡️  Step 3300 | Cosine Loss (+8): 0.264 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.37% | 🧠 L3 Grammar Gate: 12.85%
+   📐 L3 GRADS -> Max: [out_w: 1.2212] | L3 Valve: 0.5663 | RAM: 268MB
+➡️  Step 3350 | Cosine Loss (+8): 0.27 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.12% | 🧠 L3 Grammar Gate: 13.26%
+   📐 L3 GRADS -> Max: [gate_w: 352.6486] | L3 Valve: 0.5552 | RAM: 232MB
+➡️  Step 3400 | Cosine Loss (+8): 0.2706 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.89% | 🧠 L3 Grammar Gate: 13.32%
+   📐 L3 GRADS -> Max: [gate_w: 70.7355] | L3 Valve: 0.5376 | RAM: 233MB
+➡️  Step 3450 | Cosine Loss (+8): 0.2537 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.75% | 🧠 L3 Grammar Gate: 13.25%
+   📐 L3 GRADS -> Max: [gate_w: 118.8941] | L3 Valve: 0.5348 | RAM: 233MB
+➡️  Step 3500 | Cosine Loss (+8): 0.2556 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.4% | 🧠 L3 Grammar Gate: 13.54%
+   📐 L3 GRADS -> Max: [gate_w: 150.3764] | L3 Valve: 0.497 | RAM: 234MB
+➡️  Step 3550 | Cosine Loss (+8): 0.2567 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.97% | 🧠 L3 Grammar Gate: 13.7%
+   📐 L3 GRADS -> Max: [gate_w: 176.0227] | L3 Valve: 0.4904 | RAM: 235MB
+➡️  Step 3600 | Cosine Loss (+8): 0.2556 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.92% | 🧠 L3 Grammar Gate: 14.02%
+   📐 L3 GRADS -> Max: [gate_w: 121.1798] | L3 Valve: 0.4811 | RAM: 236MB
+➡️  Step 3650 | Cosine Loss (+8): 0.2378 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.29% | 🧠 L3 Grammar Gate: 14.06%
+   📐 L3 GRADS -> Max: [out_w: 1.122] | L3 Valve: 0.4751 | RAM: 236MB
+➡️  Step 3700 | Cosine Loss (+8): 0.2399 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.85% | 🧠 L3 Grammar Gate: 14.07%
+   📐 L3 GRADS -> Max: [gate_w: 154.7602] | L3 Valve: 0.4514 | RAM: 237MB
+➡️  Step 3750 | Cosine Loss (+8): 0.234 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.48% | 🧠 L3 Grammar Gate: 14.34%
+   📐 L3 GRADS -> Max: [gate_w: 172.1225] | L3 Valve: 0.4374 | RAM: 238MB
+➡️  Step 3800 | Cosine Loss (+8): 0.2263 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.36% | 🧠 L3 Grammar Gate: 14.23%
+   📐 L3 GRADS -> Max: [gate_w: 185.2612] | L3 Valve: 0.4212 | RAM: 238MB
+➡️  Step 3850 | Cosine Loss (+8): 0.2196 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.78% | 🧠 L3 Grammar Gate: 14.24%
+   📐 L3 GRADS -> Max: [gate_w: 283.1732] | L3 Valve: 0.4122 | RAM: 239MB
+➡️  Step 3900 | Cosine Loss (+8): 0.2168 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.49% | 🧠 L3 Grammar Gate: 14.28%
+   📐 L3 GRADS -> Max: [gate_w: 217.9162] | L3 Valve: 0.3974 | RAM: 240MB
+➡️  Step 3950 | Cosine Loss (+8): 0.2227 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.34% | 🧠 L3 Grammar Gate: 14.76%
+   📐 L3 GRADS -> Max: [gate_w: 103.0709] | L3 Valve: 0.4004 | RAM: 240MB
+➡️  Step 4000 | Cosine Loss (+8): 0.2163 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.22% | 🧠 L3 Grammar Gate: 14.64%
+   📐 L3 GRADS -> Max: [gate_w: 311.003] | L3 Valve: 0.3797 | RAM: 241MB
+💾 Auto-Saving Checkpoint Step 4000...
+➡️  Step 4050 | Cosine Loss (+8): 0.2155 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.47% | 🧠 L3 Grammar Gate: 14.82%
+   📐 L3 GRADS -> Max: [gate_w: 208.8681] | L3 Valve: 0.3872 | RAM: 255MB
+➡️  Step 4100 | Cosine Loss (+8): 0.2171 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 31.92% | 🧠 L3 Grammar Gate: 14.5%
+   📐 L3 GRADS -> Max: [gate_w: 193.9493] | L3 Valve: 0.3691 | RAM: 255MB
+➡️  Step 4150 | Cosine Loss (+8): 0.2025 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.02% | 🧠 L3 Grammar Gate: 14.95%
+   📐 L3 GRADS -> Max: [gate_w: 64.6838] | L3 Valve: 0.3413 | RAM: 256MB
+➡️  Step 4200 | Cosine Loss (+8): 0.1999 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.22% | 🧠 L3 Grammar Gate: 15.35%
+   📐 L3 GRADS -> Max: [gate_w: 44.5111] | L3 Valve: 0.3347 | RAM: 265MB
+➡️  Step 4250 | Cosine Loss (+8): 0.2059 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.07% | 🧠 L3 Grammar Gate: 15.17%
+   📐 L3 GRADS -> Max: [gate_w: 164.8109] | L3 Valve: 0.3241 | RAM: 274MB
+➡️  Step 4300 | Cosine Loss (+8): 0.1975 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.76% | 🧠 L3 Grammar Gate: 15.47%
+   📐 L3 GRADS -> Max: [gate_w: 67.9302] | L3 Valve: 0.3245 | RAM: 282MB
+➡️  Step 4350 | Cosine Loss (+8): 0.2001 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.05% | 🧠 L3 Grammar Gate: 15.62%
+   📐 L3 GRADS -> Max: [gate_w: 276.6978] | L3 Valve: 0.307 | RAM: 291MB
+➡️  Step 4400 | Cosine Loss (+8): 0.1864 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.77% | 🧠 L3 Grammar Gate: 15.9%
+   📐 L3 GRADS -> Max: [gate_w: 66.5354] | L3 Valve: 0.3134 | RAM: 300MB
+➡️  Step 4450 | Cosine Loss (+8): 0.1865 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.37% | 🧠 L3 Grammar Gate: 15.91%
+   📐 L3 GRADS -> Max: [out_w: 0.9134] | L3 Valve: 0.2901 | RAM: 309MB
+➡️  Step 4500 | Cosine Loss (+8): 0.1847 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.61% | 🧠 L3 Grammar Gate: 16.11%
+   📐 L3 GRADS -> Max: [gate_w: 127.2499] | L3 Valve: 0.3105 | RAM: 317MB
+➡️  Step 4550 | Cosine Loss (+8): 0.1809 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.26% | 🧠 L3 Grammar Gate: 15.85%
+   📐 L3 GRADS -> Max: [gate_w: 104.8021] | L3 Valve: 0.277 | RAM: 326MB
+➡️  Step 4600 | Cosine Loss (+8): 0.184 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.17% | 🧠 L3 Grammar Gate: 15.95%
+   📐 L3 GRADS -> Max: [gate_w: 81.4424] | L3 Valve: 0.272 | RAM: 335MB
+➡️  Step 4650 | Cosine Loss (+8): 0.1714 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.93% | 🧠 L3 Grammar Gate: 15.96%
+   📐 L3 GRADS -> Max: [gate_w: 45.7902] | L3 Valve: 0.2555 | RAM: 343MB
+➡️  Step 4700 | Cosine Loss (+8): 0.1691 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.88% | 🧠 L3 Grammar Gate: 16.3%
+   📐 L3 GRADS -> Max: [gate_w: 188.4762] | L3 Valve: 0.2491 | RAM: 352MB
+➡️  Step 4750 | Cosine Loss (+8): 0.1717 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.78% | 🧠 L3 Grammar Gate: 16.47%
+   📐 L3 GRADS -> Max: [gate_w: 89.1357] | L3 Valve: 0.2362 | RAM: 361MB
+➡️  Step 4800 | Cosine Loss (+8): 0.1623 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.7% | 🧠 L3 Grammar Gate: 16.51%
+   📐 L3 GRADS -> Max: [gate_w: 101.6858] | L3 Valve: 0.2603 | RAM: 370MB
+➡️  Step 4850 | Cosine Loss (+8): 0.1632 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.85% | 🧠 L3 Grammar Gate: 16.87%
+   📐 L3 GRADS -> Max: [out_w: 0.8425] | L3 Valve: 0.2711 | RAM: 378MB
+➡️  Step 4900 | Cosine Loss (+8): 0.16 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.76% | 🧠 L3 Grammar Gate: 16.69%
+   📐 L3 GRADS -> Max: [gate_w: 27.6628] | L3 Valve: 0.2385 | RAM: 387MB
+➡️  Step 4950 | Cosine Loss (+8): 0.1614 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.44% | 🧠 L3 Grammar Gate: 16.96%
+   📐 L3 GRADS -> Max: [gate_w: 153.1916] | L3 Valve: 0.2267 | RAM: 396MB
+➡️  Step 5000 | Cosine Loss (+8): 0.1565 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.82% | 🧠 L3 Grammar Gate: 17.2%
+   📐 L3 GRADS -> Max: [out_w: 0.7959] | L3 Valve: 0.2113 | RAM: 405MB
+💾 Auto-Saving Checkpoint Step 5000...
+➡️  Step 5050 | Cosine Loss (+8): 0.1522 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.36% | 🧠 L3 Grammar Gate: 16.94%
+   📐 L3 GRADS -> Max: [gate_w: 31.725] | L3 Valve: 0.229 | RAM: 254MB
+➡️  Step 5100 | Cosine Loss (+8): 0.1498 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.56% | 🧠 L3 Grammar Gate: 16.86%
+   📐 L3 GRADS -> Max: [gate_w: 41.5096] | L3 Valve: 0.2732 | RAM: 255MB
+➡️  Step 5150 | Cosine Loss (+8): 0.1516 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.47% | 🧠 L3 Grammar Gate: 17.11%
+   📐 L3 GRADS -> Max: [gate_w: 50.8243] | L3 Valve: 0.2302 | RAM: 264MB
+➡️  Step 5200 | Cosine Loss (+8): 0.1469 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.1% | 🧠 L3 Grammar Gate: 17.21%
+   📐 L3 GRADS -> Max: [gate_w: 110.6965] | L3 Valve: 0.2003 | RAM: 273MB
+➡️  Step 5250 | Cosine Loss (+8): 0.1485 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.6% | 🧠 L3 Grammar Gate: 17.38%
+   📐 L3 GRADS -> Max: [gate_w: 156.8023] | L3 Valve: 0.21 | RAM: 281MB
+➡️  Step 5300 | Cosine Loss (+8): 0.1342 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.2% | 🧠 L3 Grammar Gate: 17.73%
+   📐 L3 GRADS -> Max: [gate_w: 156.8429] | L3 Valve: 0.2188 | RAM: 290MB
+➡️  Step 5350 | Cosine Loss (+8): 0.142 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.62% | 🧠 L3 Grammar Gate: 17.62%
+   📐 L3 GRADS -> Max: [gate_w: 123.9337] | L3 Valve: 0.1952 | RAM: 299MB
+➡️  Step 5400 | Cosine Loss (+8): 0.1406 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.17% | 🧠 L3 Grammar Gate: 17.62%
+   📐 L3 GRADS -> Max: [gate_w: 153.1541] | L3 Valve: 0.1662 | RAM: 307MB
+➡️  Step 5450 | Cosine Loss (+8): 0.1405 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.8% | 🧠 L3 Grammar Gate: 17.84%
+   📐 L3 GRADS -> Max: [out_w: 0.6973] | L3 Valve: 0.1762 | RAM: 316MB
+➡️  Step 5500 | Cosine Loss (+8): 0.1401 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.64% | 🧠 L3 Grammar Gate: 17.93%
+   📐 L3 GRADS -> Max: [gate_b: 26.9139] | L3 Valve: 0.1511 | RAM: 325MB
+➡️  Step 5550 | Cosine Loss (+8): 0.1399 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.61% | 🧠 L3 Grammar Gate: 18.03%
+   📐 L3 GRADS -> Max: [gate_w: 68.5987] | L3 Valve: 0.1633 | RAM: 333MB
+➡️  Step 5600 | Cosine Loss (+8): 0.1293 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.71% | 🧠 L3 Grammar Gate: 18.14%
+   📐 L3 GRADS -> Max: [gate_w: 84.1108] | L3 Valve: 0.1547 | RAM: 342MB
+➡️  Step 5650 | Cosine Loss (+8): 0.1267 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.58% | 🧠 L3 Grammar Gate: 18.49%
+   📐 L3 GRADS -> Max: [gate_w: 32.8929] | L3 Valve: 0.1598 | RAM: 351MB
+➡️  Step 5700 | Cosine Loss (+8): 0.1358 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 35.25% | 🧠 L3 Grammar Gate: 18.83%
+   📐 L3 GRADS -> Max: [out_w: 0.6437] | L3 Valve: 0.1652 | RAM: 360MB
+➡️  Step 5750 | Cosine Loss (+8): 0.1338 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 35.07% | 🧠 L3 Grammar Gate: 18.81%
+   📐 L3 GRADS -> Max: [gate_w: 89.5273] | L3 Valve: 0.2021 | RAM: 368MB
+➡️  Step 5800 | Cosine Loss (+8): 0.1334 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.85% | 🧠 L3 Grammar Gate: 18.59%
+   📐 L3 GRADS -> Max: [gate_w: 41.9535] | L3 Valve: 0.1403 | RAM: 377MB
+➡️  Step 5850 | Cosine Loss (+8): 0.124 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.51% | 🧠 L3 Grammar Gate: 18.57%
+   📐 L3 GRADS -> Max: [gate_w: 59.2242] | L3 Valve: 0.1324 | RAM: 386MB
+➡️  Step 5900 | Cosine Loss (+8): 0.1205 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.92% | 🧠 L3 Grammar Gate: 18.46%
+   📐 L3 GRADS -> Max: [gate_w: 62.857] | L3 Valve: 0.1537 | RAM: 395MB
+➡️  Step 5950 | Cosine Loss (+8): 0.1191 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 32.95% | 🧠 L3 Grammar Gate: 18.61%
+   📐 L3 GRADS -> Max: [gate_w: 134.1853] | L3 Valve: 0.1318 | RAM: 404MB
+➡️  Step 6000 | Cosine Loss (+8): 0.1203 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.15% | 🧠 L3 Grammar Gate: 19.06%
+   📐 L3 GRADS -> Max: [gate_w: 159.0747] | L3 Valve: 0.1544 | RAM: 412MB
+💾 Auto-Saving Checkpoint Step 6000...
+➡️  Step 6050 | Cosine Loss (+8): 0.1288 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 33.04% | 🧠 L3 Grammar Gate: 18.82%
+   📐 L3 GRADS -> Max: [gate_w: 70.252] | L3 Valve: 0.1654 | RAM: 283MB
+➡️  Step 6100 | Cosine Loss (+8): 0.1229 | LR: 1.5e-5
+   ⚙️  L2 Syllable Gate: 34.84% | 🧠 L3 Grammar Gate: 19.41%
+   📐 L3 GRADS -> Max: [gate_w: 157.4892] | L3 Valve: 0.1259 | RAM: 284MB
+```

@@ -1,0 +1,645 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Diffusion Encoder - soft-nn
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:kino_vega_lite, "~> 0.1.11"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Diffusion
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.ContextualEmbedTrainer do
+  import Nx.Defn
+
+  defn l2_normalize(tensor) do
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    batch_size = Nx.axis_size(pred, 0)
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+
+  @doc """
+  Fully vectorized contextual co-occurrence using a Pairwise Similarity Matrix.
+  """
+  defn contextual_loss(token_sequences, embeds, opts \\ []) do
+    opts = keyword!(opts, window_size: 3)
+    window_size = opts[:window_size]
+
+    batch_size = Nx.axis_size(token_sequences, 0)
+    seq_len = Nx.axis_size(token_sequences, 1)
+
+    flat_tokens = Nx.flatten(token_sequences)
+    all_embeds = Nx.take(embeds, flat_tokens) |> l2_normalize()
+    
+    # Shape: {batch_size, seq_len, 512}
+    seq_embeds = Nx.reshape(all_embeds, {batch_size, seq_len, 512})
+
+    # ⚡ 1. Fully Vectorized Pairwise Similarity (No Loops!)
+    # Expand to {batch, seq_len, 1, 512} and {batch, 1, seq_len, 512}
+    a = Nx.new_axis(seq_embeds, 2)
+    b = Nx.new_axis(seq_embeds, 1)
+    
+    # Multiply and sum across the 512 dimension to get dot products.
+    # Result shape: {batch_size, seq_len, seq_len}
+    sim_matrix = Nx.sum(Nx.multiply(a, b), axes: [-1])
+
+    # ⚡ 2. Create the Sliding Window Mask
+    indices = Nx.iota({seq_len})
+    # Pairwise difference between every position index: {seq_len, seq_len}
+    diff = Nx.abs(Nx.subtract(Nx.new_axis(indices, 1), Nx.new_axis(indices, 0)))
+
+    # True if within window AND not comparing the token to itself (distance > 0)
+    in_window = Nx.less_equal(diff, window_size)
+    not_self = Nx.greater(diff, 0)
+    
+    # Mask shape: {seq_len, seq_len} (1.0 for valid pairs, 0.0 for ignored pairs)
+    mask = Nx.logical_and(in_window, not_self) |> Nx.as_type(:f32)
+
+    # ⚡ 3. Calculate Masked Cosine Loss
+    # Cosine distance is 1.0 - similarity
+    distances = Nx.subtract(1.0, sim_matrix)
+    masked_distances = Nx.multiply(distances, mask)
+
+    # Sum all the valid masked distances across the batch
+    total_loss = Nx.sum(masked_distances)
+    
+    # Calculate exactly how many valid pairs we evaluated
+    valid_pairs = Nx.multiply(Nx.sum(mask), batch_size)
+    
+    # Average the loss
+    Nx.divide(total_loss, Nx.add(valid_pairs, 1.0e-6))
+  end
+
+  @doc """
+  Optionally add a case-pair proximity loss to directly enforce
+  uppercase/lowercase closeness.
+  """
+  defn case_proximity_loss(embeds) do
+    # ASCII pairs: A=65/a=97, B=66/b=98, ... Z=90/z=122
+    # Offset between upper and lower is always 32
+    upper_embeds =
+      Nx.iota({26}) 
+      |> Nx.add(65)  # 65..90
+      |> then(&Nx.take(embeds, &1))
+      |> l2_normalize()
+
+    lower_embeds =
+      Nx.iota({26})
+      |> Nx.add(97)  # 97..122
+      |> then(&Nx.take(embeds, &1))
+      |> l2_normalize()
+
+    # Cosine distance between each uppercase and its lowercase pair
+    cos_sim = Nx.sum(Nx.multiply(upper_embeds, lower_embeds), axes: [-1])
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  @doc """
+  Combined training step: contextual co-occurrence + case proximity.
+  case_weight controls how strongly to enforce case pairs.
+  """
+  defn compute_grad_and_step(embeds, m_embeds, token_sequences, step, lr, opts \\ []) do
+    opts = keyword!(opts, case_weight: 0.3, window_size: 3)
+    case_weight = opts[:case_weight]
+    window_size = opts[:window_size]
+  
+    {loss, grads} = value_and_grad(embeds, fn e ->
+      ctx_loss = contextual_loss(token_sequences, e, window_size: window_size)
+      case_loss = case_proximity_loss(e)
+      ctx_loss + case_weight * case_loss
+    end)
+  
+    beta1 = 0.9
+    eps = 1.0e-8
+  
+    new_m = beta1 * m_embeds + (1.0 - beta1) * grads
+    m_hat = new_m / (1.0 - Nx.pow(beta1, step + 1))
+    new_embeds = embeds - lr * m_hat / (Nx.sqrt(Nx.abs(m_hat)) + eps)
+  
+    {loss, new_embeds, new_m}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.ContextualEmbedTrainer, <<70, 79, 82, 49, 0, 0, 46, ...>>, true}
+```
+
+```elixir
+batch_size = 32
+seq_len = 32
+key = Nx.Random.key(42) |> Nx.backend_copy(gpu)
+
+embeds = Nx.Random.normal(key, 0.0, 0.1, shape: {128, 512}) |> elem(0) |> Nx.backend_copy(gpu)
+m_embeds = Nx.broadcast(0.0, {128, 512}) |> Nx.backend_copy(gpu)
+lr = Nx.tensor(3.0e-4, type: :f32) |> Nx.backend_copy(gpu)
+
+# Flatten the 2D dataset to 1D for the streamer
+full_dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+dataset_1d = Nx.flatten(full_dataset_2d)
+data_stream = DLM.DataStreamer.build_infinite_stream(dataset_1d, batch_size, seq_len)
+
+total_steps = 25_000
+IO.puts("🚀 IGNITION: Phase 1 Contextual Shape Training...")
+
+{final_embeds, _final_m} =
+  Enum.reduce(
+    Enum.zip(0..(total_steps - 1), data_stream),
+    {embeds, m_embeds},
+    fn {step, batch}, {e, m} ->
+      gpu_batch = Nx.backend_copy(batch, gpu) |> Nx.as_type(:s32)
+      step_t = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
+
+      {loss, new_e, new_m} =
+        DLM.ContextualEmbedTrainer.compute_grad_and_step(e, m, gpu_batch, step_t, lr)
+
+      if rem(step, 100) == 0 do
+        IO.puts("Step #{step} | Loss: #{Float.round(Nx.to_number(loss), 4)}")
+      end
+
+      {new_e, new_m}
+    end
+  )
+
+IO.puts("🎉 PHASE 1 TRAINING COMPLETE!")
+
+# Save — embeddings only, matching the format your downstream code expects
+cpu_embeds = Nx.backend_copy(final_embeds, Nx.BinaryBackend)
+
+# ⚡ Match the tuple format your Phase 2 loader expects:
+# %{params: phase1_p} -> {cpu_embeds, _w1, _w2, _key}
+dummy = Nx.broadcast(0.0, {1}) |> Nx.backend_copy(Nx.BinaryBackend)
+File.write!(
+  "phase1_shape_diffusion_25k_COMPLETE.bin",
+  :erlang.term_to_binary(%{params: {cpu_embeds, dummy, dummy, dummy}})
+)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🚀 IGNITION: Phase 1 Contextual Shape Training...
+Step 0 | Loss: 1.2531
+Step 100 | Loss: 1.2569
+Step 200 | Loss: 1.256
+Step 300 | Loss: 1.2394
+Step 400 | Loss: 1.2405
+Step 500 | Loss: 1.2427
+Step 600 | Loss: 1.2314
+Step 700 | Loss: 1.225
+Step 800 | Loss: 1.2166
+Step 900 | Loss: 1.2101
+Step 1000 | Loss: 1.2075
+Step 1100 | Loss: 1.1967
+Step 1200 | Loss: 1.1905
+Step 1300 | Loss: 1.1938
+Step 1400 | Loss: 1.1834
+Step 1500 | Loss: 1.1897
+Step 1600 | Loss: 1.1735
+Step 1700 | Loss: 1.1654
+Step 1800 | Loss: 1.1512
+Step 1900 | Loss: 1.1539
+Step 2000 | Loss: 1.1491
+Step 2100 | Loss: 1.137
+Step 2200 | Loss: 1.1379
+Step 2300 | Loss: 1.1262
+Step 2400 | Loss: 1.1175
+Step 2500 | Loss: 1.1188
+Step 2600 | Loss: 1.1174
+Step 2700 | Loss: 1.1013
+Step 2800 | Loss: 1.0935
+Step 2900 | Loss: 1.089
+Step 3000 | Loss: 1.0884
+Step 3100 | Loss: 1.0748
+Step 3200 | Loss: 1.0655
+Step 3300 | Loss: 1.0661
+Step 3400 | Loss: 1.0538
+Step 3500 | Loss: 1.0485
+Step 3600 | Loss: 1.039
+Step 3700 | Loss: 1.0343
+Step 3800 | Loss: 1.0461
+Step 3900 | Loss: 1.0241
+Step 4000 | Loss: 1.0244
+Step 4100 | Loss: 1.0129
+Step 4200 | Loss: 0.9976
+Step 4300 | Loss: 0.9962
+Step 4400 | Loss: 0.9937
+Step 4500 | Loss: 0.9575
+Step 4600 | Loss: 0.9798
+Step 4700 | Loss: 0.9701
+Step 4800 | Loss: 0.9454
+Step 4900 | Loss: 0.9511
+Step 5000 | Loss: 0.9535
+Step 5100 | Loss: 0.9221
+Step 5200 | Loss: 0.9502
+Step 5300 | Loss: 0.9076
+Step 5400 | Loss: 0.9224
+Step 5500 | Loss: 0.9003
+Step 5600 | Loss: 0.906
+Step 5700 | Loss: 0.9009
+Step 5800 | Loss: 0.9045
+Step 5900 | Loss: 0.855
+Step 6000 | Loss: 0.8512
+Step 6100 | Loss: 0.886
+Step 6200 | Loss: 0.8423
+Step 6300 | Loss: 0.8438
+Step 6400 | Loss: 0.8269
+Step 6500 | Loss: 0.8274
+Step 6600 | Loss: 0.8107
+Step 6700 | Loss: 0.8385
+Step 6800 | Loss: 0.8157
+Step 6900 | Loss: 0.7747
+Step 7000 | Loss: 0.8061
+Step 7100 | Loss: 0.7877
+Step 7200 | Loss: 0.7588
+Step 7300 | Loss: 0.7858
+Step 7400 | Loss: 0.774
+Step 7500 | Loss: 0.7708
+Step 7600 | Loss: 0.7669
+Step 7700 | Loss: 0.7508
+Step 7800 | Loss: 0.7479
+Step 7900 | Loss: 0.7353
+Step 8000 | Loss: 0.6901
+Step 8100 | Loss: 0.7306
+Step 8200 | Loss: 0.722
+Step 8300 | Loss: 0.6918
+Step 8400 | Loss: 0.7053
+Step 8500 | Loss: 0.6826
+Step 8600 | Loss: 0.6885
+Step 8700 | Loss: 0.6732
+Step 8800 | Loss: 0.6923
+Step 8900 | Loss: 0.6686
+Step 9000 | Loss: 0.6881
+Step 9100 | Loss: 0.668
+Step 9200 | Loss: 0.623
+Step 9300 | Loss: 0.6735
+Step 9400 | Loss: 0.6562
+Step 9500 | Loss: 0.6442
+Step 9600 | Loss: 0.6186
+Step 9700 | Loss: 0.6126
+Step 9800 | Loss: 0.5842
+Step 9900 | Loss: 0.6138
+Step 10000 | Loss: 0.5663
+Step 10100 | Loss: 0.5957
+Step 10200 | Loss: 0.5932
+Step 10300 | Loss: 0.6344
+Step 10400 | Loss: 0.5774
+Step 10500 | Loss: 0.5954
+Step 10600 | Loss: 0.5731
+Step 10700 | Loss: 0.546
+Step 10800 | Loss: 0.5612
+Step 10900 | Loss: 0.5567
+Step 11000 | Loss: 0.5324
+Step 11100 | Loss: 0.5377
+Step 11200 | Loss: 0.6136
+Step 11300 | Loss: 0.4998
+Step 11400 | Loss: 0.5284
+Step 11500 | Loss: 0.5387
+Step 11600 | Loss: 0.566
+Step 11700 | Loss: 0.5102
+Step 11800 | Loss: 0.5681
+Step 11900 | Loss: 0.4839
+Step 12000 | Loss: 0.5183
+Step 12100 | Loss: 0.5198
+Step 12200 | Loss: 0.4754
+Step 12300 | Loss: 0.4614
+Step 12400 | Loss: 0.4697
+Step 12500 | Loss: 0.4937
+Step 12600 | Loss: 0.4613
+Step 12700 | Loss: 0.4477
+Step 12800 | Loss: 0.4537
+Step 12900 | Loss: 0.4768
+Step 13000 | Loss: 0.4807
+Step 13100 | Loss: 0.441
+Step 13200 | Loss: 0.4422
+Step 13300 | Loss: 0.412
+Step 13400 | Loss: 0.4515
+Step 13500 | Loss: 0.4269
+Step 13600 | Loss: 0.3817
+Step 13700 | Loss: 0.386
+Step 13800 | Loss: 0.3954
+Step 13900 | Loss: 0.4362
+Step 14000 | Loss: 0.3725
+Step 14100 | Loss: 0.4138
+Step 14200 | Loss: 0.4069
+Step 14300 | Loss: 0.4287
+Step 14400 | Loss: 0.4243
+Step 14500 | Loss: 0.381
+Step 14600 | Loss: 0.3517
+Step 14700 | Loss: 0.3855
+Step 14800 | Loss: 0.3726
+Step 14900 | Loss: 0.355
+Step 15000 | Loss: 0.3618
+Step 15100 | Loss: 0.3462
+Step 15200 | Loss: 0.3334
+Step 15300 | Loss: 0.3512
+Step 15400 | Loss: 0.3882
+Step 15500 | Loss: 0.3827
+Step 15600 | Loss: 0.359
+Step 15700 | Loss: 0.3484
+Step 15800 | Loss: 0.3464
+Step 15900 | Loss: 0.3208
+Step 16000 | Loss: 0.3256
+Step 16100 | Loss: 0.3712
+Step 16200 | Loss: 0.3084
+Step 16300 | Loss: 0.3316
+Step 16400 | Loss: 0.3142
+Step 16500 | Loss: 0.3157
+Step 16600 | Loss: 0.3488
+Step 16700 | Loss: 0.3288
+Step 16800 | Loss: 0.3114
+Step 16900 | Loss: 0.3233
+Step 17000 | Loss: 0.2974
+Step 17100 | Loss: 0.2899
+Step 17200 | Loss: 0.2935
+Step 17300 | Loss: 0.269
+Step 17400 | Loss: 0.3237
+Step 17500 | Loss: 0.2523
+Step 17600 | Loss: 0.2688
+Step 17700 | Loss: 0.3049
+Step 17800 | Loss: 0.2926
+Step 17900 | Loss: 0.254
+Step 18000 | Loss: 0.2874
+Step 18100 | Loss: 0.2522
+Step 18200 | Loss: 0.2908
+Step 18300 | Loss: 0.2625
+Step 18400 | Loss: 0.2962
+Step 18500 | Loss: 0.2756
+Step 18600 | Loss: 0.3004
+Step 18700 | Loss: 0.2638
+Step 18800 | Loss: 0.2606
+Step 18900 | Loss: 0.2716
+Step 19000 | Loss: 0.2469
+Step 19100 | Loss: 0.2903
+Step 19200 | Loss: 0.2319
+Step 19300 | Loss: 0.2634
+Step 19400 | Loss: 0.2322
+Step 19500 | Loss: 0.2509
+Step 19600 | Loss: 0.2082
+Step 19700 | Loss: 0.2412
+Step 19800 | Loss: 0.2436
+Step 19900 | Loss: 0.2871
+Step 20000 | Loss: 0.305
+Step 20100 | Loss: 0.2607
+Step 20200 | Loss: 0.2323
+Step 20300 | Loss: 0.2251
+Step 20400 | Loss: 0.2155
+Step 20500 | Loss: 0.2555
+Step 20600 | Loss: 0.2396
+Step 20700 | Loss: 0.2404
+Step 20800 | Loss: 0.2069
+Step 20900 | Loss: 0.2294
+Step 21000 | Loss: 0.2334
+Step 21100 | Loss: 0.2214
+Step 21200 | Loss: 0.2241
+Step 21300 | Loss: 0.1711
+Step 21400 | Loss: 0.2289
+Step 21500 | Loss: 0.186
+Step 21600 | Loss: 0.2043
+Step 21700 | Loss: 0.2028
+Step 21800 | Loss: 0.2427
+Step 21900 | Loss: 0.2217
+Step 22000 | Loss: 0.221
+Step 22100 | Loss: 0.1768
+Step 22200 | Loss: 0.196
+Step 22300 | Loss: 0.2094
+Step 22400 | Loss: 0.1846
+Step 22500 | Loss: 0.1882
+Step 22600 | Loss: 0.1822
+Step 22700 | Loss: 0.1786
+Step 22800 | Loss: 0.2027
+Step 22900 | Loss: 0.1857
+Step 23000 | Loss: 0.2046
+Step 23100 | Loss: 0.1616
+Step 23200 | Loss: 0.1869
+Step 23300 | Loss: 0.2021
+Step 23400 | Loss: 0.1836
+Step 23500 | Loss: 0.1605
+Step 23600 | Loss: 0.1677
+Step 23700 | Loss: 0.2002
+Step 23800 | Loss: 0.1509
+Step 23900 | Loss: 0.188
+Step 24000 | Loss: 0.1402
+Step 24100 | Loss: 0.1473
+Step 24200 | Loss: 0.1755
+Step 24300 | Loss: 0.1953
+Step 24400 | Loss: 0.1588
+Step 24500 | Loss: 0.1616
+Step 24600 | Loss: 0.1563
+Step 24700 | Loss: 0.1457
+Step 24800 | Loss: 0.139
+Step 24900 | Loss: 0.1657
+🎉 PHASE 1 TRAINING COMPLETE!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+```elixir
+# =====================================================================
+# Phase 1: Manifold Visualization
+# =====================================================================
+alias VegaLite, as: Vl
+
+# 1. Extract the learned 128x512 embeddings from your final params tuple
+# {final_embeds, _w1, _w2, _key} = final_p
+
+# Bring it back to the CPU for LinAlg processing
+coords = Nx.backend_copy(final_embeds, Nx.BinaryBackend)
+
+# 2. PCA: Squash 512D down to 2D
+mean = Nx.mean(coords, axes: [0], keep_axes: true)
+centered = Nx.subtract(coords, mean)
+
+# Perform Singular Value Decomposition
+{_u, _s, vt} = Nx.LinAlg.svd(centered)
+
+# Extract the top 2 Principal Components
+v_top2 = Nx.transpose(vt)[[.., 0..1]]
+
+# Project the 512D coordinates onto the new 2D plane
+coords_2d = Nx.dot(centered, v_top2)
+
+# 3. Extract X and Y for graphing
+x_vals = coords_2d[[.., 0]] |> Nx.to_flat_list()
+y_vals = coords_2d[[.., 1]] |> Nx.to_flat_list()
+
+# 4. Tag and categorize the printable ASCII characters
+plot_data =
+  Enum.map(32..126, fn ascii ->
+    char = List.to_string([ascii])
+    
+    type = cond do
+      char == " " -> "Space"
+      char =~ ~r/[aeiouAEIOU]/ -> "Vowel"
+      char =~ ~r/[a-zA-Z]/ -> "Consonant"
+      char =~ ~r/[0-9]/ -> "Number"
+      true -> "Punctuation"
+    end
+
+    %{
+      "character" => char,
+      "x" => Enum.at(x_vals, ascii),
+      "y" => Enum.at(y_vals, ascii),
+      "type" => type
+    }
+  end)
+
+# 5. Render the Latent Map
+Vl.new(width: 800, height: 600, title: "Diffusion-Molded 512D Latent Manifold")
+|> Vl.data_from_values(plot_data)
+|> Vl.mark(:text, size: 16, font: "monospace", font_weight: "bold")
+|> Vl.encode_field(:x, "x", type: :quantitative, title: "Principal Component 1")
+|> Vl.encode_field(:y, "y", type: :quantitative, title: "Principal Component 2")
+|> Vl.encode_field(:text, "character", type: :nominal)
+|> Vl.encode_field(:color, "type", type: :nominal, scale: [
+  domain: ["Space", "Vowel", "Consonant", "Number", "Punctuation"],
+  range: ["#FF0000", "#00AEEF", "#2A363B", "#99B898", "#E84A5F"]
+])
+|> Kino.VegaLite.new()
+```
