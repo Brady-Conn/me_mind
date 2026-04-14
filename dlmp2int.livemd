@@ -1,0 +1,844 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# DLM P2 - introspective
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples AND maps of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  # ⚡ NEW: Handle Maps (like frozen_map and retro_map)
+  def map(map_data, func) when is_map(map_data) and not is_struct(map_data) do
+    Map.new(map_data, fn {k, v} -> {k, map(v, func)} end)
+  end
+
+  # Handle Tuples (like the old 9-param state)
+  def map(tuple_data, func) when is_tuple(tuple_data) do
+    tuple_data
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 10, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN for Rank 2 Tensors)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # pred and target are {batch_size, dim}
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    # 1. Batched Dot Product: {batch, dim} x {dim, batch} -> {batch, batch}
+    # This creates a similarity matrix comparing every pred to every target in the batch
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 2. Create Identity Targets -> {batch, batch}
+    batch_size = Nx.axis_size(pred, 0)
+    # ⚡ THE FIX: Pass a 2D tuple {32, 32} instead of a 1D tuple {32}
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    # 3. Manual Dense Log-Softmax
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))ozen_w2,
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 27, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## SSM
+
+```elixir
+defmodule DLM.TinySSM do
+  import Nx.Defn
+  
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    activated = Nx.tanh(hidden)
+    Nx.dot(activated, v)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  # ⚡ The 60k Graft Forward Pass
+  defn forward_step(x_t, h_prev, frozen, retro) do
+    %{a_gate: a, bu: bu, bv: bv, du: du, dv: dv, vw: vw, vb: vb} = frozen
+
+    b_proj = apply_svd(x_t, bu, bv)
+    
+    # 1. The Dynamic Gate (Frozen)
+    gate_proj = apply_svd(x_t, du, dv)
+    shifted_gate = Nx.subtract(gate_proj, 3.0)
+    delta = Nx.max(softplus(shifted_gate), 0.01)
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    
+    # 2. XSA Geometry (Frozen)
+    h_norm_sq = Nx.add(Nx.sum(Nx.pow(h_prev, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    h_unit = Nx.divide(h_prev, Nx.sqrt(h_norm_sq))
+    
+    overlap = Nx.sum(Nx.multiply(b_proj, h_unit), axes: [-1], keep_axes: true)
+    b_exclusive = Nx.subtract(b_proj, Nx.multiply(overlap, h_unit))
+    
+    # 3. State Update
+    h_new = Nx.add(Nx.multiply(a_bar, h_prev), b_exclusive)
+
+    # ⚡ 4. Dual Probes (Dense Layers to 128D)
+    logits_fwd = Nx.add(Nx.dot(h_new, vw), vb)
+    logits_retro = Nx.add(Nx.dot(h_new, retro.rw), retro.rb)
+
+    {logits_fwd, logits_retro, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
+```
+
+```elixir
+defmodule DLM.ProbeOptimizer do
+  import Nx.Defn
+  
+  # Uses your exact AdamW math from DLM.Adam7
+  defn adam_step(p, g, m, v, step, lr) do
+    beta1 = 0.9
+    beta2 = 0.999
+    flat_decay = 1.0e-4
+
+    m_new = Nx.add(Nx.multiply(beta1, m), Nx.multiply(1.0 - beta1, g))
+    v_new = Nx.add(Nx.multiply(beta2, v), Nx.multiply(1.0 - beta2, Nx.pow(g, 2)))
+
+    m_hat = Nx.divide(m_new, Nx.subtract(1.0, Nx.pow(beta1, step)))
+    v_hat = Nx.divide(v_new, Nx.subtract(1.0, Nx.pow(beta2, step)))
+
+    update_val = Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), 1.0e-8)))
+
+    p_decayed = Nx.subtract(p, Nx.multiply(flat_decay, p))
+    p_new = Nx.subtract(p_decayed, update_val)
+
+    # Hard ceiling
+    current_norm = Nx.sqrt(Nx.sum(Nx.pow(p_new, 2)))
+    scale_factor = Nx.select(current_norm > 50.0, Nx.divide(50.0, Nx.add(current_norm, 1.0e-8)), 1.0)
+    
+    {Nx.multiply(p_new, scale_factor), m_new, v_new}
+  end
+
+  defn update(retro_params, grads, ms, vs, step, lr) do
+    new_step = Nx.add(step, 1)
+    
+    {rw_new, mrw_new, vrw_new} = adam_step(retro_params.rw, grads.rw, ms.rw, vs.rw, new_step, lr)
+    {rb_new, mrb_new, vrb_new} = adam_step(retro_params.rb, grads.rb, ms.rb, vs.rb, new_step, lr)
+
+    new_params = %{rw: rw_new, rb: rb_new}
+    new_ms = %{rw: mrw_new, rb: mrb_new}
+    new_vs = %{rw: vrw_new, rb: vrb_new}
+    
+    {new_params, new_ms, new_vs, new_step}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.ProbeOptimizer, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
+```
+
+```elixir
+defmodule DLM.PhysicsGenesis do
+  import Nx.Defn
+
+  @dim 512
+  @rank 256
+
+  defn ignite(key) do
+    # a_diag: Friction/Inertia
+    {a, k1} = Nx.Random.normal(key, -0.1, 0.01, shape: {@dim})
+    
+    # b: Input Force Matrices
+    {bu, k2} = Nx.Random.normal(k1, 0.0, 0.02, shape: {@dim, @rank})
+    {bv, k3} = Nx.Random.normal(k2, 0.0, 0.02, shape: {@rank, @dim})
+    
+    # c: Output Velocity Matrices
+    {cu, k4} = Nx.Random.normal(k3, 0.0, 0.02, shape: {@dim, @rank})
+    {cv, k5} = Nx.Random.normal(k4, 0.0, 0.02, shape: {@rank, @dim})
+
+    # ⚡ NEW: d: Dynamic Gating Matrices (Initialized near zero)
+    {du, k6} = Nx.Random.normal(k5, 0.0, 0.02, shape: {@dim, @rank})
+    {dv, k7} = Nx.Random.normal(k6, 0.0, 0.02, shape: {@rank, @dim})
+
+    # Inside your TinySSM Genesis init_params
+    {vocab_w, next_key} = Nx.Random.normal(k7, 0.0, 0.02, shape: {512, 128})
+    vocab_b = Nx.broadcast(0.0, {128}) |> Nx.as_type(:f32)
+    
+    # Return them at the end of your params tuple
+    
+
+    {{a, bu, bv, cu, cv, du, dv, vocab_w, vocab_b}, next_key}
+  end
+
+  def init_optimizer(params) do
+    zero_state = DLM.Tree.map(params, fn p -> Nx.broadcast(0.0, Nx.shape(p)) end)
+    {zero_state, zero_state, Nx.tensor(0)}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.Phase2Trainer do
+  import Nx.Defn
+
+  defn compute_sequence_loss(input_tokens, target_tokens, h_init, frozen, retro, frozen_embeds) do
+    # 1. Continuous embeddings for the Forward pass
+    input_coords =
+      Nx.take(frozen_embeds, Nx.flatten(input_tokens))
+      |> Nx.reshape({Nx.axis_size(input_tokens, 0), Nx.axis_size(input_tokens, 1), 512})
+      |> stop_grad() 
+
+    inputs_time_first = Nx.transpose(input_coords, axes: [1, 0, 2])
+    
+    # 2. Discrete integer tokens for the Cross Entropy calculations
+    targets_time_first = Nx.transpose(target_tokens, axes: [1, 0])
+    discrete_inputs_time_first = Nx.transpose(input_tokens, axes: [1, 0])
+
+    result =
+      while {i = 0, 
+             total_fwd = Nx.tensor(0.0, type: :f32), 
+             total_retro = Nx.tensor(0.0, type: :f32), 
+             h = h_init, 
+             inputs = inputs_time_first, 
+             targets_fwd = targets_time_first, 
+             targets_retro = discrete_inputs_time_first,
+             f = frozen, r = retro},
+            Nx.less(i, Nx.axis_size(inputs, 0)) do
+      
+        x_curr_emb = inputs[i]
+        y_fwd = targets_fwd[i]
+        y_retro = targets_retro[i] # The token we are currently processing
+
+        # 3. The Dual Probe Step
+        {logits_fwd, logits_retro, h_new} = DLM.TinySSM.forward_step(x_curr_emb, h, f, r)
+        
+        # 4. Calculate Both Losses
+        step_loss_fwd = DLM.Loss.cross_entropy(logits_fwd, y_fwd)
+        step_loss_retro = DLM.Loss.cross_entropy(logits_retro, y_retro)
+        
+        {i + 1, Nx.add(total_fwd, step_loss_fwd), Nx.add(total_retro, step_loss_retro), h_new, inputs, targets_fwd, targets_retro, f, r}
+      end
+
+    accumulated_fwd = elem(result, 1)
+    accumulated_retro = elem(result, 2)
+    seq_len_f = Nx.axis_size(inputs_time_first, 0)
+    
+    mean_fwd = Nx.divide(accumulated_fwd, seq_len_f)
+    mean_retro = Nx.divide(accumulated_retro, seq_len_f)
+
+    # 5. The Introspective Objective (0.3 weight to the retro probe)
+    total_loss = Nx.add(mean_fwd, Nx.multiply(0.3, mean_retro))
+
+    # ⚡ THE FIX: Bundle the auxiliary data into a single nested tuple
+    {total_loss, {mean_fwd, mean_retro}}
+  end
+
+  defn compute_grad(frozen_map, retro_map, batch_tokens, h_init, frozen_embeds) do
+    {_batch_size, full_seq_len} = Nx.shape(batch_tokens)
+    seq_len = full_seq_len - 1
+    
+    input_tokens  = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+
+    # ⚡ THE FIX: 1. Evaluate the full output first to extract our telemetry
+    {total_loss, {fwd_loss, retro_loss}} = compute_sequence_loss(
+      input_tokens, target_tokens, h_init, frozen_map, retro_map, frozen_embeds
+    )
+  
+    # ⚡ THE FIX: 2. Run value_and_grad, but force the closure to ONLY return the total_loss scalar
+    {_loss, raw_grads} = value_and_grad(retro_map, fn r ->
+      {tot_loss, _aux_data} = compute_sequence_loss(
+        input_tokens, target_tokens, h_init, frozen_map, r, frozen_embeds
+      )
+      tot_loss
+    end)
+  
+    # Clip only the two retro gradients
+    clipped_grads = %{
+      rw: Nx.clip(raw_grads.rw, -1.0, 1.0),
+      rb: Nx.clip(raw_grads.rb, -1.0, 1.0)
+    }
+  
+    {total_loss, fwd_loss, retro_loss, clipped_grads}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase2Trainer, <<70, 79, 82, 49, 0, 0, 32, ...>>, true}
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Scans the directory for the latest checkpoint of a specific run prefix.
+  If no checkpoints exist, it triggers a completely fresh initialization.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("✨ Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("✨ No checkpoints found for '#{run_prefix}'. Starting FRESH from Genesis.")
+        {:fresh, 0}
+      end
+    else
+      # Extract step numbers using regex and find the maximum
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("🚀 Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.CheckpointManager, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:get_resume_state, 1}}
+```
+
+```elixir
+run_prefix  = "v38_probe_60k_graft"  
+total_steps = 10000 # Short diagnostic run!
+
+# 1. Load the frozen map (YOUR EXACT 60K SOTA FILE GOES HERE)
+sota_path = "v38_DLM_Phase_2_ce_sink_adam_xsa_3e4lr_50ncap_checkpoint_step_60000.bin"
+{a, bu, bv, _cu, _cv, du, dv, vw, vb} = File.read!(sota_path) |> :erlang.binary_to_term()
+cpu_frozen_map = %{a_gate: a, bu: bu, bv: bv, du: du, dv: dv, vw: vw, vb: vb}
+frozen_map = DLM.Tree.map(cpu_frozen_map, &Nx.backend_copy(&1, gpu))
+
+# 2. Load the Manifold
+%{params: phase1_p} = File.read!("phase1_sinkhorn_diffusion_25k_COMPLETE.bin") |> :erlang.binary_to_term()
+{cpu_embeds, _w1, _w2, _key} = phase1_p
+frozen_embeds = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+# 3. Initialize ONLY the Retro Matrices (Dense to 128D)
+initial_key = Nx.Random.key(System.system_time())
+{rw, k1} = Nx.Random.normal(initial_key, 0.0, 0.02, shape: {512, 128})
+rb = Nx.broadcast(0.0, {128}) |> Nx.as_type(:f32)
+cpu_retro_map = %{rw: rw, rb: rb}
+retro_map = DLM.Tree.map(cpu_retro_map, &Nx.backend_copy(&1, gpu))
+
+# Initialize Optimizer state for only 2 matrices
+zero_state = DLM.Tree.map(cpu_retro_map, fn p -> Nx.broadcast(0.0, Nx.shape(p)) end)
+m = DLM.Tree.map(zero_state, &Nx.backend_copy(&1, gpu))
+v = DLM.Tree.map(zero_state, &Nx.backend_copy(&1, gpu))
+step_count = Nx.tensor(0) |> Nx.backend_copy(gpu)
+
+# 4. Stream setup
+batch_size = 32
+seq_len = 128  
+dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+dataset = Nx.flatten(dataset_2d)
+data_stream = DLM.DataStreamer.build_infinite_stream(dataset, batch_size, seq_len)
+
+# ⚡ 5. The Diagnostic Loop
+{final_retro, _m, _v, _step} = 
+  Enum.reduce(Enum.zip(0..(total_steps - 1), data_stream), {retro_map, m, v, step_count}, fn {step, cpu_batch}, {cr, cm, cv, c_step} ->
+    
+    gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+    
+    # Run a flat, slightly higher learning rate so the probe can learn fast
+    current_lr = 1.0e-4
+    lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+    h_init = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.as_type(:f32) |> Nx.backend_copy(gpu)
+
+    # Only pass the retro_map to be optimized
+    {_tot_tensor, fwd_tensor, retro_tensor, grads} = DLM.Phase2Trainer.compute_grad(
+      frozen_map, cr, gpu_batch, h_init, frozen_embeds
+    )
+
+    {up_r, up_m, up_v, up_step} = DLM.ProbeOptimizer.update(cr, grads, cm, cv, c_step, lr_tensor)
+
+    # ➡️ Telemetry
+    if rem(step, 50) == 0 do
+      fwd_val = Nx.to_number(fwd_tensor)
+      retro_val = Nx.to_number(retro_tensor)
+      IO.puts("➡️  Step #{step} | FWD Loss: #{Float.round(fwd_val, 4)} | RETRO Loss: #{Float.round(retro_val, 4)}")
+    end
+
+    {up_r, up_m, up_v, up_step}
+  end)
+
+IO.puts("✅ Probe Training Complete!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+
+10:16:20.260 [info] XLA service 0x7a52340cf740 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+10:16:20.262 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+10:16:20.262 [info] Using BFC allocator.
+
+10:16:20.262 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+10:16:20.262 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+
+10:16:20.653 [info] Merging Dots in computation: region_0.11
+
+10:16:20.653 [info] Merging Dots in computation: region_12.34.clone.clone.clone
+```
+
+```elixir
+defmodule DLM.ISDGenerator do
+  import Nx.Defn
+
+  # ⚡ 1. The Hardware-Level Stochastic Sampler
+  defn sample_token(logits, key, temp, top_p) do
+    # 1. Apply Temperature Scaling
+    scaled_logits = Nx.divide(logits, Nx.max(temp, 1.0e-4))
+    
+    # 2. Convert to stable probabilities
+    max_l = Nx.reduce_max(scaled_logits, axes: [-1], keep_axes: true)
+    exp_l = Nx.exp(Nx.subtract(scaled_logits, max_l))
+    probs = Nx.divide(exp_l, Nx.sum(exp_l, axes: [-1], keep_axes: true))
+    
+    # 3. Apply Top-P (Nucleus) Masking
+    sorted_indices = Nx.argsort(probs, axis: -1, direction: :desc)
+    sorted_probs = Nx.take_along_axis(probs, sorted_indices, axis: -1)
+    cumsum = Nx.cumulative_sum(sorted_probs, axis: -1)
+    
+    # Keep tokens where the cumulative sum (excluding themselves) is < top_p
+    mask = Nx.less(Nx.subtract(cumsum, sorted_probs), top_p)
+    filtered_sorted_logits = Nx.select(mask, Nx.take_along_axis(scaled_logits, sorted_indices, axis: -1), -1.0e9)
+    
+    # Unsort back to original vocabulary order
+    unsort_indices = Nx.argsort(sorted_indices, axis: -1, direction: :asc)
+    final_logits = Nx.take_along_axis(filtered_sorted_logits, unsort_indices, axis: -1)
+
+    # 4. Gumbel-Softmax Sampling (Roll the dice)
+    {noise, new_key} = Nx.Random.uniform(key, shape: Nx.shape(final_logits), type: :f32)
+    gumbel = Nx.negate(Nx.log(Nx.negate(Nx.log(Nx.add(noise, 1.0e-7)))))
+    sampled_token = Nx.argmax(Nx.add(final_logits, gumbel), axis: -1)
+    
+    {sampled_token, new_key}
+  end
+
+  # ⚡ 2. The Core ISD Step
+  defn isd_step(x_t, h_prev, frozen, retro, key, temp, top_p) do
+    {logits_fwd, logits_retro, h_new} = DLM.TinySSM.forward_step(x_t, h_prev, frozen, retro)
+    
+    # 🎲 Proposer uses stochastic sampling
+    {proposed_next_token, new_key} = sample_token(logits_fwd, key, temp, top_p)
+    
+    # 🔒 Verifier MUST remain strict argmax
+    verified_prev_token = Nx.argmax(logits_retro, axis: -1)
+    
+    {proposed_next_token, verified_prev_token, h_new, new_key}
+  end
+
+  # ⚡ 3. The Multi-Step Stride
+  def stride(start_token, h_init, frozen_map, retro_map, frozen_embeds, key, temp, top_p, stride_length \\ 4) do
+    {final_props, final_verifs, final_states, _h, _tok, final_key} =
+      Enum.reduce(1..stride_length, {[], [], [], h_init, start_token, key}, fn _step, {props, verifs, states, h_curr, x_curr, k_curr} ->
+        
+        x_emb = Nx.take(frozen_embeds, Nx.tensor([x_curr]))
+        
+        {prop_tok, verif_tok, h_next, k_next} = isd_step(x_emb, h_curr, frozen_map, retro_map, k_curr, temp, top_p)
+        
+        p_val = Nx.to_number(prop_tok[0])
+        v_val = Nx.to_number(verif_tok[0])
+
+        {[p_val | props], [v_val | verifs], [h_next | states], h_next, p_val, k_next}
+      end)
+
+    {Enum.reverse(final_props), Enum.reverse(final_verifs), Enum.reverse(final_states), final_key}
+  end
+
+  # ⚡ 4. Acceptance Logic (Unchanged)
+  def accept_stride(base_sequence, proposals, verifications, states) do
+    actual_past = [List.last(base_sequence) | Enum.drop(proposals, -1)]
+    
+    accepted_count =
+      Enum.zip(verifications, actual_past)
+      |> Enum.take_while(fn {verif, actual} -> verif == actual end)
+      |> length()
+      |> max(1)
+
+    accepted_tokens = Enum.take(proposals, accepted_count)
+    accepted_state = Enum.at(states, accepted_count - 1)
+
+    {accepted_tokens, accepted_state}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.ISDGenerator, <<70, 79, 82, 49, 0, 0, 36, ...>>, {:accept_stride, 4}}
+```
+
+```elixir
+defmodule DLM.ProbeInference do
+  import Nx.Defn
+
+  defn prime_state(tokens_tensor, h_init, frozen_map, retro_map, frozen_embeds) do
+    {_, final_h, _, _, _, _} =
+      while {i = 0, h = h_init, tokens = tokens_tensor, f_map = frozen_map, r_map = retro_map, f_embeds = frozen_embeds},
+            Nx.less(i, Nx.axis_size(tokens, 0)) do
+        
+        x_emb = Nx.take(f_embeds, Nx.new_axis(tokens[i], 0))
+        # We can pass dummy temp/key here since we ignore the generated tokens during priming
+        dummy_key = Nx.Random.key(1)
+        {_, _, h_next, _} = DLM.ISDGenerator.isd_step(x_emb, h, f_map, r_map, dummy_key, 1.0, 1.0)
+        
+        {i + 1, h_next, tokens, f_map, r_map, f_embeds}
+      end
+    final_h
+  end
+
+  def generate(prompt_text, num_tokens, frozen_map, retro_map, frozen_embeds, temp \\ 0.8, top_p \\ 0.9) do
+    gpu = {EXLA.Backend, client: :rocm}
+
+    prompt_tokens = to_charlist(prompt_text)
+    prime_tokens = Enum.drop(prompt_tokens, -1)
+
+    IO.puts("🧠 Priming state with prompt: '#{prompt_text}'")
+    h_init = Nx.broadcast(0.0, {1, 512}) |> Nx.as_type(:f32) |> Nx.backend_copy(gpu)
+    
+    h_primed = 
+      if length(prime_tokens) > 0 do
+        prime_tensor = Nx.tensor(prime_tokens, type: :s32) |> Nx.backend_copy(gpu)
+        prime_state(prime_tensor, h_init, frozen_map, retro_map, frozen_embeds)
+      else
+        h_init
+      end
+
+    stride_length = 4
+    
+    # Initialize the PRNG Key and hyperparameter tensors
+    initial_key = Nx.Random.key(System.system_time(:second)) |> Nx.backend_copy(gpu)
+    t_tensor = Nx.tensor(temp, type: :f32) |> Nx.backend_copy(gpu)
+    p_tensor = Nx.tensor(top_p, type: :f32) |> Nx.backend_copy(gpu)
+
+    {final_sequence, _final_h, total_strides, _final_key} =
+      Enum.reduce_while(1..num_tokens, {prompt_tokens, h_primed, 0, initial_key}, fn _, {current_seq, h_curr, stride_count, k_curr} ->
+        
+        if length(current_seq) >= length(prompt_tokens) + num_tokens do
+          {:halt, {current_seq, h_curr, stride_count, k_curr}}
+        else
+          last_token = List.last(current_seq)
+
+          {proposals, verifs, states, k_next} = DLM.ISDGenerator.stride(
+            last_token, h_curr, frozen_map, retro_map, frozen_embeds, k_curr, t_tensor, p_tensor, stride_length
+          )
+
+          {accepted_tokens, next_h} = DLM.ISDGenerator.accept_stride(current_seq, proposals, verifs, states)
+
+          next_seq = current_seq ++ accepted_tokens
+
+          {:cont, {next_seq, next_h, stride_count + 1, k_next}}
+        end
+      end)
+
+    generated_text = to_string(final_sequence)
+    tokens_added = length(final_sequence) - length(prompt_tokens)
+    efficiency = Float.round(tokens_added / total_strides, 2)
+
+    IO.puts("\n✨ Generation Complete!")
+    IO.puts("📊 Speedup Factor: #{efficiency} tokens accepted per forward stride.")
+    IO.puts("\n🤖 Output:\n#{generated_text}")
+    
+    generated_text
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.ProbeInference, <<70, 79, 82, 49, 0, 0, 34, ...>>, {:generate, 7}}
+```
+
+```elixir
+# prompt = "Do state space models dream of recurssive sheep?"
+# tokens_to_generate = 100
+
+# DLM.ProbeInference.generate(
+#   prompt, 
+#   tokens_to_generate, 
+#   frozen_map, 
+#   retro_map, 
+#   frozen_embeds
+# )
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+nil
+```
+
+```elixir
+prompt = "Do state space models dream of recurssive sheep?"
+# temp = 0.85, top_p = 1.0 (disabled)
+DLM.ProbeInference.generate(prompt, 100, frozen_map, retro_final, frozen_embeds, 0.85, 1.0)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Priming state with prompt: 'Do state space models dream of recurssive sheep?'
+
+✨ Generation Complete!
+📊 Speedup Factor: 1.0 tokens accepted per forward stride.
+
+🤖 Output:
+Do state space models dream of recurssive sheep? cat catitont the tYad re  mo at ve  trl y fouwitay   whaaal. l melu beceimen ad ahas r Sis ofanng  
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+"Do state space models dream of recurssive sheep? cat catitont the tYad re  mo at ve  trl y fouwitay   whaaal. l melu beceimen ad ahas r Sis ofanng  "
+```
+
+```elixir
+prompt = "Do state space models dream of recurssive sheep?"
+# temp = 1.0, top_p = 0.9 (slices off the crazy hallucinatory tokens)
+DLM.ProbeInference.generate(prompt, 100, frozen_map, retro_final, frozen_embeds, 1.0, 0.9)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🧠 Priming state with prompt: 'Do state space models dream of recurssive sheep?'
+
+✨ Generation Complete!
+📊 Speedup Factor: 1.0 tokens accepted per forward stride.
+
+🤖 Output:
+Do state space models dream of recurssive sheep? she r sis  fiallllll pand d waroffofohheere n ss to oofre  pane goes ine f fashater sl on ahhad d t
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+"Do state space models dream of recurssive sheep? she r sis  fiallllll pand d waroffofohheere n ss to oofre  pane goes ine f fashater sl on ahhad d t"
+```
