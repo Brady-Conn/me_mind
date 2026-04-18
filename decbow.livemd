@@ -1,6 +1,6 @@
 <!-- livebook:{"persist_outputs":true} -->
 
-# Diffusion Encoder - sinkhorn
+# Diffusion Encoder - CBOW
 
 ```elixir
 System.put_env("XLA_BUILD", "true")
@@ -77,6 +77,85 @@ end
 ```
 
 ```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN for Rank 2 Tensors)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # pred and target are {batch_size, dim}
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    # 1. Batched Dot Product: {batch, dim} x {dim, batch} -> {batch, batch}
+    # This creates a similarity matrix comparing every pred to every target in the batch
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 2. Create Identity Targets -> {batch, batch}
+    batch_size = Nx.axis_size(pred, 0)
+    # ⚡ THE FIX: Pass a 2D tuple {32, 32} instead of a 1D tuple {32}
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    # 3. Manual Dense Log-Softmax
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))ozen_w2,
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 27, ...>>, true}
+```
+
+```elixir
 defmodule DLM.DataStreamer do
   def stream(path, seq_len, batch_size) do
     lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
@@ -129,147 +208,75 @@ end
 ```
 
 ```elixir
-defmodule DLM.SinkhornOT do
-  import Nx.Defn
-
-  defn cost_matrix(pred, target) do
-    p_exp = Nx.new_axis(pred, 1)
-    t_exp = Nx.new_axis(target, 0)
-    diff = Nx.subtract(p_exp, t_exp)
-    Nx.sum(Nx.pow(diff, 2), axes: [-1])
-  end
-
-  # ⚡ FIX 1: Bump the default epsilon up to 10.0 to handle your 512D spatial scale
-  defn compute(pred, target, epsilon \\ 10.0, max_iters \\ 30) do
-    # np = DLM.Loss.l2_normalize(pred)
-    # nt = DLM.Loss.l2_normalize(target)
-    c = cost_matrix(pred, target)
-    k = Nx.exp(Nx.divide(Nx.negate(c), epsilon))
-    
-    batch_size = Nx.axis_size(pred, 0)
-    mass = 1.0 / batch_size
-    mu = Nx.broadcast(mass, {batch_size})
-    nu = Nx.broadcast(mass, {batch_size})
-
-    {_final_k, u_final, v_final, _mu, _nu, _i} =
-      while {k_mat = k, 
-             u = Nx.broadcast(1.0, {batch_size}), 
-             _v = Nx.broadcast(1.0, {batch_size}), 
-             m = mu, n = nu, i = 0},
-            Nx.less(i, max_iters) do
-            
-        # ⚡ FIX 2: Add 1.0e-8 to the denominator to mathematically prevent NaN crashes
-        denom_v = Nx.add(Nx.dot(Nx.transpose(k_mat), u), 1.0e-8)
-        v_new = Nx.divide(n, denom_v)
-        
-        denom_u = Nx.add(Nx.dot(k_mat, v_new), 1.0e-8)
-        u_new = Nx.divide(m, denom_u)
-
-        {k_mat, u_new, v_new, m, n, i + 1}
-      end
-
-    u_exp = Nx.new_axis(u_final, 1)
-    v_exp = Nx.new_axis(v_final, 0)
-    p = Nx.multiply(Nx.multiply(u_exp, k), v_exp)
-
-    Nx.sum(Nx.multiply(p, c))
-  end
-end
-```
-
-<!-- livebook:{"output":true} -->
-
-```
-{:module, DLM.SinkhornOT, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
-```
-
-```elixir
 defmodule DLM.ContextualEmbedTrainer do
   import Nx.Defn
 
-  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
-  defn l2_normalize(tensor) do
-    # Calculate Euclidean norm across the last axis natively
-    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
-    # Divide by norm with a tiny epsilon to prevent divide-by-zero
-    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  @doc """
+  Replaces the similarity loss with a Predictive CBOW Masked Loss.
+  We take a sliding window of 5 characters, average the 4 outer characters,
+  and predict the 1 missing center character.
+  """
+  defn masked_prediction_loss(token_sequences, embeds) do
+    # token_sequences shape: {batch_size, 128}
+    seq_len = Nx.axis_size(token_sequences, 1)
+    vocab_size = Nx.axis_size(embeds, 0)
+    
+    # We lose 4 tokens at the edges per sequence due to the window size
+    valid_len = seq_len - 4
+
+    # ⚡ 1. O(1) Sliding Window Extraction (No loops!)
+    # We slice the tensor shifted by 1 each time to grab the context and target.
+    ctx1 = Nx.slice_along_axis(token_sequences, 0, valid_len, axis: 1)
+    ctx2 = Nx.slice_along_axis(token_sequences, 1, valid_len, axis: 1)
+    targets = Nx.slice_along_axis(token_sequences, 2, valid_len, axis: 1) # The center!
+    ctx3 = Nx.slice_along_axis(token_sequences, 3, valid_len, axis: 1)
+    ctx4 = Nx.slice_along_axis(token_sequences, 4, valid_len, axis: 1)
+
+    # ⚡ 2. Map tokens to their Embeddings
+    e1 = Nx.take(embeds, ctx1)
+    e2 = Nx.take(embeds, ctx2)
+    e3 = Nx.take(embeds, ctx3)
+    e4 = Nx.take(embeds, ctx4)
+
+    # ⚡ 3. Pool the Context (The Bottleneck)
+    # Average the 4 surrounding embeddings
+    context_sum = Nx.add(e1, e2) |> Nx.add(e3) |> Nx.add(e4)
+    context_emb = Nx.divide(context_sum, 4.0)
+
+    # ⚡ 4. Weight Tying Prediction
+    # We need to map the 512D context back to 128D vocabulary logits.
+    # Instead of creating new weights, we dot-product against the transposed embedding matrix itself!
+    # context_emb shape: {batch, valid_len, 512}
+    # embeds shape: {128, 512} -> Transpose -> {512, 128}
+    logits = Nx.dot(context_emb, [2], Nx.transpose(embeds), [0])
+
+    # ⚡ 5. Softmax Cross Entropy Loss
+    # Fast one-hot encoding using an Identity matrix
+    # eye = Nx.eye({vocab_size, vocab_size}, type: :f32)
+    # labels = Nx.take(eye, targets)
+    
+    Nx.mean(DLM.Loss.cross_entropy(logits, targets))
   end
 
-  # ⚡ 1. The Sinkhorn Loss Function
-  defn compute_loss(e, batch_tokens) do
-    # Extract inputs (t) and targets (t+1) from the sequence
-    seq_len = Nx.axis_size(batch_tokens, 1) - 1
-    inputs = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
-    targets = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
-
-    # Map integers to their current 512D coordinates
-    pred_coords = Nx.take(e, inputs)
-    target_coords = Nx.take(e, targets)
-
-    # Flatten the sequence and batch dimensions together into a single cloud of points
-    flat_preds = Nx.reshape(pred_coords, {:auto, 512})
-    flat_targets = Nx.reshape(target_coords, {:auto, 512})
-    
-    # Normalize to ensure everything remains perfectly on the surface of the void
-    p_norm = l2_normalize(flat_preds)
-    t_norm = l2_normalize(flat_targets)
-
-    # Execute Optimal Transport (epsilon = 0.1 to match your void's scale)
-    DLM.SinkhornOT.compute(p_norm, t_norm, 0.1)
-  end
-
-  # ⚡ 2. Newton-Schulz Iteration for Orthogonal Isometry
-  defn newton_schulz(g) do
-    norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2)))
-    x_init = Nx.divide(g, Nx.add(norm, 1.0e-8))
-
-    {x_final, _} =
-      while {x = x_init, i = 0}, Nx.less(i, 5) do
-        x_t = Nx.transpose(x)
-        x_t_x = Nx.dot(x_t, x)
-        term = Nx.dot(x, x_t_x)
-        
-        x_next = Nx.subtract(Nx.multiply(1.5, x), Nx.multiply(0.5, term))
-        {x_next, i + 1}
-      end
-      
-    x_final
-  end
-
-  # ⚡ 3. The Muon Update Step
-  defn muon_step(p, g, m, lr, max_norm \\ 20.0) do
-    beta1 = 0.95
-    new_m = beta1 * m + (1.0 - beta1) * g
-    ortho_update = newton_schulz(new_m)
-    
-    r = Nx.axis_size(p, 0)
-    c = Nx.axis_size(p, 1)
-    scale = Nx.divide(Nx.max(r, c), 5.0) |> Nx.as_type(:f32)
-    
-    p_new = p - lr * scale * ortho_update
-    
-    # Clamp norm to prevent runaway expansion
-    current_norm = Nx.sqrt(Nx.sum(Nx.pow(p_new, 2)))
-    p_clipped = Nx.select(
-      current_norm > max_norm,
-      p_new * (max_norm / (current_norm + 1.0e-8)),
-      p_new
-    )
-    
-    {p_clipped, new_m}
-  end
-
-  # ⚡ 4. The Unified Master Step
-  defn compute_grad_and_step(e, m, batch_tokens, _step_t, lr) do
-    # Calculate the global transport cost and the exact gradient to minimize it
-    {loss, grad_e} = value_and_grad(e, fn e_params -> 
-      compute_loss(e_params, batch_tokens) 
+  defn compute_grad_and_step(embeds, m_embeds, v_embeds, token_sequences, step, lr) do
+    {loss, grads} = value_and_grad(embeds, fn e ->
+      masked_prediction_loss(token_sequences, e)
     end)
-
-    # Pass the gradient through the Muon forge to strictly enforce orthogonality
-    {new_e, new_m} = muon_step(e, grad_e, m, lr)
-
-    {loss, new_e, new_m}
+  
+    # Standard Adam Optimizer logic for stable embedding updates
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+  
+    new_m = beta1 * m_embeds + (1.0 - beta1) * grads
+    new_v = beta2 * v_embeds + (1.0 - beta2) * Nx.pow(grads, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, step + 1))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, step + 1))
+    
+    new_embeds = embeds - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+  
+    {loss, new_embeds, new_m, new_v}
   end
 end
 ```
@@ -277,42 +284,51 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.ContextualEmbedTrainer, <<70, 79, 82, 49, 0, 0, 38, ...>>, true}
+warning: variable "vocab_size" is unused (if the variable is not meant to be used, prefix it with an underscore)
+└─ decbow.livemd#cell:ala3zrt6xmd3mxpy:12: DLM.ContextualEmbedTrainer.masked_prediction_loss/2
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.ContextualEmbedTrainer, <<70, 79, 82, 49, 0, 0, 24, ...>>, true}
 ```
 
 ```elixir
 batch_size = 32
-seq_len = 128
+seq_len = 256
 key = Nx.Random.key(42) |> Nx.backend_copy(gpu)
 
 embeds = Nx.Random.normal(key, 0.0, 0.1, shape: {128, 512}) |> elem(0) |> Nx.backend_copy(gpu)
 m_embeds = Nx.broadcast(0.0, {128, 512}) |> Nx.backend_copy(gpu)
-lr = Nx.tensor(3.0e-5, type: :f32) |> Nx.backend_copy(gpu)
+v_embeds = Nx.broadcast(0.0, {128, 512}) |> Nx.backend_copy(gpu)
+lr = Nx.tensor(3.0e-4, type: :f32) |> Nx.backend_copy(gpu)
 
 # Flatten the 2D dataset to 1D for the streamer
-full_dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+full_dataset_2d = File.read!("scholar_full_mixed_256.bin") |> :erlang.binary_to_term()
 dataset_1d = Nx.flatten(full_dataset_2d)
 data_stream = DLM.DataStreamer.build_infinite_stream(dataset_1d, batch_size, seq_len)
 
-total_steps = 13206
-IO.puts("🚀 IGNITION: Phase 1 Contextual Shape Training...")
+total_steps = 6000
+IO.puts("🚀 IGNITION: Phase 1 CBOW Training...")
 
-{final_embeds, _final_m} =
+{final_embeds, final_m, final_v} =
   Enum.reduce(
     Enum.zip(0..(total_steps - 1), data_stream),
-    {embeds, m_embeds},
-    fn {step, batch}, {e, m} ->
+    {embeds, m_embeds, v_embeds},
+    fn {step, batch}, {e, m, v} ->
       gpu_batch = Nx.backend_copy(batch, gpu) |> Nx.as_type(:s32)
       step_t = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
 
-      {loss, new_e, new_m} =
-        DLM.ContextualEmbedTrainer.compute_grad_and_step(e, m, gpu_batch, step_t, lr)
+      {loss, new_e, new_m, new_v} =
+        DLM.ContextualEmbedTrainer.compute_grad_and_step(e, m, v, gpu_batch, step_t, lr)
 
       if rem(step, 100) == 0 do
-        IO.puts("Step #{step} | Loss: #{Nx.to_number(loss)}")
+        IO.puts("Step #{step} | Loss: #{Float.round(Nx.to_number(loss), 4)}")
       end
 
-      {new_e, new_m}
+      {new_e, new_m, new_v}
     end
   )
 
@@ -320,37 +336,89 @@ IO.puts("🎉 PHASE 1 TRAINING COMPLETE!")
 
 # Save — embeddings only, matching the format your downstream code expects
 cpu_embeds = Nx.backend_copy(final_embeds, Nx.BinaryBackend)
+cpu_m = Nx.backend_copy(final_m, Nx.BinaryBackend)
+cpu_v = Nx.backend_copy(final_v, Nx.BinaryBackend)
 
 # ⚡ Match the tuple format your Phase 2 loader expects:
 # %{params: phase1_p} -> {cpu_embeds, _w1, _w2, _key}
 dummy = Nx.broadcast(0.0, {1}) |> Nx.backend_copy(Nx.BinaryBackend)
 File.write!(
-  "phase1_sink_diffusion_13k_COMPLETE.bin",
-  :erlang.term_to_binary(%{params: {cpu_embeds, dummy, dummy, dummy}})
+  "phase1_cbow_diffusion_256sq3e4_6k_COMPLETE.bin",
+  :erlang.term_to_binary(%{params: {cpu_embeds, cpu_m, cpu_v, dummy}})
 )
 ```
 
 <!-- livebook:{"output":true} -->
 
 ```
+🚀 IGNITION: Phase 1 CBOW Training...
+Step 0 | Loss: 4.8189
+Step 100 | Loss: 3.9256
+Step 200 | Loss: 3.4397
+Step 300 | Loss: 3.2949
+Step 400 | Loss: 3.1796
+Step 500 | Loss: 3.0843
+Step 600 | Loss: 3.0396
+Step 700 | Loss: 3.0707
+Step 800 | Loss: 3.058
+Step 900 | Loss: 3.0343
+Step 1000 | Loss: 3.0767
+Step 1100 | Loss: 2.9992
+Step 1200 | Loss: 3.0145
+Step 1300 | Loss: 3.0257
+Step 1400 | Loss: 3.0053
+Step 1500 | Loss: 2.9996
+Step 1600 | Loss: 3.0272
+Step 1700 | Loss: 3.0612
+Step 1800 | Loss: 3.0248
+Step 1900 | Loss: 3.0049
+Step 2000 | Loss: 3.0367
+Step 2100 | Loss: 2.9907
+Step 2200 | Loss: 2.969
+Step 2300 | Loss: 2.972
+Step 2400 | Loss: 2.9742
+Step 2500 | Loss: 2.9776
+Step 2600 | Loss: 3.0237
+Step 2700 | Loss: 2.9476
+Step 2800 | Loss: 2.9882
+Step 2900 | Loss: 3.0106
+Step 3000 | Loss: 2.9574
+Step 3100 | Loss: 2.9781
+Step 3200 | Loss: 2.9369
+Step 3300 | Loss: 3.0319
+Step 3400 | Loss: 3.0007
+Step 3500 | Loss: 2.9709
+Step 3600 | Loss: 2.9417
+Step 3700 | Loss: 2.9203
+Step 3800 | Loss: 2.9945
+Step 3900 | Loss: 2.9998
+Step 4000 | Loss: 2.9363
+Step 4100 | Loss: 3.0501
+Step 4200 | Loss: 2.9821
+Step 4300 | Loss: 2.9929
+Step 4400 | Loss: 2.9979
+Step 4500 | Loss: 2.94
+Step 4600 | Loss: 2.9772
+Step 4700 | Loss: 2.9704
+Step 4800 | Loss: 2.9495
+Step 4900 | Loss: 2.9593
+Step 5000 | Loss: 2.9614
+Step 5100 | Loss: 3.0125
+Step 5200 | Loss: 2.9523
+Step 5300 | Loss: 2.9443
+Step 5400 | Loss: 2.9334
+Step 5500 | Loss: 2.9727
+Step 5600 | Loss: 2.9106
+Step 5700 | Loss: 2.9754
+Step 5800 | Loss: 2.9697
+Step 5900 | Loss: 2.9946
+🎉 PHASE 1 TRAINING COMPLETE!
+```
 
-22:16:57.349 [info] XLA service 0x7619280b6080 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+<!-- livebook:{"output":true} -->
 
-22:16:57.351 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
-
-22:16:57.351 [info] Using BFC allocator.
-
-22:16:57.351 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
-
-22:16:57.351 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
-🚀 IGNITION: Phase 1 Contextual Shape Training...
-
-22:16:57.913 [info] Merging Dots in computation: region_17.18
-Step 0 | Loss: 4.953514007866033e-7
-Step 100 | Loss: 4.928349994770542e-7
-Step 200 | Loss: 1.0723611012508627e-5
-Step 300 | Loss: 1.3578316429629922e-4
-Step 400 | Loss: 1.2233336747158319e-5
+```
+:ok
 ```
 
 ```elixir
@@ -417,23 +485,6 @@ Vl.new(width: 800, height: 600, title: "Diffusion-Molded 512D Latent Manifold")
 |> Kino.VegaLite.new()
 ```
 
-<!-- livebook:{"output":true} -->
-
-```
-
-17:29:25.396 [info] Merging Dots in computation: region_7.7
-
-17:29:25.396 [info] Merging Dots in computation: region_16.14
-
-17:29:25.396 [info] Merging Dots in computation: region_54.58
-
-17:29:25.396 [info] Merging Dots in computation: region_6.61
-```
-
-<!-- livebook:{"branch_parent_index":0} -->
-
-## Probe
-
 ```elixir
 defmodule DLM.LatentRadar do
   import Nx.Defn
@@ -456,10 +507,10 @@ end
 gpu = {EXLA.Backend, client: :rocm}
 
 # 1. Load the frozen dictionary directly
-%{params: {cpu_embeds, _, _, _}} = File.read!("phase1_msenorm_diffusion_25k_COMPLETE.bin") |> :erlang.binary_to_term()
+%{params: {cpu_embeds, _, _, _}} = File.read!("phase1_cbow_diffusion_256sq3e4_6k_COMPLETE.bin") |> :erlang.binary_to_term()
 
 # 2. L2 Normalize it (This is exactly how Phase 2 sees the targets)
-frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.ContextualEmbedTrainer.l2_normalize()
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
 
 vocab_size = Nx.axis_size(frozen_map, 0)
 
@@ -496,12 +547,12 @@ IO.puts "Closest neighbor is ASCII #{closest_idx} (Squared Dist: #{Float.round(c
 ```
 🌌 512D Latent Void Geometry (Squared Euclidean) 🌌
 ==================================================
-Absolute Closest Neighbors: 0.0
-Furthest Two Characters:    2.2859
-Average Distance:           0.9115
+Absolute Closest Neighbors: 0.0263
+Furthest Two Characters:    3.369
+Average Distance:           1.8248
 
 🔍 Probe: The Letter 'e' (ASCII 101)
-Closest neighbor is ASCII 52 (Squared Dist: 0.0)
+Closest neighbor is ASCII 114 (Squared Dist: 0.0528)
 ```
 
 <!-- livebook:{"output":true} -->

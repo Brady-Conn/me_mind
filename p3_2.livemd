@@ -1,0 +1,1358 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# HSSMP3.2
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 16, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Main SSM
+
+```elixir
+defmodule DLM.Main_SSM do
+  import Nx.Defn
+
+  defn swish(x) do
+    x * Nx.sigmoid(x)
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn softplus(x) do
+    # ⚡ UNBREAKABLE SOFTPLUS: Guaranteed stable in forward AND backward passes
+    Nx.max(x, 0.0) + Nx.log1p(Nx.exp(-Nx.abs(x)))
+  end
+
+  defn apply_svd_weight(x, u, v) do
+    x |> Nx.dot(u) |> softplus() |> Nx.dot(v)
+  end
+
+  # ⚡ The core physics step (Used heavily by the new Master Loop)
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, vw, vb) do
+    # 1. Local Mixers
+    mix1 = apply_svd_weight(x_p2, mu1, mv1)
+    mix2 = apply_svd_weight(x_p1, mu2, mv2)
+    x_mixed = Nx.add(x_t, Nx.add(mix1, mix2))
+    
+    # 2. Input Force
+    b_proj = apply_svd_weight(x_mixed, bu, bv)
+
+    # ⚡ The Bounded Syntax Valve
+    valve_logit = Nx.add(Nx.dot(x_mixed, vw), vb)
+    shifted_valve = Nx.subtract(valve_logit, 3.0)
+    
+    # Cap the maximum time-step at 1.0 to prevent memory erasure
+    delta = Nx.clip(softplus(shifted_valve), 0.01, 1.0)
+    
+    # 3. Friction
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    b_bar = Nx.multiply(delta, b_proj)
+    
+    # ⚡ 4. XSA Geometric Adaptation
+    h_norm_sq = Nx.add(Nx.sum(Nx.pow(h_prev, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    h_unit = Nx.divide(h_prev, Nx.sqrt(h_norm_sq))
+    
+    overlap = Nx.sum(Nx.multiply(b_bar, h_unit), axes: [-1], keep_axes: true)
+    b_exclusive = Nx.subtract(b_bar, Nx.multiply(overlap, h_unit))
+    
+    # Strictly Orthogonal State Update
+    h_new = Nx.add(Nx.multiply(a_bar, h_prev), b_exclusive)
+    
+    # 5. Output Velocity (Fixed Double-Projection)
+    out_proj = apply_svd_weight(h_new, cu, cv)
+    
+    # 6. Skip Connection
+    skip = apply_svd_weight(x_t, du, dv)
+    
+    y_t = Nx.add(out_proj, skip)
+    
+    {y_t, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM, <<70, 79, 82, 49, 0, 0, 33, ...>>, true}
+```
+
+```elixir
+defmodule DLM.MuonHybrid do
+  import Nx.Defn
+
+  defn newton_schulz(g, iters \\ 5) do
+    frobenius_norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2))) + 1.0e-7
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, iters) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn clip_norm(param, max_norm) do
+    norm = Nx.sqrt(Nx.sum(Nx.pow(param, 2))) + 1.0e-7
+    scale = Nx.min(1.0, max_norm / norm)
+    Nx.multiply(param, scale)
+  end
+
+  defn muon_update(param, grad, m, lr) do
+    beta1 = 0.9
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    step = newton_schulz(new_m)
+    param_update = param - lr * step
+    
+    {param_update, new_m}
+  end
+
+  defn adam_update(param, grad, m, v, step, lr) do
+    safe_step = step + 1.0
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+    
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+    
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+    
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  defn step(params, grads, ms, vs, step_count, lr) do
+    # norm_cap = Nx.tensor(35.0, type: :f32)
+
+    # ⚡ Unpack 15 elements
+    {p_a, p_bu, p_bv, p_cu, p_cv, p_du, p_dv, p_mu1, p_mv1, p_mu2, p_mv2, 
+     p_valve_w, p_valve_b, p_out_w, p_out_b} = params
+  
+    {g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv, g_mu1, g_mv1, g_mu2, g_mv2, 
+     g_valve_w, g_valve_b, g_out_w, g_out_b} = grads
+  
+    {m_a, m_bu, m_bv, m_cu, m_cv, m_du, m_dv, m_mu1, m_mv1, m_mu2, m_mv2, 
+     m_valve_w, m_valve_b, m_out_w, m_out_b} = ms
+  
+    {v_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv, v_mu1, v_mv1, v_mu2, v_mv2, 
+     v_valve_w, v_valve_b, v_out_w, v_out_b} = vs
+  
+    # ⚡ Adam for Scalars/Biases
+    {up_a, nm_a, nv_a} = adam_update(p_a, g_a, m_a, v_a, step_count, lr)
+    {up_valve_b, nm_valve_b, nv_valve_b} = adam_update(p_valve_b, g_valve_b, m_valve_b, v_valve_b, step_count, lr)
+    {up_out_b, nm_out_b, nv_out_b} = adam_update(p_out_b, g_out_b, m_out_b, v_out_b, step_count, lr)
+    
+    # ⚡ Repaired Muon for 2D Matrices
+    {up_bu, nm_bu} = muon_update(p_bu, g_bu, m_bu, lr)
+    {up_bv, nm_bv} = muon_update(p_bv, g_bv, m_bv, lr)
+    {up_cu, nm_cu} = muon_update(p_cu, g_cu, m_cu, lr)
+    {up_cv, nm_cv} = muon_update(p_cv, g_cv, m_cv, lr)
+    {up_du, nm_du} = muon_update(p_du, g_du, m_du, lr)
+    {up_dv, nm_dv} = muon_update(p_dv, g_dv, m_dv, lr)
+    {up_mu1, nm_mu1} = muon_update(p_mu1, g_mu1, m_mu1, lr)
+    {up_mv1, nm_mv1} = muon_update(p_mv1, g_mv1, m_mv1, lr)
+    {up_mu2, nm_mu2} = muon_update(p_mu2, g_mu2, m_mu2, lr)
+    {up_mv2, nm_mv2} = muon_update(p_mv2, g_mv2, m_mv2, lr)
+    {up_valve_w, nm_valve_w} = muon_update(p_valve_w, g_valve_w, m_valve_w, lr)
+    {up_out_w, nm_out_w} = muon_update(p_out_w, g_out_w, m_out_w, lr)
+  
+    # Repack
+    new_params = {up_a, up_bu, up_bv, up_cu, up_cv, up_du, up_dv, up_mu1, up_mv1, up_mu2, up_mv2, 
+                  up_valve_w, up_valve_b, up_out_w, up_out_b}
+  
+    new_ms = {nm_a, nm_bu, nm_bv, nm_cu, nm_cv, nm_du, nm_dv, nm_mu1, nm_mv1, nm_mu2, nm_mv2, 
+              nm_valve_w, nm_valve_b, nm_out_w, nm_out_b}
+  
+    new_vs = {nv_a, v_bu, v_bv, v_cu, v_cv, v_du, v_dv, v_mu1, v_mv1, v_mu2, v_mv2, 
+              v_valve_w, nv_valve_b, v_out_w, nv_out_b}
+  
+    {new_params, new_ms, new_vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.MuonHybrid, <<70, 79, 82, 49, 0, 0, 47, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Main_SSM_Genesis do
+  @dim 512
+  @rank 256
+
+  def init_params(seed \\ 42) do
+    key = Nx.Random.key(seed)
+    
+    {a_diag, key} = Nx.Random.normal(key, -0.1, 0.01, shape: {@dim})
+    
+    {b_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {b_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {c_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {c_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {d_u,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {d_v,    key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v1,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    {mx_u2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @rank})
+    {mx_v2,  key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@rank, @dim})
+    
+
+    # 3. ⚡ The Syntax Valve (Swish Gate)
+    {valve_w, key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @dim})
+    valve_b = Nx.broadcast(0.0, {@dim})
+
+    # 4. ⚡ Latent Output Projection
+    {out_w, _key} = Nx.Random.normal(key, 0.0, 0.02, shape: {@dim, @dim})
+    out_b = Nx.broadcast(0.0, {@dim})
+
+    # 19 Parameters Total
+    {a_diag, b_u, b_v, c_u, c_v, d_u, d_v, mx_u1, mx_v1, mx_u2, mx_v2, valve_w, valve_b, out_w, out_b}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = DLM.Tree.map(params, zero_like)
+    vs = DLM.Tree.map(params, zero_like)
+    {ms, vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM_Genesis, <<70, 79, 82, 49, 0, 0, 16, ...>>, {:init_optimizer, 1}}
+```
+
+```elixir
+defmodule DLM.TinySSM do
+  import Nx.Defn
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    activated = Nx.tanh(hidden) # ⚡ Let tanh handle the bounding
+    Nx.dot(activated, v)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn forward_step(x_t, h_prev, params) do
+    # ⚡ Unpack all 11 params
+    {a, bu, bv, cu, cv, du, dv, vw, vb, rb, rw} = params
+
+    b_proj = apply_svd(x_t, bu, bv)
+    
+    # 1. The Dynamic Gate
+    gate_proj = apply_svd(x_t, du, dv)
+    shifted_gate = Nx.subtract(gate_proj, 3.0)
+    delta = Nx.max(softplus(shifted_gate), 0.01)
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    
+    # 2. XSA Geometric Adaptation
+    h_norm_sq = Nx.add(Nx.sum(Nx.pow(h_prev, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    h_unit = Nx.divide(h_prev, Nx.sqrt(h_norm_sq))
+    overlap = Nx.sum(Nx.multiply(b_proj, h_unit), axes: [-1], keep_axes: true)
+    b_exclusive = Nx.subtract(b_proj, Nx.multiply(overlap, h_unit))
+    
+    # 3. Strictly Orthogonal State Update
+    h_new = Nx.add(Nx.multiply(a_bar, h_prev), b_exclusive)
+
+    # ⚡ 4. The SVD Bottleneck
+    # We pass the state through the SVD layers to "clean" the signal
+    h_latent = apply_svd(h_new, cu, cv)
+
+    # ⚡ 5. Dual Probes (Decoding the Latent signal)
+    logits_fwd = Nx.add(Nx.dot(h_latent, vw), vb)
+    logits_retro = Nx.add(Nx.dot(h_latent, rw), rb)
+
+    {logits_fwd, logits_retro, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 30, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## BLiMP
+
+```elixir
+defmodule DLM.Phase3_Eval do
+  import Nx.Defn
+
+  defn compute_sentence_loss(input_tokens, target_tokens, h_base_init, h_top_init, frozen_base_p, top_p, frozen_map) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+    
+    # 1. Map inputs to continuous space
+    input_coords =
+      Nx.take(frozen_map, Nx.flatten(input_tokens))
+      |> Nx.reshape({1, seq_len, 512})
+      |> stop_grad()
+
+    in_t = Nx.transpose(input_coords, axes: [1, 0, 2])
+    
+    # ⚡ Keep targets as discrete raw integers for Cross-Entropy
+    targ_t = Nx.transpose(target_tokens, axes: [1, 0])
+
+    zero_frame = Nx.broadcast(0.0, Nx.shape(h_top_init))
+
+    # 2. The Physics Loop (Continuous Deep Stack)
+    result =
+      while {i = 0, total_loss = Nx.tensor(0.0, type: :f32),
+             h_base = h_base_init, h_top = h_top_init,
+             xp1 = zero_frame, xp2 = zero_frame,
+             x_in = in_t, y_targ = targ_t,
+             b_p = frozen_base_p, t_p = top_p, f_map = frozen_map},
+            Nx.less(i, seq_len) do
+
+        x_curr = x_in[i]
+
+        # Unpack Top Brain
+        {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, valve_w, valve_b, out_w, out_b} = t_p
+        
+        # ⚡ Unpack Frozen Base (The Borrowed Hands)
+        {_b_a, _b_bu, _b_bv, b_cu, b_cv, _b_du, _b_dv, b_vw, b_vb, _b_rb, _b_rw} = b_p
+
+        # --- LAYER 1: Frozen Base ---
+        {_logits_fwd, _logits_retro, h_base_new} = DLM.TinySSM.forward_step(x_curr, h_base, b_p)
+
+        # --- LAYER 2: Main SSM (Tick 1 Only for Evaluation) ---
+        {_y_top1, h_top_1} = DLM.Main_SSM.ssm_recurrence(
+          h_base_new, xp1, xp2, h_top, 
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, valve_w, valve_b
+        )
+
+        h_top_new = h_top_1
+
+        # ⚡ 1. Phase 3 Predicts the 512D Latent Thought
+        pred_t1 = Nx.dot(h_top_new, out_w) |> Nx.add(out_b) 
+        
+        # ⚡ 2. Borrow Phase 2's Hands to Translate Thought -> Vocab Logits
+        h_latent_pred = DLM.TinySSM.apply_svd(pred_t1, b_cu, b_cv)
+        logits_t1 = Nx.add(Nx.dot(h_latent_pred, b_vw), b_vb) |> Nx.reshape({1, 128})
+
+        # ⚡ 3. Calculate Cross-Entropy Loss against the true character
+        step_loss = DLM.Loss.cross_entropy(logits_t1, y_targ[i])
+
+        # ⚡ Shift Convolutional History
+        {i + 1, Nx.add(total_loss, step_loss), h_base_new, h_top_new, h_base_new, xp1, x_in, y_targ, b_p, t_p, f_map}
+      end
+
+    Nx.divide(elem(result, 1), seq_len)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase3_Eval, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+
+# ==============================================================================
+# 1. LOAD MODELS (Continuous Deep Stack)
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1 Frozen Manifold...")
+%{params: {cpu_embeds, _, _, _}} = File.read!("phase1_sinkhorn_diffusion_25k_COMPLETE.bin") |> :erlang.binary_to_term()
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+IO.puts("⚙️ Loading Frozen Phase 2.1 Base SSM...")
+# Point this to your best Phase 2.1 checkpoint (e.g., the 71k file)
+base_checkpoint_path = "v38_DLM_Phase_2_1_sh_muon_fix_3e4_50n_checkpoint_step_41000.bin" 
+base_p_raw = File.read!(base_checkpoint_path) |> :erlang.binary_to_term()
+b_p = DLM.Tree.map(base_p_raw, &Nx.backend_copy(&1, gpu))
+
+IO.puts("🚀 Loading Phase 3.1 Top SSM...")
+top_checkpoint_path = "v38_DLM_Phase_3_latent_mse_genesis_checkpoint_step_14000.bin"
+
+# ⚡ Extract ONLY the :params tuple from the saved training map
+%{params: top_p_raw} = File.read!(top_checkpoint_path) |> :erlang.binary_to_term()
+
+t_p = DLM.Tree.map(top_p_raw, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# PRE-WARM: compile the JIT kernel once
+# ==============================================================================
+IO.puts("🔥 Pre-warming JIT compiler...")
+warmup_tokens = Nx.tensor([[72, 101, 108, 108, 111]], type: :s32) |> Nx.backend_copy(gpu)
+warmup_input  = Nx.slice_along_axis(warmup_tokens, 0, 4, axis: 1)
+warmup_target = Nx.slice_along_axis(warmup_tokens, 1, 4, axis: 1)
+
+# Phase 3 requires dual hidden states
+h_base_init_warm = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+h_top_init_warm  = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+
+DLM.Phase3_Eval.compute_sentence_loss(
+  warmup_input, warmup_target, 
+  h_base_init_warm, h_top_init_warm, 
+  b_p, t_p, frozen_map
+)
+IO.puts("✅ JIT warm, starting batch...\n")
+
+# ==============================================================================
+# 2. EVAL FUNCTION
+# ==============================================================================
+run_blimp = fn path ->
+  pairs =
+    File.read!(path)
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
+
+  total_pairs = length(pairs)
+
+  {passes, total_loss_diff} =
+    Enum.reduce(pairs, {0, 0.0}, fn pair, {pass_count, diff_acc} ->
+      good_sentence = pair["sentence_good"]
+      bad_sentence  = pair["sentence_bad"]
+  
+      good_val_tokens = good_sentence |> to_charlist() |> Nx.tensor(type: :s32)
+      bad_val_tokens  = bad_sentence  |> to_charlist() |> Nx.tensor(type: :s32)
+  
+      good_seq_len = Nx.size(good_val_tokens) - 1
+      bad_seq_len  = Nx.size(bad_val_tokens)  - 1
+  
+      good_input  = Nx.slice_along_axis(good_val_tokens, 0, good_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      good_target = Nx.slice_along_axis(good_val_tokens, 1, good_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      bad_input   = Nx.slice_along_axis(bad_val_tokens,  0, bad_seq_len,  axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      bad_target  = Nx.slice_along_axis(bad_val_tokens,  1, bad_seq_len,  axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+  
+      # Dual states for the Deep Stack
+      h_base_init = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+      h_top_init  = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+  
+      # ⚡ Execute using Phase 3 Eval
+      good_loss = DLM.Phase3_Eval.compute_sentence_loss(good_input, good_target, h_base_init, h_top_init, b_p, t_p, frozen_map) |> Nx.to_number()
+      bad_loss  = DLM.Phase3_Eval.compute_sentence_loss(bad_input,  bad_target,  h_base_init, h_top_init, b_p, t_p, frozen_map) |> Nx.to_number()
+  
+      # Explicit cleanup
+      :erlang.garbage_collect(self())
+  
+      new_pass_count = if good_loss < bad_loss, do: pass_count + 1, else: pass_count
+      {new_pass_count, diff_acc + (bad_loss - good_loss)}
+    end)
+
+  accuracy   = (passes / total_pairs) * 100.0
+  avg_margin = total_loss_diff / total_pairs
+  name       = Path.basename(path, ".jsonl")
+
+  {name, accuracy, avg_margin, passes, total_pairs}
+end
+
+# ==============================================================================
+# 3. BATCH RUN
+# ==============================================================================
+dataset_files = Path.wildcard("./data/*.jsonl") |> Enum.sort()
+total_files   = length(dataset_files)
+
+IO.puts("🚀 Running BLiMP batch eval across #{total_files} datasets...\n")
+
+results =
+  dataset_files
+  |> Enum.with_index(1)
+  |> Enum.map(fn {path, idx} ->
+    IO.puts("  [#{idx}/#{total_files}] #{Path.basename(path)}...")
+    result = run_blimp.(path)
+    :erlang.garbage_collect(self())
+    result
+  end)
+
+# ==============================================================================
+# 4. SORTED SUMMARY
+# ==============================================================================
+sorted = Enum.sort_by(results, fn {_, acc, _, _, _} -> acc end, :desc)
+
+IO.puts("\n")
+IO.puts(String.duplicate("=", 70))
+IO.puts("🏆 BLIMP BATCH RESULTS — sorted by accuracy")
+IO.puts(String.duplicate("=", 70))
+IO.puts(String.pad_trailing("Dataset", 48) <> "Accuracy   Margin")
+IO.puts(String.duplicate("-", 70))
+
+Enum.each(sorted, fn {name, acc, margin, passes, total} ->
+  flag = cond do
+    acc >= 60.0 -> "✅"
+    acc <= 40.0 -> "❌"
+    true        -> "〰️"
+  end
+  IO.puts("#{flag} #{String.pad_trailing(name, 46)} #{String.pad_leading("#{Float.round(acc, 1)}%", 7)} (#{passes}/#{total})   #{Float.round(margin, 4)}")
+end)
+
+IO.puts(String.duplicate("-", 70))
+
+# Overall average
+avg_acc = results |> Enum.map(fn {_, acc, _, _, _} -> acc end) |> Enum.sum() |> Kernel./(total_files)
+IO.puts("📊 Overall average accuracy: #{Float.round(avg_acc, 2)}%")
+IO.puts(String.duplicate("=", 70))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Phase 1 Frozen Manifold...
+
+20:35:17.951 [info] XLA service 0x7533a000cac0 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+20:35:17.952 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+20:35:17.952 [info] Using BFC allocator.
+
+20:35:17.952 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+20:35:17.952 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+⚙️ Loading Frozen Phase 2.1 Base SSM...
+🚀 Loading Phase 3.1 Top SSM...
+🔥 Pre-warming JIT compiler...
+✅ JIT warm, starting batch...
+
+🚀 Running BLiMP batch eval across 67 datasets...
+
+  [1/67] adjunct_island.jsonl...
+  [2/67] anaphor_gender_agreement.jsonl...
+  [3/67] anaphor_number_agreement.jsonl...
+  [4/67] animate_subject_passive.jsonl...
+  [5/67] animate_subject_trans.jsonl...
+  [6/67] causative.jsonl...
+  [7/67] complex_NP_island.jsonl...
+  [8/67] coordinate_structure_constraint_complex_left_branch.jsonl...
+  [9/67] coordinate_structure_constraint_object_extraction.jsonl...
+  [10/67] determiner_noun_agreement_1.jsonl...
+  [11/67] determiner_noun_agreement_2.jsonl...
+  [12/67] determiner_noun_agreement_irregular_1.jsonl...
+  [13/67] determiner_noun_agreement_irregular_2.jsonl...
+  [14/67] determiner_noun_agreement_with_adj_2.jsonl...
+  [15/67] determiner_noun_agreement_with_adj_irregular_1.jsonl...
+  [16/67] determiner_noun_agreement_with_adj_irregular_2.jsonl...
+  [17/67] determiner_noun_agreement_with_adjective_1.jsonl...
+  [18/67] distractor_agreement_relational_noun.jsonl...
+  [19/67] distractor_agreement_relative_clause.jsonl...
+  [20/67] drop_argument.jsonl...
+  [21/67] ellipsis_n_bar_1.jsonl...
+  [22/67] ellipsis_n_bar_2.jsonl...
+  [23/67] existential_there_object_raising.jsonl...
+  [24/67] existential_there_quantifiers_1.jsonl...
+  [25/67] existential_there_quantifiers_2.jsonl...
+  [26/67] existential_there_subject_raising.jsonl...
+  [27/67] expletive_it_object_raising.jsonl...
+  [28/67] inchoative.jsonl...
+  [29/67] intransitive.jsonl...
+  [30/67] irregular_past_participle_adjectives.jsonl...
+  [31/67] irregular_past_participle_verbs.jsonl...
+  [32/67] irregular_plural_subject_verb_agreement_1.jsonl...
+  [33/67] irregular_plural_subject_verb_agreement_2.jsonl...
+  [34/67] left_branch_island_echo_question.jsonl...
+  [35/67] left_branch_island_simple_question.jsonl...
+  [36/67] matrix_question_npi_licensor_present.jsonl...
+  [37/67] npi_present_1.jsonl...
+  [38/67] npi_present_2.jsonl...
+  [39/67] only_npi_licensor_present.jsonl...
+  [40/67] only_npi_scope.jsonl...
+  [41/67] passive_1.jsonl...
+  [42/67] passive_2.jsonl...
+  [43/67] principle_A_c_command.jsonl...
+  [44/67] principle_A_case_1.jsonl...
+  [45/67] principle_A_case_2.jsonl...
+  [46/67] principle_A_domain_1.jsonl...
+  [47/67] principle_A_domain_2.jsonl...
+  [48/67] principle_A_domain_3.jsonl...
+  [49/67] principle_A_reconstruction.jsonl...
+  [50/67] regular_plural_subject_verb_agreement_1.jsonl...
+  [51/67] regular_plural_subject_verb_agreement_2.jsonl...
+  [52/67] sentential_negation_npi_licensor_present.jsonl...
+  [53/67] sentential_negation_npi_scope.jsonl...
+  [54/67] sentential_subject_island.jsonl...
+  [55/67] superlative_quantifiers_1.jsonl...
+  [56/67] superlative_quantifiers_2.jsonl...
+  [57/67] tough_vs_raising_1.jsonl...
+  [58/67] tough_vs_raising_2.jsonl...
+  [59/67] transitive.jsonl...
+  [60/67] wh_island.jsonl...
+  [61/67] wh_questions_object_gap.jsonl...
+  [62/67] wh_questions_subject_gap.jsonl...
+  [63/67] wh_questions_subject_gap_long_distance.jsonl...
+  [64/67] wh_vs_that_no_gap.jsonl...
+  [65/67] wh_vs_that_no_gap_long_distance.jsonl...
+  [66/67] wh_vs_that_with_gap.jsonl...
+  [67/67] wh_vs_that_with_gap_long_distance.jsonl...
+
+
+======================================================================
+🏆 BLIMP BATCH RESULTS — sorted by accuracy
+======================================================================
+Dataset                                         Accuracy   Margin
+----------------------------------------------------------------------
+✅ wh_island                                       100.0% (1000/1000)   0.0746
+✅ only_npi_licensor_present                        98.3% (983/1000)   0.0052
+✅ wh_questions_subject_gap_long_distance           89.5% (895/1000)   0.0115
+✅ wh_questions_object_gap                          80.2% (802/1000)   0.0156
+✅ tough_vs_raising_2                               79.9% (799/1000)   0.0547
+✅ left_branch_island_echo_question                 71.7% (717/1000)   0.0664
+✅ irregular_past_participle_verbs                  69.3% (693/1000)   0.0332
+✅ existential_there_subject_raising                67.6% (676/1000)   0.0314
+✅ wh_questions_subject_gap                         67.5% (675/1000)   0.0073
+✅ anaphor_gender_agreement                         65.9% (659/1000)   0.0296
+✅ existential_there_quantifiers_1                  64.4% (644/1000)   0.0141
+✅ coordinate_structure_constraint_object_extraction   64.1% (641/1000)   0.0271
+〰️ ellipsis_n_bar_2                                 59.8% (598/1000)   0.0092
+〰️ sentential_negation_npi_licensor_present         57.7% (577/1000)   0.0052
+〰️ principle_A_case_1                               57.2% (572/1000)   0.0143
+〰️ ellipsis_n_bar_1                                 55.8% (558/1000)   0.0006
+〰️ wh_vs_that_no_gap_long_distance                  55.0% (550/1000)   0.0055
+〰️ irregular_plural_subject_verb_agreement_2        54.6% (546/1000)   0.0096
+〰️ wh_vs_that_no_gap                                54.0% (540/1000)   0.0076
+〰️ transitive                                       53.8% (538/1000)   0.0073
+〰️ animate_subject_trans                            53.7% (537/1000)   0.0113
+〰️ sentential_negation_npi_scope                    53.2% (532/1000)   0.0001
+〰️ animate_subject_passive                          52.9% (529/1000)   0.0077
+〰️ determiner_noun_agreement_with_adj_2             52.7% (527/1000)   0.0034
+〰️ adjunct_island                                   52.1% (521/1000)   0.0006
+〰️ distractor_agreement_relational_noun             51.4% (514/1000)   0.0034
+〰️ determiner_noun_agreement_with_adjective_1       51.2% (512/1000)   -0.0005
+〰️ regular_plural_subject_verb_agreement_2          51.2% (512/1000)   0.0038
+〰️ anaphor_number_agreement                         51.1% (511/1000)   0.0077
+〰️ determiner_noun_agreement_2                      51.0% (510/1000)   -0.0019
+〰️ principle_A_domain_3                             50.8% (508/1000)   0.0005
+〰️ determiner_noun_agreement_1                      50.6% (506/1000)   -0.0018
+〰️ wh_vs_that_with_gap                              49.5% (495/1000)   -0.0082
+〰️ passive_2                                        49.4% (494/1000)   -0.0027
+〰️ coordinate_structure_constraint_complex_left_branch   49.0% (490/1000)   -0.0003
+〰️ determiner_noun_agreement_irregular_1            49.0% (490/1000)   -0.0008
+〰️ principle_A_domain_1                             48.2% (482/1000)   -0.0003
+〰️ existential_there_object_raising                 47.8% (478/1000)   -0.0068
+〰️ passive_1                                        47.5% (475/1000)   -0.0044
+〰️ determiner_noun_agreement_irregular_2            46.9% (469/1000)   -0.0078
+〰️ regular_plural_subject_verb_agreement_1          46.7% (467/1000)   -0.0244
+〰️ expletive_it_object_raising                      46.5% (465/1000)   -0.0067
+〰️ wh_vs_that_with_gap_long_distance                46.5% (465/1000)   -0.0066
+〰️ determiner_noun_agreement_with_adj_irregular_2   46.3% (463/1000)   -0.0082
+〰️ distractor_agreement_relative_clause             46.1% (461/1000)   -0.0012
+〰️ left_branch_island_simple_question               45.7% (457/1000)   -0.0014
+〰️ irregular_plural_subject_verb_agreement_1        45.5% (455/1000)   -0.0041
+〰️ principle_A_c_command                            44.4% (444/1000)   -0.0062
+〰️ causative                                        44.3% (443/1000)   -0.0107
+〰️ principle_A_domain_2                             43.9% (439/1000)   -0.0082
+〰️ inchoative                                       43.7% (437/1000)   -0.0336
+〰️ determiner_noun_agreement_with_adj_irregular_1   43.5% (435/1000)   -0.0064
+〰️ sentential_subject_island                        42.5% (425/1000)   -0.0014
+〰️ complex_NP_island                                41.2% (412/1000)   -0.0026
+〰️ principle_A_reconstruction                       41.2% (412/1000)   -0.0031
+❌ drop_argument                                    31.9% (319/1000)   -0.0683
+❌ npi_present_1                                    30.2% (302/1000)   -0.0215
+❌ superlative_quantifiers_1                        28.1% (281/1000)   -0.0079
+❌ intransitive                                     26.0% (260/1000)   -0.0989
+❌ tough_vs_raising_1                               22.9% (229/1000)   -0.0651
+❌ npi_present_2                                    22.6% (226/1000)   -0.0366
+❌ matrix_question_npi_licensor_present             18.7% (187/1000)   -0.1042
+❌ irregular_past_participle_adjectives             17.5% (175/1000)   -0.0489
+❌ superlative_quantifiers_2                        14.6% (146/1000)   -0.0447
+❌ only_npi_scope                                   10.2% (102/1000)   -0.0553
+❌ existential_there_quantifiers_2                   2.0% (20/1000)   -0.0705
+❌ principle_A_case_2                                0.9% (9/1000)   -0.0656
+----------------------------------------------------------------------
+📊 Overall average accuracy: 48.79%
+======================================================================
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.Main_SSM_Trainer do
+  import Nx.Defn
+
+  # 1. Maps discrete tokens to their perfect 512D spatial coordinates
+  defn get_real_coordinates(batch_tokens, frozen_embeds) do
+    Nx.take(frozen_embeds, Nx.flatten(batch_tokens))
+      |> Nx.reshape({Nx.axis_size(batch_tokens, 0), Nx.axis_size(batch_tokens, 1), 512})
+      |> stop_grad()
+  end
+
+  # 2. THE MASTER SEQUENCE LOOP (Now with Gate Tracking!)
+  defn compute_sequence_loss(input_tokens, target_tokens_1, target_tokens_2, target_tokens_3, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+ 
+    # Get embeddings for the present inputs
+    clean_coords = get_real_coordinates(input_tokens, frozen_map)
+    inputs_time = Nx.transpose(clean_coords, axes: [1, 0, 2])
+    
+    # ⚡ Get embeddings for the FUTURE inputs (Phase 3 no longer uses raw integers!)
+    coords_t1 = get_real_coordinates(target_tokens_1, frozen_map) |> Nx.transpose(axes: [1, 0, 2])
+    coords_t2 = get_real_coordinates(target_tokens_2, frozen_map) |> Nx.transpose(axes: [1, 0, 2])
+    coords_t3 = get_real_coordinates(target_tokens_3, frozen_map) |> Nx.transpose(axes: [1, 0, 2])
+
+    zero_frame = Nx.broadcast(0.0, Nx.shape(h_top_init))
+
+    result =
+      while {i = 0, total_loss = 0.0, 
+             h_base = h_base_init, h_top = h_top_init,
+             xp1 = zero_frame, xp2 = zero_frame,
+             in_t = inputs_time, 
+             c_t1 = coords_t1, c_t2 = coords_t2, c_t3 = coords_t3, # Replaced raw integers
+             b_p = frozen_base_p, t_p = top_p, f_map = frozen_map}, 
+            Nx.less(i, seq_len) do
+        
+        {a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, valve_w, valve_b, out_w, out_b} = t_p
+        
+        x_curr = in_t[i]
+
+        # --- LAYER 1: The Frozen Physics Engine (Present Thought) ---
+        {_logits_fwd, _logits_retro, h_base_new} = DLM.TinySSM.forward_step(x_curr, h_base, b_p)
+
+        # ⚡ GENERATE THE GROUND TRUTH LATENT TARGETS (Future Thoughts)
+        # We peek ahead using the target embeddings to see what Phase 2 WILL think.
+        {_, _, base_target_1} = DLM.TinySSM.forward_step(c_t1[i], h_base_new, b_p)
+        {_, _, base_target_2} = DLM.TinySSM.forward_step(c_t2[i], base_target_1, b_p)
+        {_, _, base_target_3} = DLM.TinySSM.forward_step(c_t3[i], base_target_2, b_p)
+
+        # ⚡ SHIELD THE MANIFOLD: Freeze the gradients on the future targets!
+        # If we don't do this, Phase 3 will "cheat" by pushing errors backward into Phase 2.
+        safe_t1 = stop_grad(base_target_1)
+        safe_t2 = stop_grad(base_target_2)
+        safe_t3 = stop_grad(base_target_3)
+
+        # --- LAYER 2: The Top Brain (Predicting the Future) ---
+        # TICK 1
+        {_y_top1, h_top_1} = DLM.Main_SSM.ssm_recurrence(
+          h_base_new, xp1, xp2, h_top, 
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, valve_w, valve_b
+        )
+        
+        # TICK 2
+        {_y_top2, h_top_2} = DLM.Main_SSM.ssm_recurrence(
+          h_top_1, h_base_new, xp1, h_top_1, 
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, valve_w, valve_b
+        )
+
+        # TICK 3
+        {_y_top3, h_top_3} = DLM.Main_SSM.ssm_recurrence(
+          h_top_2, h_top_1, h_base_new, h_top_2, 
+          a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, valve_w, valve_b
+        )
+
+        # --- THE UPDATES (Continuous Flow) ---
+        h_top_new = h_top_1
+        h_base_carried = h_base_new
+
+        # ⚡ 5. LATENT PREDICTION & EXPONENTIAL MSE LOSS
+        # Project the top layer's states into the exact 512D coordinate space of the base layer
+        pred_t1 = Nx.dot(h_top_1, out_w) |> Nx.add(out_b)
+        pred_t2 = Nx.dot(h_top_2, out_w) |> Nx.add(out_b)
+        pred_t3 = Nx.dot(h_top_3, out_w) |> Nx.add(out_b)
+
+        # Calculate Mean Squared Error (MSE) instead of Cross-Entropy
+        loss_t1 = Nx.mean(Nx.pow(Nx.subtract(pred_t1, safe_t1), 2))
+        loss_t2 = Nx.mean(Nx.pow(Nx.subtract(pred_t2, safe_t2), 2))
+        loss_t3 = Nx.mean(Nx.pow(Nx.subtract(pred_t3, safe_t3), 2))
+
+        # The Exponential Discount Factor (Gamma)
+        gamma = Nx.tensor(0.5, type: :f32)
+
+        # Apply the decay
+        decayed_t2 = Nx.multiply(loss_t2, gamma)
+        decayed_t3 = Nx.multiply(loss_t3, Nx.pow(gamma, 2.0))
+
+        # Sum the temporal array
+        step_loss = Nx.add(loss_t1, Nx.add(decayed_t2, decayed_t3))
+        
+        # Add to the sequence accumulator
+        total_loss_new = Nx.add(total_loss, step_loss)
+
+        {i + 1, total_loss_new, h_base_carried, h_top_new, h_base_new, xp1, in_t, c_t1, c_t2, c_t3, b_p, t_p, f_map}
+      end
+      
+    {Nx.divide(elem(result, 1), seq_len), elem(result, 2), elem(result, 3)}
+  end
+
+  # 3. GRADIENT TAPE
+  defn compute_grad_and_step(batch_tokens, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p) do
+    # We must drop 3 tokens to make room for t+3 prediction
+    seq_len = Nx.axis_size(batch_tokens, 1) - 3
+    
+    input_tokens = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    target_tokens_1 = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+    target_tokens_2 = Nx.slice_along_axis(batch_tokens, 2, seq_len, axis: 1)
+    target_tokens_3 = Nx.slice_along_axis(batch_tokens, 3, seq_len, axis: 1)
+
+    {loss, raw_grads} = value_and_grad(top_p, fn p ->
+      {avg_loss, _h_base_final, _h_top_final} = 
+        compute_sequence_loss(input_tokens, target_tokens_1, target_tokens_2, target_tokens_3, h_base_init, h_top_init, frozen_base_p, frozen_map, p)
+      avg_loss
+    end)
+    
+    # Run a clean pass to get states AND the average gate value for telemetry
+    {_loss, final_h_base, final_h_top} = 
+        compute_sequence_loss(input_tokens, target_tokens_1, target_tokens_2, target_tokens_3, h_base_init, h_top_init, frozen_base_p, frozen_map, top_p)
+
+    {loss, raw_grads, final_h_base, final_h_top}
+  end
+
+  # ⚡ 4. TELEMETRY HELPER (Unpacks all 19 Phase 3 Params)
+  def grad_norms(grads) do
+    {g_a, g_bu, g_bv, g_cu, g_cv, g_du, g_dv, g_mu1, g_mv1, g_mu2, g_mv2, g_valve_w, g_valve_b, g_out_w, g_out_b} = grads
+    
+    calc = fn g -> g |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4) end
+    
+    [
+      a_diag: calc.(g_a), b_u: calc.(g_bu), b_v: calc.(g_bv),
+      c_u: calc.(g_cu), c_v: calc.(g_cv), d_u: calc.(g_du), d_v: calc.(g_dv),
+      mx_u1: calc.(g_mu1), mx_v1: calc.(g_mv1), mx_u2: calc.(g_mu2), mx_v2: calc.(g_mv2),
+      valve_w: calc.(g_valve_w), valve_b: calc.(g_valve_b), 
+      out_w: calc.(g_out_w), out_b: calc.(g_out_b)
+    ]
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM_Trainer, <<70, 79, 82, 49, 0, 0, 53, ...>>, {:grad_norms, 1}}
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Handles resuming and saving states for the Hierarchical DLM.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("✨ Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("✨ No checkpoints found for '#{run_prefix}'. Starting FRESH.")
+        {:fresh, 0}
+      end
+    else
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("🚀 Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+
+  # ⚡ NEW: Clean, centralized saving logic
+  def save_checkpoint(prefix, step, p, m, v, h_base, h_top) do
+    IO.puts("💾 Auto-Saving Checkpoint Step #{step}...")
+    
+    state = %{
+      params: DLM.Tree.map(p, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      ms: DLM.Tree.map(m, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      vs: DLM.Tree.map(v, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+      step: step,
+      h_base: Nx.backend_copy(h_base, Nx.BinaryBackend),
+      h_top: Nx.backend_copy(h_top, Nx.BinaryBackend)
+    }
+    
+    File.write!("#{prefix}_checkpoint_step_#{step}.bin", :erlang.term_to_binary(state))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.CheckpointManager, <<70, 79, 82, 49, 0, 0, 23, ...>>, {:save_checkpoint, 7}}
+```
+
+```elixir
+run_prefix = "v38_DLM_Phase_3_latent_mse_genesis"
+total_steps = 100000
+batch_size = 32
+seq_len = 128
+save_interval = 1000
+
+# ==============================================================================
+# 1. LOAD FROZEN FOUNDATIONS (Manifold + Physics Engine)
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1 Frozen Manifold...")
+%{params: {cpu_embeds, _, _, _}} = File.read!("phase1_sinkhorn_diffusion_25k_COMPLETE.bin") |> :erlang.binary_to_term()
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+IO.puts("⚙️ Loading Phase 2 Base SSM (Physics Engine)...")
+base_checkpoint = File.read!("v38_DLM_Phase_2_1_sh_muon_fix_3e4_50n_checkpoint_step_41000.bin") |> :erlang.binary_to_term()
+frozen_base_p = DLM.Tree.map(base_checkpoint, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# 2. INITIALIZE / RESUME TOP LEVEL
+# ==============================================================================
+{load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
+
+{starting_p, starting_m, starting_v, start_h_base, start_h_top} =
+  if load_path == :fresh do
+    IO.puts("✨ Igniting brand new Phase 3 Genesis weights...")
+    raw_p = DLM.Main_SSM_Genesis.init_params(42)
+    {raw_m, raw_v} = DLM.Main_SSM_Genesis.init_optimizer(raw_p)
+    
+    blank_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+    
+    {raw_p, raw_m, raw_v, blank_h, blank_h}
+  else
+    ckpt = File.read!(load_path) |> :erlang.binary_to_term()
+    blank_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+    
+    {
+      ckpt.params, 
+      ckpt.ms, 
+      ckpt.vs, 
+      Map.get(ckpt, :h_base, blank_h), 
+      Map.get(ckpt, :h_top, blank_h)
+    }
+  end
+
+# Push standard optimizer states to GPU
+p = DLM.Tree.map(starting_p, &Nx.backend_copy(&1, gpu))
+m = DLM.Tree.map(starting_m, &Nx.backend_copy(&1, gpu))
+v = DLM.Tree.map(starting_v, &Nx.backend_copy(&1, gpu))
+h_base = Nx.backend_copy(start_h_base, gpu)
+h_top = Nx.backend_copy(start_h_top, gpu)
+
+# ==============================================================================
+# 3. DATA STREAM
+# ==============================================================================
+IO.puts("🧠 Loading Curriculum...")
+dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+dataset = Nx.flatten(dataset_2d)
+data_stream = DLM.DataStreamer.build_infinite_stream(dataset, batch_size, seq_len)
+
+# ==============================================================================
+# 4. THE MASTER LOOP
+# ==============================================================================
+if start_step != :completed do
+  IO.puts("🚀 Entering Continuous Hierarchy Loop...")
+
+  {final_p, _m, _v, _hb, _ht} =
+    Enum.reduce(Enum.zip(start_step..(total_steps - 1), data_stream), {p, m, v, h_base, h_top}, 
+      fn {step, cpu_batch}, {cp, cm, cv, ch_base, ch_top} ->
+        
+        gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+
+        # ⚡ 1. Learning Rate Schedule
+        base_lr = 3.0e-4
+        min_lr = 3.0e-5
+        warmup_steps = 1000
+        
+        current_lr = 
+          if step < warmup_steps do
+            base_lr * (step / warmup_steps)
+          else
+            progress = min(max((step - warmup_steps) / (total_steps - warmup_steps), 0.0), 1.0)
+            min_lr + 0.5 * (base_lr - min_lr) * (1.0 + :math.cos(:math.pi() * progress))
+          end
+
+        # ⚡ 2. The Unified Gradient Tape
+        {loss_tensor, grads, next_h_base, next_h_top} = 
+          DLM.Main_SSM_Trainer.compute_grad_and_step(
+            gpu_batch, ch_base, ch_top, frozen_base_p, frozen_map, cp
+          )
+
+        loss_val = Nx.to_number(loss_tensor)
+
+        # ⚡ 3. Safety Check
+        if loss_val == :nan or loss_val > 20.0 do
+          IO.puts("⚠️ Step #{step}: NaN/Spike detected! Flushing Hidden States.")
+          clean_h = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+          {cp, cm, cv, clean_h, clean_h} # Skip update, flush memory
+        else
+          # ⚡ 4. Optimizer Step
+          lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+          step_tensor = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
+          
+          {up_p, up_m, up_v} = DLM.MuonHybrid.step(cp, grads, cm, cv, step_tensor, lr_tensor)
+
+          # ⚡ 5. Telemetry
+          if rem(step, 50) == 0 do
+            # Note: Since we use Cosine Distance now, loss is roughly between 0.0 (perfect) and 1.0 (orthogonal)
+            mem = :erlang.memory(:total) |> div(1024 * 1024)
+            
+            # Transfer grads to CPU for inspection to avoid slowing down the GPU tape
+            cpu_grads = DLM.Tree.map(grads, &Nx.backend_copy(&1, Nx.BinaryBackend))
+            norms = DLM.Main_SSM_Trainer.grad_norms(cpu_grads)
+            
+            # Sort to find the hottest gradients
+            sorted_norms = Enum.sort_by(norms, fn {_k, v} -> v end, :desc)
+            {max_name, max_norm} = hd(sorted_norms)
+            
+            IO.puts("➡️  Step #{step} | MSE Loss: #{Float.round(loss_val, 4)} | LR: #{Float.round(current_lr, 6)}")
+            IO.puts("   📐 GRADS -> Max: [#{max_name}: #{max_norm}] | RAM: #{mem}MB")
+          end
+
+          # ⚡ 6. Auto-Save
+          if rem(step, save_interval) == 0 and step > 0 do
+            DLM.CheckpointManager.save_checkpoint(run_prefix, step, up_p, up_m, up_v, next_h_base, next_h_top)
+            :erlang.garbage_collect(self())
+          end
+
+          {up_p, up_m, up_v, next_h_base, next_h_top}
+        end
+    end)
+
+  IO.puts("🎉 THE OVERNIGHT BAKE IS COMPLETE!")
+  DLM.CheckpointManager.save_checkpoint("#{run_prefix}_final", total_steps, final_p, m, v, h_base, h_top)
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Phase 1 Frozen Manifold...
+
+20:51:59.839 [info] XLA service 0x73d61400e2b0 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+20:51:59.841 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+20:51:59.841 [info] Using BFC allocator.
+
+20:51:59.841 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+20:51:59.841 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+⚙️ Loading Phase 2 Base SSM (Physics Engine)...
+🚀 Auto-Resuming 'v38_DLM_Phase_3_latent_mse_genesis' from Step 14000...
+🧠 Loading Curriculum...
+🚀 Entering Continuous Hierarchy Loop...
+
+20:52:00.380 [info] Merging Dots in computation: region_0.18
+
+20:52:00.381 [info] Merging Dots in computation: region_56.74.clone.clone
+
+20:52:00.381 [info] Merging Dots in computation: region_19.55.clone.clone.clone
+
+20:55:17.437 [info] Merging Dots in computation: region_1.2
+
+20:55:17.437 [info] Merging Dots in computation: region_4.5
+
+20:55:17.438 [info] Merging Dots in computation: region_7.8
+
+20:55:17.438 [info] Merging Dots in computation: region_10.11
+
+20:55:17.438 [info] Merging Dots in computation: region_13.14
+
+20:55:17.438 [info] Merging Dots in computation: region_16.17
+
+20:55:17.438 [info] Merging Dots in computation: region_19.20
+
+20:55:17.438 [info] Merging Dots in computation: region_22.23
+
+20:55:17.438 [info] Merging Dots in computation: region_25.26
+
+20:55:17.438 [info] Merging Dots in computation: region_28.29
+
+20:55:17.438 [info] Merging Dots in computation: region_31.32
+
+20:55:17.438 [info] Merging Dots in computation: region_34.35
+➡️  Step 14000 | MSE Loss: 0.719 | LR: 2.89e-4
+   📐 GRADS -> Max: [out_w: 1.0422] | RAM: 217MB
+💾 Auto-Saving Checkpoint Step 14000...
+➡️  Step 14050 | MSE Loss: 0.7194 | LR: 2.89e-4
+   📐 GRADS -> Max: [out_w: 1.0651] | RAM: 217MB
+➡️  Step 14100 | MSE Loss: 0.6985 | LR: 2.89e-4
+   📐 GRADS -> Max: [out_w: 1.0466] | RAM: 236MB
+➡️  Step 14150 | MSE Loss: 0.6948 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 0.9696] | RAM: 230MB
+➡️  Step 14200 | MSE Loss: 0.707 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 1.4118] | RAM: 237MB
+➡️  Step 14250 | MSE Loss: 0.6838 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 0.9672] | RAM: 219MB
+➡️  Step 14300 | MSE Loss: 0.7175 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 1.011] | RAM: 219MB
+➡️  Step 14350 | MSE Loss: 0.7079 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 1.2014] | RAM: 238MB
+➡️  Step 14400 | MSE Loss: 0.6973 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 0.8413] | RAM: 238MB
+➡️  Step 14450 | MSE Loss: 0.7278 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 1.2633] | RAM: 239MB
+➡️  Step 14500 | MSE Loss: 0.6873 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 1.0177] | RAM: 221MB
+➡️  Step 14550 | MSE Loss: 0.6999 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 1.4886] | RAM: 221MB
+➡️  Step 14600 | MSE Loss: 0.6979 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 1.3767] | RAM: 240MB
+➡️  Step 14650 | MSE Loss: 0.6896 | LR: 2.88e-4
+   📐 GRADS -> Max: [out_w: 0.9416] | RAM: 241MB
+➡️  Step 14700 | MSE Loss: 0.7473 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.433] | RAM: 241MB
+➡️  Step 14750 | MSE Loss: 0.707 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.2291] | RAM: 223MB
+➡️  Step 14800 | MSE Loss: 0.6902 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.1627] | RAM: 224MB
+➡️  Step 14850 | MSE Loss: 0.7293 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.6618] | RAM: 244MB
+➡️  Step 14900 | MSE Loss: 0.697 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.1544] | RAM: 244MB
+➡️  Step 14950 | MSE Loss: 0.7087 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.299] | RAM: 244MB
+➡️  Step 15000 | MSE Loss: 0.7158 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.2488] | RAM: 226MB
+💾 Auto-Saving Checkpoint Step 15000...
+➡️  Step 15050 | MSE Loss: 0.6751 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.2388] | RAM: 245MB
+➡️  Step 15100 | MSE Loss: 0.6896 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.7154] | RAM: 245MB
+➡️  Step 15150 | MSE Loss: 0.7237 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.4216] | RAM: 246MB
+➡️  Step 15200 | MSE Loss: 0.7112 | LR: 2.87e-4
+   📐 GRADS -> Max: [out_w: 1.2984] | RAM: 246MB
+➡️  Step 15250 | MSE Loss: 0.6651 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 1.3684] | RAM: 254MB
+➡️  Step 15300 | MSE Loss: 0.6987 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 1.3065] | RAM: 261MB
+➡️  Step 15350 | MSE Loss: 0.7362 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 2.0466] | RAM: 268MB
+➡️  Step 15400 | MSE Loss: 0.7128 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 1.6576] | RAM: 225MB
+➡️  Step 15450 | MSE Loss: 0.6929 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 1.8804] | RAM: 232MB
+➡️  Step 15500 | MSE Loss: 0.6731 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 1.5848] | RAM: 240MB
+➡️  Step 15550 | MSE Loss: 0.6924 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 1.8703] | RAM: 247MB
+➡️  Step 15600 | MSE Loss: 0.6584 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 1.1475] | RAM: 255MB
+➡️  Step 15650 | MSE Loss: 0.6853 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 2.0338] | RAM: 262MB
+➡️  Step 15700 | MSE Loss: 0.6936 | LR: 2.86e-4
+   📐 GRADS -> Max: [out_w: 1.7162] | RAM: 269MB
+➡️  Step 15750 | MSE Loss: 0.7021 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 1.6499] | RAM: 277MB
+➡️  Step 15800 | MSE Loss: 0.727 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 1.7798] | RAM: 284MB
+➡️  Step 15850 | MSE Loss: 0.6787 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 2.1495] | RAM: 291MB
+➡️  Step 15900 | MSE Loss: 0.7013 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 1.7538] | RAM: 299MB
+➡️  Step 15950 | MSE Loss: 0.7015 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 1.6279] | RAM: 306MB
+➡️  Step 16000 | MSE Loss: 0.6944 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 1.5544] | RAM: 314MB
+💾 Auto-Saving Checkpoint Step 16000...
+➡️  Step 16050 | MSE Loss: 0.6842 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 1.4194] | RAM: 202MB
+➡️  Step 16100 | MSE Loss: 0.7232 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 2.1648] | RAM: 202MB
+➡️  Step 16150 | MSE Loss: 0.6971 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 1.985] | RAM: 203MB
+➡️  Step 16200 | MSE Loss: 0.6726 | LR: 2.85e-4
+   📐 GRADS -> Max: [out_w: 2.5352] | RAM: 203MB
+```

@@ -1,0 +1,1649 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# DLM P2.1 - muon hybrid
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN for Rank 2 Tensors)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # pred and target are {batch_size, dim}
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    # 1. Batched Dot Product: {batch, dim} x {dim, batch} -> {batch, batch}
+    # This creates a similarity matrix comparing every pred to every target in the batch
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 2. Create Identity Targets -> {batch, batch}
+    batch_size = Nx.axis_size(pred, 0)
+    # ⚡ THE FIX: Pass a 2D tuple {32, 32} instead of a 1D tuple {32}
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    # 3. Manual Dense Log-Softmax
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))ozen_w2,
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 27, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## SSM
+
+```elixir
+defmodule DLM.TinySSM do
+  import Nx.Defn
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    activated = Nx.tanh(hidden) # ⚡ Let tanh handle the bounding
+    Nx.dot(activated, v)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn forward_step(x_t, h_prev, params) do
+    # ⚡ Unpack all 11 params
+    {a, bu, bv, cu, cv, du, dv, vw, vb, rb, rw} = params
+
+    b_proj = apply_svd(x_t, bu, bv)
+    
+    # 1. The Dynamic Gate
+    gate_proj = apply_svd(x_t, du, dv)
+    shifted_gate = Nx.subtract(gate_proj, 3.0)
+    delta = Nx.max(softplus(shifted_gate), 0.01)
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    
+    # 2. XSA Geometric Adaptation
+    h_norm_sq = Nx.add(Nx.sum(Nx.pow(h_prev, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    h_unit = Nx.divide(h_prev, Nx.sqrt(h_norm_sq))
+    overlap = Nx.sum(Nx.multiply(b_proj, h_unit), axes: [-1], keep_axes: true)
+    b_exclusive = Nx.subtract(b_proj, Nx.multiply(overlap, h_unit))
+    
+    # 3. Strictly Orthogonal State Update
+    h_new = Nx.add(Nx.multiply(a_bar, h_prev), b_exclusive)
+
+    # ⚡ 4. The SVD Bottleneck
+    # We pass the state through the SVD layers to "clean" the signal
+    h_latent = apply_svd(h_new, cu, cv)
+
+    # ⚡ 5. Dual Probes (Decoding the Latent signal)
+    logits_fwd = Nx.add(Nx.dot(h_latent, vw), vb)
+    logits_retro = Nx.add(Nx.dot(h_latent, rw), rb)
+
+    {logits_fwd, logits_retro, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 30, ...>>, true}
+```
+
+```elixir
+defmodule DLM.AdamMuonHybrid do
+  import Nx.Defn
+
+  # ⚡ 1. The Global Norm Clipper
+  # Correctly scales the entire matrix to preserve geometric direction
+  defn clip_norm(tensor, max_norm) do
+    norm = Nx.add(Nx.sqrt(Nx.sum(Nx.pow(tensor, 2))), 1.0e-8)
+    scale = Nx.min(1.0, Nx.divide(max_norm, norm))
+    Nx.multiply(tensor, scale)
+  end
+
+  # -------------------------------------------------------------------------
+  # AdamW (For 1D Friction/Inertia vectors and Biases)
+  # -------------------------------------------------------------------------
+  defn adam_step(p, g, m, v, step, lr) do
+    beta1 = 0.9
+    beta2 = 0.999
+    flat_decay = 1.0e-4
+
+    m_new = Nx.add(Nx.multiply(beta1, m), Nx.multiply(1.0 - beta1, g))
+    v_new = Nx.add(Nx.multiply(beta2, v), Nx.multiply(1.0 - beta2, Nx.pow(g, 2)))
+
+    m_hat = Nx.divide(m_new, Nx.subtract(1.0, Nx.pow(beta1, step)))
+    v_hat = Nx.divide(v_new, Nx.subtract(1.0, Nx.pow(beta2, step)))
+
+    update_val = Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), 1.0e-8)))
+
+    p_decayed = Nx.subtract(p, Nx.multiply(flat_decay, p))
+    p_new = Nx.subtract(p_decayed, update_val)
+
+    # ⚡ Weight limits removed! The manifold can expand.
+    {p_new, m_new, v_new}
+  end
+  
+  # -------------------------------------------------------------------------
+  # Muon Orthogonalization (Newton-Schulz Iteration)
+  # -------------------------------------------------------------------------
+  defn newton_schulz(g) do
+    norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2)))
+    x_init = Nx.divide(g, Nx.add(norm, 1.0e-8))
+
+    {x_final, _} =
+      while {x = x_init, i = 0}, Nx.less(i, 5) do
+        x_t = Nx.transpose(x)
+        x_t_x = Nx.dot(x_t, x)
+        term = Nx.dot(x, x_t_x)
+        
+        x_next = Nx.subtract(Nx.multiply(1.5, x), Nx.multiply(0.5, term))
+        {x_next, i + 1}
+      end
+      
+    x_final
+  end
+
+  # -------------------------------------------------------------------------
+  # Muon Step (For 2D Transformation Matrices)
+  # -------------------------------------------------------------------------
+  defn muon_step(p, g, m, v, lr) do
+    beta1 = 0.9
+    
+    # 1. Accumulate Momentum using the SANITIZED gradient
+    m_new = Nx.add(Nx.multiply(beta1, m), Nx.multiply(1.0 - beta1, g))
+    
+    # 2. Orthogonalize the Momentum buffer
+    step = newton_schulz(m_new)
+    
+    # 3. Apply the step directly (no weight clipping!)
+    p_new = Nx.subtract(p, Nx.multiply(lr, step))
+    
+    # We pass 'v' through unmodified because Muon doesn't use velocity,
+    # but we need it to repack the optimizer state tuples cleanly.
+    {p_new, m_new, v}
+  end
+
+  # -------------------------------------------------------------------------
+  # The 11-Parameter Router
+  # -------------------------------------------------------------------------
+  defn update(params, grads, ms, vs, step, lr) do
+    {a, bu, bv, cu, cv, du, dv, vw, vb, rb, rw} = params
+    {ga, gbu, gbv, gcu, gcv, gdu, gdv, gvw, gvb, grb, grw} = grads
+    {ma, mbu, mbv, mcu, mcv, mdu, mdv, mvw, mvb, mrb, mrw} = ms
+    {va, vbu, vbv, vcu, vcv, vdu, vdv, vvw, vvb, vrb, vrw} = vs
+
+    new_step = Nx.add(step, 1)
+
+    # ⚡ PRE-EMPTIVE GRADIENT CLIPPING (Global Norm = 1.0)
+    norm_cap = Nx.tensor(1.0, type: :f32)
+    c_ga  = clip_norm(ga, norm_cap)
+    c_gbu = clip_norm(gbu, norm_cap)
+    c_gbv = clip_norm(gbv, norm_cap)
+    c_gcu = clip_norm(gcu, norm_cap)
+    c_gcv = clip_norm(gcv, norm_cap)
+    c_gdu = clip_norm(gdu, norm_cap)
+    c_gdv = clip_norm(gdv, norm_cap)
+    c_gvw = clip_norm(gvw, norm_cap)
+    c_gvb = clip_norm(gvb, norm_cap)
+    c_grb = clip_norm(grb, norm_cap)
+    c_grw = clip_norm(grw, norm_cap)
+
+    # ⚡ 1. AdamW (Scalars, 1D Vectors, Biases)
+    {a_new, ma_new, va_new}   = adam_step(a, c_ga, ma, va, new_step, lr)
+    {vw_new, mvw_new, vvw_new} = adam_step(vw, c_gvw, mvw, vvw, new_step, lr)
+    {vb_new, mvb_new, vvb_new} = adam_step(vb, c_gvb, mvb, vvb, new_step, lr)
+    {rb_new, mrb_new, vrb_new} = adam_step(rb, c_grb, mrb, vrb, new_step, lr)
+    
+    # ⚡ 2. Muon (2D Transformation Matrices)
+    {bu_new, mbu_new, vbu_new} = muon_step(bu, c_gbu, mbu, vbu, lr)
+    {bv_new, mbv_new, vbv_new} = muon_step(bv, c_gbv, mbv, vbv, lr)
+    {cu_new, mcu_new, vcu_new} = muon_step(cu, c_gcu, mcu, vcu, lr)
+    {cv_new, mcv_new, vcv_new} = muon_step(cv, c_gcv, mcv, vcv, lr)
+    {du_new, mdu_new, vdu_new} = muon_step(du, c_gdu, mdu, vdu, lr)
+    {dv_new, mdv_new, vdv_new} = muon_step(dv, c_gdv, mdv, vdv, lr)
+    {rw_new, mrw_new, vrw_new} = muon_step(rw, c_grw, mrw, vrw, lr)
+
+    new_params = {a_new, bu_new, bv_new, cu_new, cv_new, du_new, dv_new, vw_new, vb_new, rb_new, rw_new}
+    new_ms = {ma_new, mbu_new, mbv_new, mcu_new, mcv_new, mdu_new, mdv_new, mvw_new, mvb_new, mrb_new, mrw_new}
+    new_vs = {va_new, vbu_new, vbv_new, vcu_new, vcv_new, vdu_new, vdv_new, vvw_new, vvb_new, vrb_new, vrw_new}
+    
+    {new_params, new_ms, new_vs, new_step}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.AdamMuonHybrid, <<70, 79, 82, 49, 0, 0, 47, ...>>, true}
+```
+
+```elixir
+defmodule DLM.PhysicsGenesis do
+  import Nx.Defn
+
+  @dim 512
+  @rank 256
+
+  defn ignite(key) do
+    # a_diag: Friction/Inertia
+    {a, k1} = Nx.Random.normal(key, -0.1, 0.01, shape: {@dim})
+    
+    # b: Input Force Matrices
+    {bu, k2} = Nx.Random.normal(k1, 0.0, 0.02, shape: {@dim, @rank})
+    {bv, k3} = Nx.Random.normal(k2, 0.0, 0.02, shape: {@rank, @dim})
+    
+    # c: Output Velocity Matrices
+    {cu, k4} = Nx.Random.normal(k3, 0.0, 0.02, shape: {@dim, @rank})
+    {cv, k5} = Nx.Random.normal(k4, 0.0, 0.02, shape: {@rank, @dim})
+
+    # ⚡ NEW: d: Dynamic Gating Matrices (Initialized near zero)
+    {du, k6} = Nx.Random.normal(k5, 0.0, 0.02, shape: {@dim, @rank})
+    {dv, k7} = Nx.Random.normal(k6, 0.0, 0.02, shape: {@rank, @dim})
+
+    {vocab_w, k8} = Nx.Random.normal(k7, 0.0, 0.02, shape: {512, 128})
+    {rw, next_key} = Nx.Random.normal(k8, 0.0, 0.02, shape: {512, 128})
+    
+    vocab_b = Nx.broadcast(0.0, {128}) |> Nx.as_type(:f32)
+    rb = Nx.broadcast(0.0, {128}) |> Nx.as_type(:f32)
+    
+
+    {{a, bu, bv, cu, cv, du, dv, vocab_w, vocab_b, rb, rw}, next_key}
+  end
+
+  def init_optimizer(params) do
+    zero_state = DLM.Tree.map(params, fn p -> Nx.broadcast(0.0, Nx.shape(p)) end)
+    {zero_state, zero_state, Nx.tensor(0)}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## BLiMP
+
+```elixir
+defmodule DLM.Phase2_Eval do
+  import Nx.Defn
+
+  defn compute_sentence_loss(input_tokens, target_tokens, h_init, params, frozen_map) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+  
+    # 1. Map inputs to continuous Sinkhorn space
+    input_coords =
+      Nx.take(frozen_map, Nx.flatten(input_tokens))
+      |> Nx.reshape({1, seq_len, 512})
+  
+    in_t = Nx.transpose(input_coords, axes: [1, 0, 2])
+    targ_t = Nx.transpose(target_tokens, axes: [1, 0])
+  
+    # 2. The Physics Loop
+    result =
+      while {i = 0, total_loss = Nx.tensor(0.0, type: :f32),
+             h = h_init,
+             x_in = in_t, y_targ = targ_t,
+             p = params, f_map = frozen_map},
+            Nx.less(i, seq_len) do
+  
+          x_curr = x_in[i]
+  
+          # ⚡ UPDATE: Unpack all 11 trainable parameters from Phase 2.1
+          {a, bu, bv, cu, cv, du, dv, vw, vb, _rb, _rw} = p
+
+          # --- ⚡ 3. The Core Physics (XSA) ---
+          b_proj = DLM.TinySSM.apply_svd(x_curr, bu, bv)
+          gate_proj = DLM.TinySSM.apply_svd(x_curr, du, dv)
+          shifted_gate = Nx.subtract(gate_proj, 3.0)
+          delta = Nx.max(DLM.TinySSM.softplus(shifted_gate), 0.01)
+          a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+          
+          h_norm_sq = Nx.add(Nx.sum(Nx.pow(h, 2), axes: [-1], keep_axes: true), 1.0e-6)
+          h_unit = Nx.divide(h, Nx.sqrt(h_norm_sq))
+          overlap = Nx.sum(Nx.multiply(b_proj, h_unit), axes: [-1], keep_axes: true)
+          b_exclusive = Nx.subtract(b_proj, Nx.multiply(overlap, h_unit))
+          
+          h_new = Nx.add(Nx.multiply(a_bar, h), b_exclusive)
+
+          # --- ⚡ 4. The SVD Bottleneck (MUST MATCH TRAINING) ---
+          h_latent = DLM.TinySSM.apply_svd(h_new, cu, cv)
+          
+          # --- ⚡ 5. Forward Logit Prediction ---
+          logits = Nx.add(Nx.dot(h_latent, vw), vb)
+          
+          # Cross Entropy Loss against the target character
+          step_loss = DLM.Loss.cross_entropy(logits, y_targ[i])
+
+        {i + 1, Nx.add(total_loss, step_loss), h_new, x_in, y_targ, p, f_map}
+      end
+  
+    Nx.divide(elem(result, 1), seq_len)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase2_Eval, <<70, 79, 82, 49, 0, 0, 24, ...>>, true}
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+
+# ==============================================================================
+# 1. LOAD MODELS
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1 Frozen Manifold...") # phase1_sinkhorn_diffusion_25k_COMPLETE phase1_shape_diffusion_25k_COMPLETE.bin
+%{params: {cpu_embeds, _, _, _}} = File.read!("phase1_sinkhorn_diffusion_25k_COMPLETE.bin") |> :erlang.binary_to_term()
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+IO.puts("⚙️ Loading Phase 2.1 Introspective SSM...")
+# ⚡ Read the 11-parameter tuple directly
+checkpoint_path = "v38_DLM_Phase_2_1_sh_muon_fix_3e4_50n_checkpoint_step_44000.bin"
+phase2_p = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+
+# Move the tuple to GPU
+p = DLM.Tree.map(phase2_p, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# PRE-WARM: compile the JIT kernel once
+# ==============================================================================
+IO.puts("🔥 Pre-warming JIT compiler...")
+warmup_tokens = Nx.tensor([[72, 101, 108, 108, 111]], type: :s32) |> Nx.backend_copy(gpu)
+warmup_input  = Nx.slice_along_axis(warmup_tokens, 0, 4, axis: 1)
+warmup_target = Nx.slice_along_axis(warmup_tokens, 1, 4, axis: 1)
+h_init_warm   = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+
+DLM.Phase2_Eval.compute_sentence_loss(warmup_input, warmup_target, h_init_warm, p, frozen_map)
+IO.puts("✅ JIT warm, starting batch...\n")
+
+# ==============================================================================
+# 2. EVAL FUNCTION
+# ==============================================================================
+run_blimp = fn path ->
+  pairs =
+    File.read!(path)
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
+
+  total_pairs = length(pairs)
+
+  {passes, total_loss_diff} =
+    Enum.reduce(pairs, {0, 0.0}, fn pair, {pass_count, diff_acc} ->
+      good_sentence = pair["sentence_good"]
+      bad_sentence  = pair["sentence_bad"]
+  
+      good_val_tokens = good_sentence |> to_charlist() |> Nx.tensor(type: :s32)
+      bad_val_tokens  = bad_sentence  |> to_charlist() |> Nx.tensor(type: :s32)
+  
+      good_seq_len = Nx.size(good_val_tokens) - 1
+      bad_seq_len  = Nx.size(bad_val_tokens)  - 1
+  
+      good_input  = Nx.slice_along_axis(good_val_tokens, 0, good_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      good_target = Nx.slice_along_axis(good_val_tokens, 1, good_seq_len, axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      bad_input   = Nx.slice_along_axis(bad_val_tokens,  0, bad_seq_len,  axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      bad_target  = Nx.slice_along_axis(bad_val_tokens,  1, bad_seq_len,  axis: 0) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+  
+      h_init = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+  
+      # ⚡ Execute using only the 7 Phase 2 parameters
+      good_loss = DLM.Phase2_Eval.compute_sentence_loss(good_input, good_target, h_init, p, frozen_map) |> Nx.to_number()
+      bad_loss  = DLM.Phase2_Eval.compute_sentence_loss(bad_input,  bad_target,  h_init, p, frozen_map) |> Nx.to_number()
+  
+      # Explicit cleanup
+      :erlang.garbage_collect(self())
+  
+      new_pass_count = if good_loss < bad_loss, do: pass_count + 1, else: pass_count
+      {new_pass_count, diff_acc + (bad_loss - good_loss)}
+    end)
+
+  accuracy   = (passes / total_pairs) * 100.0
+  avg_margin = total_loss_diff / total_pairs
+  name       = Path.basename(path, ".jsonl")
+
+  {name, accuracy, avg_margin, passes, total_pairs}
+end
+
+# ==============================================================================
+# 3. BATCH RUN
+# ==============================================================================
+dataset_files = Path.wildcard("./data/*.jsonl") |> Enum.sort()
+total_files   = length(dataset_files)
+
+IO.puts("🚀 Running BLiMP batch eval across #{total_files} datasets...\n")
+
+results =
+  dataset_files
+  |> Enum.with_index(1)
+  |> Enum.map(fn {path, idx} ->
+    IO.puts("  [#{idx}/#{total_files}] #{Path.basename(path)}...")
+    result = run_blimp.(path)
+    :erlang.garbage_collect(self())
+    result
+  end)
+
+# ==============================================================================
+# 4. SORTED SUMMARY
+# ==============================================================================
+sorted = Enum.sort_by(results, fn {_, acc, _, _, _} -> acc end, :desc)
+
+IO.puts("\n")
+IO.puts(String.duplicate("=", 70))
+IO.puts("🏆 BLIMP BATCH RESULTS — sorted by accuracy")
+IO.puts(String.duplicate("=", 70))
+IO.puts(String.pad_trailing("Dataset", 48) <> "Accuracy   Margin")
+IO.puts(String.duplicate("-", 70))
+
+Enum.each(sorted, fn {name, acc, margin, passes, total} ->
+  flag = cond do
+    acc >= 60.0 -> "✅"
+    acc <= 40.0 -> "❌"
+    true        -> "〰️"
+  end
+  IO.puts("#{flag} #{String.pad_trailing(name, 46)} #{String.pad_leading("#{Float.round(acc, 1)}%", 7)} (#{passes}/#{total})   #{Float.round(margin, 4)}")
+end)
+
+IO.puts(String.duplicate("-", 70))
+
+# Overall average
+avg_acc = results |> Enum.map(fn {_, acc, _, _, _} -> acc end) |> Enum.sum() |> Kernel./(total_files)
+IO.puts("📊 Overall average accuracy: #{Float.round(avg_acc, 2)}%")
+IO.puts(String.duplicate("=", 70))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Phase 1 Frozen Manifold...
+
+17:29:40.882 [info] XLA service 0x7c6f8a2489e0 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+17:29:40.883 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+17:29:40.883 [info] Using BFC allocator.
+
+17:29:40.883 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+17:29:40.883 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+⚙️ Loading Phase 2.1 Introspective SSM...
+🔥 Pre-warming JIT compiler...
+✅ JIT warm, starting batch...
+
+🚀 Running BLiMP batch eval across 67 datasets...
+
+  [1/67] adjunct_island.jsonl...
+  [2/67] anaphor_gender_agreement.jsonl...
+  [3/67] anaphor_number_agreement.jsonl...
+  [4/67] animate_subject_passive.jsonl...
+  [5/67] animate_subject_trans.jsonl...
+  [6/67] causative.jsonl...
+  [7/67] complex_NP_island.jsonl...
+  [8/67] coordinate_structure_constraint_complex_left_branch.jsonl...
+  [9/67] coordinate_structure_constraint_object_extraction.jsonl...
+  [10/67] determiner_noun_agreement_1.jsonl...
+  [11/67] determiner_noun_agreement_2.jsonl...
+  [12/67] determiner_noun_agreement_irregular_1.jsonl...
+  [13/67] determiner_noun_agreement_irregular_2.jsonl...
+  [14/67] determiner_noun_agreement_with_adj_2.jsonl...
+  [15/67] determiner_noun_agreement_with_adj_irregular_1.jsonl...
+  [16/67] determiner_noun_agreement_with_adj_irregular_2.jsonl...
+  [17/67] determiner_noun_agreement_with_adjective_1.jsonl...
+  [18/67] distractor_agreement_relational_noun.jsonl...
+  [19/67] distractor_agreement_relative_clause.jsonl...
+  [20/67] drop_argument.jsonl...
+  [21/67] ellipsis_n_bar_1.jsonl...
+  [22/67] ellipsis_n_bar_2.jsonl...
+  [23/67] existential_there_object_raising.jsonl...
+  [24/67] existential_there_quantifiers_1.jsonl...
+  [25/67] existential_there_quantifiers_2.jsonl...
+  [26/67] existential_there_subject_raising.jsonl...
+  [27/67] expletive_it_object_raising.jsonl...
+  [28/67] inchoative.jsonl...
+  [29/67] intransitive.jsonl...
+  [30/67] irregular_past_participle_adjectives.jsonl...
+  [31/67] irregular_past_participle_verbs.jsonl...
+  [32/67] irregular_plural_subject_verb_agreement_1.jsonl...
+  [33/67] irregular_plural_subject_verb_agreement_2.jsonl...
+  [34/67] left_branch_island_echo_question.jsonl...
+  [35/67] left_branch_island_simple_question.jsonl...
+  [36/67] matrix_question_npi_licensor_present.jsonl...
+  [37/67] npi_present_1.jsonl...
+  [38/67] npi_present_2.jsonl...
+  [39/67] only_npi_licensor_present.jsonl...
+  [40/67] only_npi_scope.jsonl...
+  [41/67] passive_1.jsonl...
+  [42/67] passive_2.jsonl...
+  [43/67] principle_A_c_command.jsonl...
+  [44/67] principle_A_case_1.jsonl...
+  [45/67] principle_A_case_2.jsonl...
+  [46/67] principle_A_domain_1.jsonl...
+  [47/67] principle_A_domain_2.jsonl...
+  [48/67] principle_A_domain_3.jsonl...
+  [49/67] principle_A_reconstruction.jsonl...
+  [50/67] regular_plural_subject_verb_agreement_1.jsonl...
+  [51/67] regular_plural_subject_verb_agreement_2.jsonl...
+  [52/67] sentential_negation_npi_licensor_present.jsonl...
+  [53/67] sentential_negation_npi_scope.jsonl...
+  [54/67] sentential_subject_island.jsonl...
+  [55/67] superlative_quantifiers_1.jsonl...
+  [56/67] superlative_quantifiers_2.jsonl...
+  [57/67] tough_vs_raising_1.jsonl...
+  [58/67] tough_vs_raising_2.jsonl...
+  [59/67] transitive.jsonl...
+  [60/67] wh_island.jsonl...
+  [61/67] wh_questions_object_gap.jsonl...
+  [62/67] wh_questions_subject_gap.jsonl...
+  [63/67] wh_questions_subject_gap_long_distance.jsonl...
+  [64/67] wh_vs_that_no_gap.jsonl...
+  [65/67] wh_vs_that_no_gap_long_distance.jsonl...
+  [66/67] wh_vs_that_with_gap.jsonl...
+  [67/67] wh_vs_that_with_gap_long_distance.jsonl...
+
+
+======================================================================
+🏆 BLIMP BATCH RESULTS — sorted by accuracy
+======================================================================
+Dataset                                         Accuracy   Margin
+----------------------------------------------------------------------
+✅ only_npi_licensor_present                       100.0% (1000/1000)   0.2233
+✅ wh_vs_that_no_gap                                99.9% (999/1000)   0.0693
+✅ wh_vs_that_no_gap_long_distance                  99.9% (999/1000)   0.0513
+✅ superlative_quantifiers_1                        99.0% (990/1000)   0.0739
+✅ principle_A_case_2                               94.7% (947/1000)   0.0535
+✅ principle_A_case_1                               93.3% (933/1000)   0.0644
+✅ wh_questions_subject_gap                         89.6% (896/1000)   0.0706
+✅ wh_questions_subject_gap_long_distance           89.0% (890/1000)   0.0428
+✅ principle_A_domain_1                             84.2% (842/1000)   0.0269
+✅ wh_island                                        83.3% (833/1000)   0.0392
+✅ existential_there_subject_raising                71.3% (713/1000)   0.0451
+✅ only_npi_scope                                   70.9% (709/1000)   0.0315
+✅ wh_questions_object_gap                          70.2% (702/1000)   0.0385
+✅ principle_A_c_command                            69.0% (690/1000)   0.0377
+✅ anaphor_gender_agreement                         68.1% (681/1000)   0.0522
+✅ adjunct_island                                   65.7% (657/1000)   0.0122
+✅ left_branch_island_echo_question                 65.2% (652/1000)   0.0321
+✅ existential_there_quantifiers_1                  65.0% (650/1000)   0.0238
+✅ existential_there_quantifiers_2                  63.7% (637/1000)   0.0408
+✅ tough_vs_raising_2                               62.0% (620/1000)   0.0422
+✅ irregular_past_participle_verbs                  61.4% (614/1000)   0.0266
+〰️ existential_there_object_raising                 59.1% (591/1000)   0.0081
+〰️ animate_subject_passive                          59.0% (590/1000)   0.0226
+〰️ sentential_negation_npi_licensor_present         57.4% (574/1000)   0.037
+〰️ regular_plural_subject_verb_agreement_2          54.5% (545/1000)   0.0046
+〰️ determiner_noun_agreement_with_adj_irregular_2   54.4% (544/1000)   0.0031
+〰️ sentential_negation_npi_scope                    54.4% (544/1000)   0.0025
+〰️ superlative_quantifiers_2                        53.2% (532/1000)   -0.0373
+〰️ distractor_agreement_relational_noun             52.8% (528/1000)   0.0015
+〰️ determiner_noun_agreement_irregular_2            52.6% (526/1000)   0.0033
+〰️ distractor_agreement_relative_clause             52.2% (522/1000)   0.0035
+〰️ principle_A_domain_3                             52.2% (522/1000)   0.0069
+〰️ determiner_noun_agreement_with_adjective_1       51.5% (515/1000)   0.0014
+〰️ irregular_plural_subject_verb_agreement_1        51.5% (515/1000)   -0.0004
+〰️ complex_NP_island                                51.2% (512/1000)   0.0003
+〰️ ellipsis_n_bar_2                                 50.8% (508/1000)   -0.0009
+〰️ expletive_it_object_raising                      50.8% (508/1000)   0.001
+〰️ irregular_plural_subject_verb_agreement_2        50.7% (507/1000)   -0.0076
+〰️ coordinate_structure_constraint_object_extraction   50.6% (506/1000)   0.0023
+〰️ determiner_noun_agreement_with_adj_irregular_1   50.6% (506/1000)   0.0018
+〰️ determiner_noun_agreement_1                      50.5% (505/1000)   -0.0005
+〰️ determiner_noun_agreement_2                      49.7% (497/1000)   0.004
+〰️ determiner_noun_agreement_irregular_1            49.1% (491/1000)   -0.0035
+〰️ sentential_subject_island                        48.9% (489/1000)   0.0013
+〰️ anaphor_number_agreement                         47.9% (479/1000)   -0.018
+〰️ transitive                                       47.6% (476/1000)   -0.0032
+〰️ determiner_noun_agreement_with_adj_2             47.3% (473/1000)   -0.001
+〰️ passive_2                                        45.5% (455/1000)   -0.0072
+〰️ npi_present_1                                    44.3% (443/1000)   0.0033
+〰️ npi_present_2                                    42.9% (429/1000)   -0.0018
+〰️ passive_1                                        42.8% (428/1000)   -0.0124
+〰️ coordinate_structure_constraint_complex_left_branch   40.8% (408/1000)   -0.0056
+〰️ principle_A_reconstruction                       40.2% (402/1000)   -0.0083
+〰️ causative                                        40.1% (401/1000)   -0.0281
+❌ tough_vs_raising_1                               39.0% (390/1000)   -0.0405
+❌ animate_subject_trans                            38.4% (384/1000)   -0.0865
+❌ principle_A_domain_2                             38.4% (384/1000)   -0.0206
+❌ left_branch_island_simple_question               38.2% (382/1000)   -0.0166
+❌ ellipsis_n_bar_1                                 37.9% (379/1000)   -0.0065
+❌ inchoative                                       35.9% (359/1000)   -0.067
+❌ regular_plural_subject_verb_agreement_1          32.8% (328/1000)   -0.0358
+❌ intransitive                                     31.7% (317/1000)   -0.0899
+❌ matrix_question_npi_licensor_present             30.7% (307/1000)   -0.0572
+❌ drop_argument                                    28.5% (285/1000)   -0.1072
+❌ irregular_past_participle_adjectives             21.1% (211/1000)   -0.0383
+❌ wh_vs_that_with_gap_long_distance                 0.1% (1/1000)   -0.0538
+❌ wh_vs_that_with_gap                               0.0% (0/1000)   -0.0807
+----------------------------------------------------------------------
+📊 Overall average accuracy: 55.0%
+======================================================================
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.Phase2Trainer do
+  import Nx.Defn
+
+  defn compute_sequence_loss(input_tokens, target_tokens, h_init, params, embeds) do
+    input_coords =
+      Nx.take(embeds, Nx.flatten(input_tokens))
+      |> Nx.reshape({Nx.axis_size(input_tokens, 0), Nx.axis_size(input_tokens, 1), 512})
+      |> stop_grad()
+  
+    inputs_time_first = Nx.transpose(input_coords, axes: [1, 0, 2])
+    targets_fwd_time_first = Nx.transpose(target_tokens, axes: [1, 0])
+    targets_retro_time_first = Nx.transpose(input_tokens, axes: [1, 0])
+  
+    # The main unroll loop
+    result =
+      while {i = 0, total_fwd = 0.0, total_retro = 0.0, h = h_init, 
+             inf = inputs_time_first, tf = targets_fwd_time_first, tr = targets_retro_time_first, p = params},
+            Nx.less(i, Nx.axis_size(inf, 0)) do
+        
+        x_curr = inf[i]
+        
+        # ⚡ This now uses the FULL forward_step where p contains all trainable weights
+        {logits_fwd, logits_retro, h_new} = DLM.TinySSM.forward_step(x_curr, h, p)
+        
+        l_fwd = DLM.Loss.cross_entropy(logits_fwd, tf[i])
+        l_retro = DLM.Loss.cross_entropy(logits_retro, tr[i])
+        
+        {i + 1, total_fwd + l_fwd, total_retro + l_retro, h_new, inf, tf, tr, p}
+      end
+  
+    {_, acc_fwd, acc_retro, _, _, _, _, _} = result
+    
+    seq_len = Nx.axis_size(inputs_time_first, 0)
+    mean_fwd = acc_fwd / seq_len
+    mean_retro = acc_retro / seq_len
+    
+    # The unified objective
+    total_loss = mean_fwd + (0.3 * mean_retro)
+    
+    {total_loss, {mean_fwd, mean_retro}}
+  end
+
+ defn compute_grad(params, batch_tokens, h_init, frozen_embeds) do
+    {_batch_size, full_seq_len} = Nx.shape(batch_tokens)
+    seq_len = full_seq_len - 1
+    
+    input_tokens  = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+
+    # ⚡ FIX 1: Run the full pass first to extract telemetry for your IO
+    {total_loss, {fwd_loss, retro_loss}} = compute_sequence_loss(
+      input_tokens, target_tokens, h_init, params, frozen_embeds
+    )
+  
+    # ⚡ FIX 2: value_and_grad closure MUST return only the scalar total_loss
+    {_loss, raw_grads} = value_and_grad(params, fn p ->
+      {tot_loss, _aux} = compute_sequence_loss(input_tokens, target_tokens, h_init, p, frozen_embeds)
+      tot_loss
+    end)
+  
+    {total_loss, fwd_loss, retro_loss, raw_grads}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase2Trainer, <<70, 79, 82, 49, 0, 0, 28, ...>>, true}
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Scans the directory for the latest checkpoint of a specific run prefix.
+  If no checkpoints exist, it triggers a completely fresh initialization.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("✨ Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("✨ No checkpoints found for '#{run_prefix}'. Starting FRESH from Genesis.")
+        {:fresh, 0}
+      end
+    else
+      # Extract step numbers using regex and find the maximum
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("🚀 Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.CheckpointManager, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:get_resume_state, 1}}
+```
+
+```elixir
+run_prefix  = "v38_DLM_Phase_2_1_sh_muon_fix_1e4_50n"  
+total_steps = 90000
+
+# ⚡ 2. CHECK RESUME STATE (No more base_weights passed in!)
+{load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
+
+if start_step == :completed do
+  IO.puts("✅ This run has already reached #{total_steps} steps. Exiting.")
+else
+  # 1. Load the completed Phase 1 state
+  %{params: phase1_p} = File.read!("phase1_sinkhorn_diffusion_25k_COMPLETE.bin") |> :erlang.binary_to_term()
+  
+  # 2. Unpack it (we only want the embeds, we can throw away the Phase 1 denoiser weights for now)
+  {cpu_embeds, _w1, _w2, _key} = phase1_p
+  
+  # 3. Push the finalized map to the GPU and L2 Normalize it one last time to be safe
+  frozen_map = cpu_embeds
+               |> Nx.backend_copy(gpu)
+               |> DLM.Loss.l2_normalize()
+  
+  IO.puts("🌌 Phase 1 Frozen Manifold Loaded & Normalized!")
+
+  batch_size = 32
+  seq_len = 128  
+
+  IO.puts("🧠 Loading LPSSM 128seqlen training data CPU Memory...")
+  dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+  dataset = Nx.flatten(dataset_2d)
+  data_stream = DLM.DataStreamer.build_infinite_stream(dataset, batch_size, seq_len)
+
+  # ⚡ 3. BRANCHING WEIGHT INITIALIZATION
+  {starting_params, initial_key} =
+    if load_path == :fresh do
+      IO.puts("✨ Igniting brand new Genesis weights for #{run_prefix}...")
+      DLM.PhysicsGenesis.ignite(Nx.Random.key(System.system_time()))
+    else
+      IO.puts("✨ Loading Weights from #{load_path}...")
+      loaded_p = File.read!(load_path) |> :erlang.binary_to_term()
+      # Give it a fresh noise key even if resuming
+      {loaded_p, Nx.Random.key(System.system_time())}
+    end
+
+    # Initialize the optimizer states with zeroes
+    {m, v, _step_count} = DLM.PhysicsGenesis.init_optimizer(starting_params)
+  
+    # Move everything to the GPU
+    p = DLM.Tree.map(starting_params, &Nx.backend_copy(&1, gpu))
+    m = DLM.Tree.map(m, &Nx.backend_copy(&1, gpu))
+    v = DLM.Tree.map(v, &Nx.backend_copy(&1, gpu))
+    step_count = Nx.tensor(start_step) |> Nx.backend_copy(gpu)
+  
+    # ⚡ 4. ZIP FROM THE START_STEP
+    {final_p, _m, _v, _key, _step} = 
+      Enum.reduce(Enum.zip(start_step..(total_steps - 1), data_stream), {p, m, v, initial_key, step_count}, fn {step, cpu_batch}, {cp, cm, cv, cur_key, c_step} ->
+        
+        gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+        
+        # DYNAMIC LEARNING RATE SCHEDULER
+        max_lr = 1.0e-4
+        warmup_steps = 500
+  
+        current_lr =
+          if step < warmup_steps do
+            max_lr * (step / warmup_steps)
+          else
+            decay_ratio = (step - warmup_steps) / (total_steps - warmup_steps)
+            max_lr * 0.5 * (1.0 + :math.cos(:math.pi() * decay_ratio))
+          end
+        
+        lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+        h_init = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.as_type(:f32) |> Nx.backend_copy(gpu)
+  
+        split_keys = Nx.Random.split(cur_key)
+        next_key = split_keys[1]
+        
+        # ⚡ UPDATE: Catch all three loss components
+        {loss_tensor, fwd_tensor, retro_tensor, grads} = DLM.Phase2Trainer.compute_grad(
+          cp, gpu_batch, h_init, frozen_map
+        )
+  
+        # ⚡ UPDATE: Telemetry capture for all components
+        loss_vals = if rem(step, 50) == 0 do
+          {Nx.to_number(loss_tensor), Nx.to_number(fwd_tensor), Nx.to_number(retro_tensor)}
+        else
+          {0.0, 0.0, 0.0}
+        end
+  
+        # ⚡ Use the 11-param Optimizer (HybridMuon7 or updated Adam7)
+        {up_p, up_m, up_v, up_step} = DLM.AdamMuonHybrid.update(cp, grads, cm, cv, c_step, lr_tensor)
+  
+        # ➡️ Telemetry
+        if rem(step, 50) == 0 do
+          {tot_v, fwd_v, ret_v} = loss_vals
+          # ⚡ Unpack the 11 params for norm checking
+          {_a, _bu, bv, _cu, _cv, _du, dv, _vw, _vb, _rb, _rw} = up_p
+          bv_norm = bv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+          dv_norm = dv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number()
+  
+          IO.puts("➡️ Step #{step} | Total: #{Float.round(tot_v, 4)} | FWD: #{Float.round(fwd_v, 4)} | RETRO: #{Float.round(ret_v, 4)} | bv_n: #{Float.round(bv_norm, 2)} | dv_n: #{Float.round(dv_norm, 2)}")
+        end
+  
+        # 💾 DYNAMIC CHECKPOINT SAVING
+        if rem(step, 1000) == 0 and step > 0 do
+          IO.puts("💾 Checkpoint reached! Saving Step #{step}...")
+          cpu_snapshot = DLM.Tree.map(up_p, &Nx.backend_copy(&1, Nx.BinaryBackend))
+          filename = "#{run_prefix}_checkpoint_step_#{step}.bin"
+          File.write!(filename, :erlang.term_to_binary(cpu_snapshot))
+          :erlang.garbage_collect()
+        end
+  
+        {up_p, up_m, up_v, next_key, up_step}
+    end)
+
+  IO.puts("💾 Saving Final Gated Physics Engine Weights...")
+  # It is safe to use backend_transfer here because the run is over
+  good_params = DLM.Tree.map(final_p, &Nx.backend_transfer(&1, Nx.BinaryBackend))
+  File.write!("#{run_prefix}_final.bin", :erlang.term_to_binary(good_params))
+  IO.puts("✅ Resaved with clean CPU tensors")
+  IO.puts("✅ Physics Engine Training Complete!")
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🚀 Auto-Resuming 'v38_DLM_Phase_2_1_sh_muon_fix_3e4_50n' from Step 65000...
+
+14:15:29.318 [info] XLA service 0x708ec4007c80 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+14:15:29.319 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+14:15:29.319 [info] Using BFC allocator.
+
+14:15:29.320 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+14:15:29.320 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+🌌 Phase 1 Frozen Manifold Loaded & Normalized!
+🧠 Loading LPSSM 128seqlen training data CPU Memory...
+✨ Loading Weights from v38_DLM_Phase_2_1_sh_muon_fix_3e4_50n_checkpoint_step_65000.bin...
+
+14:15:29.730 [info] Merging Dots in computation: region_0.11
+
+14:15:29.731 [info] Merging Dots in computation: region_12.34.clone
+
+14:16:42.345 [info] Merging Dots in computation: region_3.4
+
+14:16:42.345 [info] Merging Dots in computation: region_7.8
+
+14:16:42.345 [info] Merging Dots in computation: region_11.12
+
+14:16:42.345 [info] Merging Dots in computation: region_15.16
+
+14:16:42.345 [info] Merging Dots in computation: region_19.20
+
+14:16:42.345 [info] Merging Dots in computation: region_23.24
+
+14:16:42.345 [info] Merging Dots in computation: region_30.31
+➡️ Step 65000 | Total: 2.4252 | FWD: 2.3901 | RETRO: 0.117 | bv_n: 13.73 | dv_n: 14.8
+💾 Checkpoint reached! Saving Step 65000...
+➡️ Step 65050 | Total: 2.3768 | FWD: 2.3438 | RETRO: 0.1101 | bv_n: 13.73 | dv_n: 14.8
+➡️ Step 65100 | Total: 2.4045 | FWD: 2.3726 | RETRO: 0.1063 | bv_n: 13.73 | dv_n: 14.8
+➡️ Step 65150 | Total: 2.3679 | FWD: 2.3399 | RETRO: 0.0934 | bv_n: 13.73 | dv_n: 14.8
+➡️ Step 65200 | Total: 2.4036 | FWD: 2.367 | RETRO: 0.122 | bv_n: 13.73 | dv_n: 14.8
+➡️ Step 65250 | Total: 2.3369 | FWD: 2.3085 | RETRO: 0.0948 | bv_n: 13.74 | dv_n: 14.81
+➡️ Step 65300 | Total: 2.4066 | FWD: 2.3711 | RETRO: 0.1183 | bv_n: 13.74 | dv_n: 14.81
+➡️ Step 65350 | Total: 2.4604 | FWD: 2.4226 | RETRO: 0.1259 | bv_n: 13.74 | dv_n: 14.81
+➡️ Step 65400 | Total: 2.2924 | FWD: 2.2676 | RETRO: 0.0825 | bv_n: 13.74 | dv_n: 14.81
+➡️ Step 65450 | Total: 2.284 | FWD: 2.261 | RETRO: 0.0768 | bv_n: 13.74 | dv_n: 14.81
+➡️ Step 65500 | Total: 2.3963 | FWD: 2.3665 | RETRO: 0.0995 | bv_n: 13.74 | dv_n: 14.82
+➡️ Step 65550 | Total: 2.2764 | FWD: 2.2507 | RETRO: 0.0858 | bv_n: 13.74 | dv_n: 14.82
+➡️ Step 65600 | Total: 2.3728 | FWD: 2.3509 | RETRO: 0.0729 | bv_n: 13.75 | dv_n: 14.82
+➡️ Step 65650 | Total: 2.3863 | FWD: 2.3561 | RETRO: 0.1007 | bv_n: 13.75 | dv_n: 14.82
+➡️ Step 65700 | Total: 2.3546 | FWD: 2.3205 | RETRO: 0.1139 | bv_n: 13.75 | dv_n: 14.83
+➡️ Step 65750 | Total: 2.2779 | FWD: 2.2538 | RETRO: 0.0802 | bv_n: 13.75 | dv_n: 14.83
+➡️ Step 65800 | Total: 2.3916 | FWD: 2.3576 | RETRO: 0.1136 | bv_n: 13.75 | dv_n: 14.83
+➡️ Step 65850 | Total: 2.2561 | FWD: 2.2339 | RETRO: 0.0743 | bv_n: 13.75 | dv_n: 14.83
+➡️ Step 65900 | Total: 2.4524 | FWD: 2.4227 | RETRO: 0.0989 | bv_n: 13.75 | dv_n: 14.83
+➡️ Step 65950 | Total: 2.3608 | FWD: 2.3296 | RETRO: 0.1039 | bv_n: 13.76 | dv_n: 14.84
+➡️ Step 66000 | Total: 2.2864 | FWD: 2.2588 | RETRO: 0.0922 | bv_n: 13.76 | dv_n: 14.84
+💾 Checkpoint reached! Saving Step 66000...
+➡️ Step 66050 | Total: 2.3607 | FWD: 2.3339 | RETRO: 0.0891 | bv_n: 13.76 | dv_n: 14.84
+➡️ Step 66100 | Total: 2.4267 | FWD: 2.3934 | RETRO: 0.111 | bv_n: 13.76 | dv_n: 14.84
+➡️ Step 66150 | Total: 2.3735 | FWD: 2.343 | RETRO: 0.1014 | bv_n: 13.76 | dv_n: 14.85
+➡️ Step 66200 | Total: 2.3218 | FWD: 2.2996 | RETRO: 0.074 | bv_n: 13.76 | dv_n: 14.85
+➡️ Step 66250 | Total: 2.4952 | FWD: 2.4577 | RETRO: 0.125 | bv_n: 13.76 | dv_n: 14.85
+➡️ Step 66300 | Total: 2.3759 | FWD: 2.3504 | RETRO: 0.0849 | bv_n: 13.77 | dv_n: 14.85
+➡️ Step 66350 | Total: 2.3284 | FWD: 2.2998 | RETRO: 0.0955 | bv_n: 13.77 | dv_n: 14.85
+➡️ Step 66400 | Total: 2.3273 | FWD: 2.3015 | RETRO: 0.086 | bv_n: 13.77 | dv_n: 14.86
+➡️ Step 66450 | Total: 2.3275 | FWD: 2.3038 | RETRO: 0.0791 | bv_n: 13.77 | dv_n: 14.86
+➡️ Step 66500 | Total: 2.4892 | FWD: 2.4508 | RETRO: 0.1282 | bv_n: 13.77 | dv_n: 14.86
+➡️ Step 66550 | Total: 2.3705 | FWD: 2.3448 | RETRO: 0.0857 | bv_n: 13.77 | dv_n: 14.86
+➡️ Step 66600 | Total: 2.3962 | FWD: 2.3632 | RETRO: 0.1097 | bv_n: 13.77 | dv_n: 14.87
+➡️ Step 66650 | Total: 2.3552 | FWD: 2.3367 | RETRO: 0.0616 | bv_n: 13.78 | dv_n: 14.87
+➡️ Step 66700 | Total: 2.2792 | FWD: 2.2555 | RETRO: 0.0788 | bv_n: 13.78 | dv_n: 14.87
+➡️ Step 66750 | Total: 2.3652 | FWD: 2.3346 | RETRO: 0.1021 | bv_n: 13.78 | dv_n: 14.87
+➡️ Step 66800 | Total: 2.3726 | FWD: 2.3364 | RETRO: 0.1208 | bv_n: 13.78 | dv_n: 14.88
+➡️ Step 66850 | Total: 2.4505 | FWD: 2.4186 | RETRO: 0.1064 | bv_n: 13.78 | dv_n: 14.88
+➡️ Step 66900 | Total: 2.3448 | FWD: 2.3162 | RETRO: 0.0954 | bv_n: 13.78 | dv_n: 14.88
+➡️ Step 66950 | Total: 2.5337 | FWD: 2.4787 | RETRO: 0.1834 | bv_n: 13.78 | dv_n: 14.88
+➡️ Step 67000 | Total: 2.3839 | FWD: 2.3532 | RETRO: 0.1023 | bv_n: 13.78 | dv_n: 14.88
+💾 Checkpoint reached! Saving Step 67000...
+➡️ Step 67050 | Total: 2.3484 | FWD: 2.3227 | RETRO: 0.0854 | bv_n: 13.79 | dv_n: 14.89
+➡️ Step 67100 | Total: 2.3666 | FWD: 2.3367 | RETRO: 0.0997 | bv_n: 13.79 | dv_n: 14.89
+➡️ Step 67150 | Total: 2.4924 | FWD: 2.4449 | RETRO: 0.1583 | bv_n: 13.79 | dv_n: 14.89
+➡️ Step 67200 | Total: 2.493 | FWD: 2.4516 | RETRO: 0.1381 | bv_n: 13.79 | dv_n: 14.89
+➡️ Step 67250 | Total: 2.4712 | FWD: 2.4227 | RETRO: 0.1614 | bv_n: 13.79 | dv_n: 14.9
+➡️ Step 67300 | Total: 2.2911 | FWD: 2.2646 | RETRO: 0.0882 | bv_n: 13.79 | dv_n: 14.9
+➡️ Step 67350 | Total: 2.3919 | FWD: 2.3626 | RETRO: 0.0978 | bv_n: 13.79 | dv_n: 14.9
+➡️ Step 67400 | Total: 2.3286 | FWD: 2.2993 | RETRO: 0.0976 | bv_n: 13.79 | dv_n: 14.9
+➡️ Step 67450 | Total: 2.3319 | FWD: 2.3056 | RETRO: 0.0875 | bv_n: 13.8 | dv_n: 14.9
+➡️ Step 67500 | Total: 2.4022 | FWD: 2.3725 | RETRO: 0.0988 | bv_n: 13.8 | dv_n: 14.91
+➡️ Step 67550 | Total: 2.3886 | FWD: 2.3628 | RETRO: 0.0862 | bv_n: 13.8 | dv_n: 14.91
+➡️ Step 67600 | Total: 2.3517 | FWD: 2.3243 | RETRO: 0.0914 | bv_n: 13.8 | dv_n: 14.91
+➡️ Step 67650 | Total: 2.3889 | FWD: 2.3508 | RETRO: 0.127 | bv_n: 13.8 | dv_n: 14.91
+➡️ Step 67700 | Total: 2.2953 | FWD: 2.2691 | RETRO: 0.0874 | bv_n: 13.8 | dv_n: 14.92
+➡️ Step 67750 | Total: 2.3932 | FWD: 2.3637 | RETRO: 0.0981 | bv_n: 13.8 | dv_n: 14.92
+➡️ Step 67800 | Total: 2.3997 | FWD: 2.3601 | RETRO: 0.1318 | bv_n: 13.8 | dv_n: 14.92
+➡️ Step 67850 | Total: 2.3845 | FWD: 2.3546 | RETRO: 0.0994 | bv_n: 13.81 | dv_n: 14.92
+➡️ Step 67900 | Total: 2.4727 | FWD: 2.4332 | RETRO: 0.1314 | bv_n: 13.81 | dv_n: 14.92
+➡️ Step 67950 | Total: 2.462 | FWD: 2.4194 | RETRO: 0.1422 | bv_n: 13.81 | dv_n: 14.93
+➡️ Step 68000 | Total: 2.3992 | FWD: 2.3626 | RETRO: 0.1219 | bv_n: 13.81 | dv_n: 14.93
+💾 Checkpoint reached! Saving Step 68000...
+➡️ Step 68050 | Total: 2.3281 | FWD: 2.3026 | RETRO: 0.085 | bv_n: 13.81 | dv_n: 14.93
+➡️ Step 68100 | Total: 2.4567 | FWD: 2.4186 | RETRO: 0.1269 | bv_n: 13.81 | dv_n: 14.93
+➡️ Step 68150 | Total: 2.4548 | FWD: 2.4188 | RETRO: 0.1198 | bv_n: 13.81 | dv_n: 14.93
+➡️ Step 68200 | Total: 2.3891 | FWD: 2.3576 | RETRO: 0.1052 | bv_n: 13.81 | dv_n: 14.94
+➡️ Step 68250 | Total: 2.413 | FWD: 2.3824 | RETRO: 0.1018 | bv_n: 13.82 | dv_n: 14.94
+➡️ Step 68300 | Total: 2.3838 | FWD: 2.3569 | RETRO: 0.0898 | bv_n: 13.82 | dv_n: 14.94
+➡️ Step 68350 | Total: 2.4599 | FWD: 2.4139 | RETRO: 0.1534 | bv_n: 13.82 | dv_n: 14.94
+➡️ Step 68400 | Total: 2.4274 | FWD: 2.3976 | RETRO: 0.0995 | bv_n: 13.82 | dv_n: 14.95
+➡️ Step 68450 | Total: 2.4773 | FWD: 2.4406 | RETRO: 0.1226 | bv_n: 13.82 | dv_n: 14.95
+➡️ Step 68500 | Total: 2.3922 | FWD: 2.3637 | RETRO: 0.0952 | bv_n: 13.82 | dv_n: 14.95
+➡️ Step 68550 | Total: 2.4159 | FWD: 2.377 | RETRO: 0.1295 | bv_n: 13.82 | dv_n: 14.95
+➡️ Step 68600 | Total: 2.4073 | FWD: 2.3755 | RETRO: 0.1059 | bv_n: 13.82 | dv_n: 14.95
+➡️ Step 68650 | Total: 2.4302 | FWD: 2.3995 | RETRO: 0.1023 | bv_n: 13.83 | dv_n: 14.96
+➡️ Step 68700 | Total: 2.3484 | FWD: 2.321 | RETRO: 0.0915 | bv_n: 13.83 | dv_n: 14.96
+➡️ Step 68750 | Total: 2.3301 | FWD: 2.301 | RETRO: 0.0971 | bv_n: 13.83 | dv_n: 14.96
+➡️ Step 68800 | Total: 2.3782 | FWD: 2.3509 | RETRO: 0.0913 | bv_n: 13.83 | dv_n: 14.96
+➡️ Step 68850 | Total: 2.3657 | FWD: 2.3369 | RETRO: 0.0961 | bv_n: 13.83 | dv_n: 14.96
+➡️ Step 68900 | Total: 2.5418 | FWD: 2.4937 | RETRO: 0.1603 | bv_n: 13.83 | dv_n: 14.97
+➡️ Step 68950 | Total: 2.3899 | FWD: 2.3597 | RETRO: 0.1008 | bv_n: 13.83 | dv_n: 14.97
+➡️ Step 69000 | Total: 2.4488 | FWD: 2.4153 | RETRO: 0.1118 | bv_n: 13.83 | dv_n: 14.97
+💾 Checkpoint reached! Saving Step 69000...
+➡️ Step 69050 | Total: 2.3034 | FWD: 2.2647 | RETRO: 0.1289 | bv_n: 13.83 | dv_n: 14.97
+➡️ Step 69100 | Total: 2.4257 | FWD: 2.3849 | RETRO: 0.136 | bv_n: 13.84 | dv_n: 14.97
+➡️ Step 69150 | Total: 2.4094 | FWD: 2.3784 | RETRO: 0.1033 | bv_n: 13.84 | dv_n: 14.98
+➡️ Step 69200 | Total: 2.3619 | FWD: 2.3285 | RETRO: 0.1113 | bv_n: 13.84 | dv_n: 14.98
+➡️ Step 69250 | Total: 2.3444 | FWD: 2.3143 | RETRO: 0.1003 | bv_n: 13.84 | dv_n: 14.98
+➡️ Step 69300 | Total: 2.4587 | FWD: 2.4279 | RETRO: 0.1027 | bv_n: 13.84 | dv_n: 14.98
+➡️ Step 69350 | Total: 2.2808 | FWD: 2.2575 | RETRO: 0.0775 | bv_n: 13.84 | dv_n: 14.98
+➡️ Step 69400 | Total: 2.4273 | FWD: 2.3971 | RETRO: 0.1007 | bv_n: 13.84 | dv_n: 14.99
+➡️ Step 69450 | Total: 2.4554 | FWD: 2.411 | RETRO: 0.1479 | bv_n: 13.84 | dv_n: 14.99
+➡️ Step 69500 | Total: 2.3065 | FWD: 2.275 | RETRO: 0.105 | bv_n: 13.84 | dv_n: 14.99
+➡️ Step 69550 | Total: 2.3664 | FWD: 2.3386 | RETRO: 0.0927 | bv_n: 13.85 | dv_n: 14.99
+➡️ Step 69600 | Total: 2.386 | FWD: 2.34 | RETRO: 0.1532 | bv_n: 13.85 | dv_n: 14.99
+➡️ Step 69650 | Total: 2.5862 | FWD: 2.5485 | RETRO: 0.1258 | bv_n: 13.85 | dv_n: 15.0
+➡️ Step 69700 | Total: 2.3701 | FWD: 2.3429 | RETRO: 0.0907 | bv_n: 13.85 | dv_n: 15.0
+➡️ Step 69750 | Total: 2.4998 | FWD: 2.454 | RETRO: 0.1525 | bv_n: 13.85 | dv_n: 15.0
+➡️ Step 69800 | Total: 2.451 | FWD: 2.4226 | RETRO: 0.0946 | bv_n: 13.85 | dv_n: 15.0
+➡️ Step 69850 | Total: 2.4498 | FWD: 2.4125 | RETRO: 0.1243 | bv_n: 13.85 | dv_n: 15.0
+➡️ Step 69900 | Total: 2.4434 | FWD: 2.4084 | RETRO: 0.1166 | bv_n: 13.85 | dv_n: 15.01
+➡️ Step 69950 | Total: 2.4423 | FWD: 2.4084 | RETRO: 0.1131 | bv_n: 13.85 | dv_n: 15.01
+➡️ Step 70000 | Total: 2.4738 | FWD: 2.4311 | RETRO: 0.1426 | bv_n: 13.86 | dv_n: 15.01
+💾 Checkpoint reached! Saving Step 70000...
+➡️ Step 70050 | Total: 2.4088 | FWD: 2.3797 | RETRO: 0.097 | bv_n: 13.86 | dv_n: 15.01
+➡️ Step 70100 | Total: 2.4641 | FWD: 2.4335 | RETRO: 0.1019 | bv_n: 13.86 | dv_n: 15.01
+➡️ Step 70150 | Total: 2.4758 | FWD: 2.4463 | RETRO: 0.0984 | bv_n: 13.86 | dv_n: 15.02
+➡️ Step 70200 | Total: 2.3473 | FWD: 2.3152 | RETRO: 0.107 | bv_n: 13.86 | dv_n: 15.02
+➡️ Step 70250 | Total: 2.427 | FWD: 2.38 | RETRO: 0.157 | bv_n: 13.86 | dv_n: 15.02
+➡️ Step 70300 | Total: 2.4577 | FWD: 2.4318 | RETRO: 0.0862 | bv_n: 13.86 | dv_n: 15.02
+➡️ Step 70350 | Total: 2.379 | FWD: 2.35 | RETRO: 0.0965 | bv_n: 13.86 | dv_n: 15.02
+➡️ Step 70400 | Total: 2.4019 | FWD: 2.3657 | RETRO: 0.1208 | bv_n: 13.86 | dv_n: 15.03
+➡️ Step 70450 | Total: 2.4524 | FWD: 2.4193 | RETRO: 0.1101 | bv_n: 13.86 | dv_n: 15.03
+➡️ Step 70500 | Total: 2.4093 | FWD: 2.3739 | RETRO: 0.118 | bv_n: 13.87 | dv_n: 15.03
+➡️ Step 70550 | Total: 2.3554 | FWD: 2.3268 | RETRO: 0.0952 | bv_n: 13.87 | dv_n: 15.03
+➡️ Step 70600 | Total: 2.4407 | FWD: 2.411 | RETRO: 0.0992 | bv_n: 13.87 | dv_n: 15.03
+➡️ Step 70650 | Total: 2.3913 | FWD: 2.3581 | RETRO: 0.1106 | bv_n: 13.87 | dv_n: 15.03
+➡️ Step 70700 | Total: 2.3076 | FWD: 2.2832 | RETRO: 0.0815 | bv_n: 13.87 | dv_n: 15.04
+➡️ Step 70750 | Total: 2.3418 | FWD: 2.309 | RETRO: 0.1094 | bv_n: 13.87 | dv_n: 15.04
+➡️ Step 70800 | Total: 2.3379 | FWD: 2.3134 | RETRO: 0.0817 | bv_n: 13.87 | dv_n: 15.04
+➡️ Step 70850 | Total: 2.3975 | FWD: 2.3696 | RETRO: 0.0928 | bv_n: 13.87 | dv_n: 15.04
+➡️ Step 70900 | Total: 2.4659 | FWD: 2.427 | RETRO: 0.1296 | bv_n: 13.87 | dv_n: 15.04
+➡️ Step 70950 | Total: 2.4419 | FWD: 2.3992 | RETRO: 0.1423 | bv_n: 13.87 | dv_n: 15.04
+➡️ Step 71000 | Total: 2.3841 | FWD: 2.3637 | RETRO: 0.0678 | bv_n: 13.88 | dv_n: 15.05
+💾 Checkpoint reached! Saving Step 71000...
+➡️ Step 71050 | Total: 2.4273 | FWD: 2.3921 | RETRO: 0.1173 | bv_n: 13.88 | dv_n: 15.05
+➡️ Step 71100 | Total: 2.4187 | FWD: 2.391 | RETRO: 0.0923 | bv_n: 13.88 | dv_n: 15.05
+➡️ Step 71150 | Total: 2.356 | FWD: 2.3311 | RETRO: 0.083 | bv_n: 13.88 | dv_n: 15.05
+➡️ Step 71200 | Total: 2.4656 | FWD: 2.4165 | RETRO: 0.1635 | bv_n: 13.88 | dv_n: 15.05
+➡️ Step 71250 | Total: 2.3719 | FWD: 2.3347 | RETRO: 0.1237 | bv_n: 13.88 | dv_n: 15.06
+➡️ Step 71300 | Total: 2.3427 | FWD: 2.3109 | RETRO: 0.1061 | bv_n: 13.88 | dv_n: 15.06
+➡️ Step 71350 | Total: 2.3703 | FWD: 2.338 | RETRO: 0.1076 | bv_n: 13.88 | dv_n: 15.06
+➡️ Step 71400 | Total: 2.4796 | FWD: 2.4431 | RETRO: 0.1215 | bv_n: 13.88 | dv_n: 15.06
+➡️ Step 71450 | Total: 2.3625 | FWD: 2.3382 | RETRO: 0.0809 | bv_n: 13.88 | dv_n: 15.06
+➡️ Step 71500 | Total: 2.3796 | FWD: 2.3555 | RETRO: 0.0803 | bv_n: 13.89 | dv_n: 15.06
+➡️ Step 71550 | Total: 2.3816 | FWD: 2.3517 | RETRO: 0.0995 | bv_n: 13.89 | dv_n: 15.07
+➡️ Step 71600 | Total: 2.3974 | FWD: 2.3585 | RETRO: 0.1297 | bv_n: 13.89 | dv_n: 15.07
+➡️ Step 71650 | Total: 2.4084 | FWD: 2.3745 | RETRO: 0.1133 | bv_n: 13.89 | dv_n: 15.07
+➡️ Step 71700 | Total: 2.3587 | FWD: 2.3138 | RETRO: 0.1497 | bv_n: 13.89 | dv_n: 15.07
+➡️ Step 71750 | Total: 2.4452 | FWD: 2.407 | RETRO: 0.1273 | bv_n: 13.89 | dv_n: 15.07
+➡️ Step 71800 | Total: 2.3627 | FWD: 2.3301 | RETRO: 0.1086 | bv_n: 13.89 | dv_n: 15.07
+➡️ Step 71850 | Total: 2.3835 | FWD: 2.3586 | RETRO: 0.0828 | bv_n: 13.89 | dv_n: 15.08
+➡️ Step 71900 | Total: 2.4079 | FWD: 2.3772 | RETRO: 0.1022 | bv_n: 13.89 | dv_n: 15.08
+➡️ Step 71950 | Total: 2.5447 | FWD: 2.4927 | RETRO: 0.1734 | bv_n: 13.89 | dv_n: 15.08
+➡️ Step 72000 | Total: 2.4225 | FWD: 2.3923 | RETRO: 0.1004 | bv_n: 13.89 | dv_n: 15.08
+💾 Checkpoint reached! Saving Step 72000...
+➡️ Step 72050 | Total: 2.3723 | FWD: 2.3509 | RETRO: 0.0714 | bv_n: 13.9 | dv_n: 15.08
+➡️ Step 72100 | Total: 2.3751 | FWD: 2.3489 | RETRO: 0.0871 | bv_n: 13.9 | dv_n: 15.08
+➡️ Step 72150 | Total: 2.2961 | FWD: 2.272 | RETRO: 0.0803 | bv_n: 13.9 | dv_n: 15.08
+➡️ Step 72200 | Total: 2.3909 | FWD: 2.3698 | RETRO: 0.0702 | bv_n: 13.9 | dv_n: 15.09
+➡️ Step 72250 | Total: 2.4227 | FWD: 2.3897 | RETRO: 0.1102 | bv_n: 13.9 | dv_n: 15.09
+➡️ Step 72300 | Total: 2.4085 | FWD: 2.3796 | RETRO: 0.0963 | bv_n: 13.9 | dv_n: 15.09
+➡️ Step 72350 | Total: 2.33 | FWD: 2.3016 | RETRO: 0.0945 | bv_n: 13.9 | dv_n: 15.09
+➡️ Step 72400 | Total: 2.4479 | FWD: 2.4182 | RETRO: 0.0992 | bv_n: 13.9 | dv_n: 15.09
+➡️ Step 72450 | Total: 2.3465 | FWD: 2.3112 | RETRO: 0.1176 | bv_n: 13.9 | dv_n: 15.09
+➡️ Step 72500 | Total: 2.3396 | FWD: 2.3152 | RETRO: 0.0813 | bv_n: 13.9 | dv_n: 15.1
+➡️ Step 72550 | Total: 2.4417 | FWD: 2.4022 | RETRO: 0.1317 | bv_n: 13.9 | dv_n: 15.1
+➡️ Step 72600 | Total: 2.3049 | FWD: 2.2803 | RETRO: 0.0822 | bv_n: 13.91 | dv_n: 15.1
+➡️ Step 72650 | Total: 2.3799 | FWD: 2.3508 | RETRO: 0.0971 | bv_n: 13.91 | dv_n: 15.1
+➡️ Step 72700 | Total: 2.4407 | FWD: 2.3947 | RETRO: 0.1532 | bv_n: 13.91 | dv_n: 15.1
+➡️ Step 72750 | Total: 2.4374 | FWD: 2.4033 | RETRO: 0.1135 | bv_n: 13.91 | dv_n: 15.1
+➡️ Step 72800 | Total: 2.4643 | FWD: 2.423 | RETRO: 0.1375 | bv_n: 13.91 | dv_n: 15.1
+➡️ Step 72850 | Total: 2.3247 | FWD: 2.2872 | RETRO: 0.1249 | bv_n: 13.91 | dv_n: 15.11
+➡️ Step 72900 | Total: 2.4429 | FWD: 2.4066 | RETRO: 0.121 | bv_n: 13.91 | dv_n: 15.11
+➡️ Step 72950 | Total: 2.3678 | FWD: 2.3399 | RETRO: 0.093 | bv_n: 13.91 | dv_n: 15.11
+➡️ Step 73000 | Total: 2.4459 | FWD: 2.4135 | RETRO: 0.1079 | bv_n: 13.91 | dv_n: 15.11
+💾 Checkpoint reached! Saving Step 73000...
+➡️ Step 73050 | Total: 2.4405 | FWD: 2.4038 | RETRO: 0.1225 | bv_n: 13.91 | dv_n: 15.11
+➡️ Step 73100 | Total: 2.3889 | FWD: 2.3581 | RETRO: 0.1025 | bv_n: 13.91 | dv_n: 15.11
+➡️ Step 73150 | Total: 2.4548 | FWD: 2.4177 | RETRO: 0.1238 | bv_n: 13.91 | dv_n: 15.11
+➡️ Step 73200 | Total: 2.419 | FWD: 2.3888 | RETRO: 0.1006 | bv_n: 13.92 | dv_n: 15.12
+➡️ Step 73250 | Total: 2.374 | FWD: 2.3514 | RETRO: 0.0752 | bv_n: 13.92 | dv_n: 15.12
+➡️ Step 73300 | Total: 2.3893 | FWD: 2.3603 | RETRO: 0.0968 | bv_n: 13.92 | dv_n: 15.12
+➡️ Step 73350 | Total: 2.3398 | FWD: 2.3192 | RETRO: 0.0689 | bv_n: 13.92 | dv_n: 15.12
+➡️ Step 73400 | Total: 2.4289 | FWD: 2.3998 | RETRO: 0.0971 | bv_n: 13.92 | dv_n: 15.12
+➡️ Step 73450 | Total: 2.4049 | FWD: 2.3536 | RETRO: 0.171 | bv_n: 13.92 | dv_n: 15.12
+➡️ Step 73500 | Total: 2.4264 | FWD: 2.3976 | RETRO: 0.096 | bv_n: 13.92 | dv_n: 15.12
+➡️ Step 73550 | Total: 2.4461 | FWD: 2.4083 | RETRO: 0.1262 | bv_n: 13.92 | dv_n: 15.13
+➡️ Step 73600 | Total: 2.3429 | FWD: 2.3174 | RETRO: 0.0852 | bv_n: 13.92 | dv_n: 15.13
+➡️ Step 73650 | Total: 2.4433 | FWD: 2.41 | RETRO: 0.1111 | bv_n: 13.92 | dv_n: 15.13
+➡️ Step 73700 | Total: 2.343 | FWD: 2.3135 | RETRO: 0.0983 | bv_n: 13.92 | dv_n: 15.13
+➡️ Step 73750 | Total: 2.4481 | FWD: 2.4179 | RETRO: 0.1009 | bv_n: 13.92 | dv_n: 15.13
+➡️ Step 73800 | Total: 2.4312 | FWD: 2.404 | RETRO: 0.0907 | bv_n: 13.92 | dv_n: 15.13
+➡️ Step 73850 | Total: 2.4341 | FWD: 2.4014 | RETRO: 0.109 | bv_n: 13.93 | dv_n: 15.13
+➡️ Step 73900 | Total: 2.3628 | FWD: 2.3344 | RETRO: 0.0947 | bv_n: 13.93 | dv_n: 15.13
+➡️ Step 73950 | Total: 2.3992 | FWD: 2.365 | RETRO: 0.1142 | bv_n: 13.93 | dv_n: 15.14
+➡️ Step 74000 | Total: 2.4272 | FWD: 2.39 | RETRO: 0.1239 | bv_n: 13.93 | dv_n: 15.14
+💾 Checkpoint reached! Saving Step 74000...
+➡️ Step 74050 | Total: 2.4081 | FWD: 2.377 | RETRO: 0.1036 | bv_n: 13.93 | dv_n: 15.14
+➡️ Step 74100 | Total: 2.4091 | FWD: 2.3781 | RETRO: 0.1033 | bv_n: 13.93 | dv_n: 15.14
+➡️ Step 74150 | Total: 2.3734 | FWD: 2.339 | RETRO: 0.1147 | bv_n: 13.93 | dv_n: 15.14
+➡️ Step 74200 | Total: 2.4053 | FWD: 2.3632 | RETRO: 0.1404 | bv_n: 13.93 | dv_n: 15.14
+➡️ Step 74250 | Total: 2.4384 | FWD: 2.4049 | RETRO: 0.1115 | bv_n: 13.93 | dv_n: 15.14
+➡️ Step 74300 | Total: 2.3894 | FWD: 2.3549 | RETRO: 0.1152 | bv_n: 13.93 | dv_n: 15.14
+➡️ Step 74350 | Total: 2.38 | FWD: 2.3539 | RETRO: 0.0872 | bv_n: 13.93 | dv_n: 15.15
+➡️ Step 74400 | Total: 2.4124 | FWD: 2.3762 | RETRO: 0.1206 | bv_n: 13.93 | dv_n: 15.15
+➡️ Step 74450 | Total: 2.5486 | FWD: 2.5081 | RETRO: 0.135 | bv_n: 13.93 | dv_n: 15.15
+➡️ Step 74500 | Total: 2.3436 | FWD: 2.3144 | RETRO: 0.0974 | bv_n: 13.94 | dv_n: 15.15
+➡️ Step 74550 | Total: 2.3523 | FWD: 2.3276 | RETRO: 0.0824 | bv_n: 13.94 | dv_n: 15.15
+➡️ Step 74600 | Total: 2.3506 | FWD: 2.3227 | RETRO: 0.0929 | bv_n: 13.94 | dv_n: 15.15
+➡️ Step 74650 | Total: 2.3944 | FWD: 2.3675 | RETRO: 0.0897 | bv_n: 13.94 | dv_n: 15.15
+➡️ Step 74700 | Total: 2.455 | FWD: 2.4168 | RETRO: 0.1273 | bv_n: 13.94 | dv_n: 15.15
+➡️ Step 74750 | Total: 2.308 | FWD: 2.2847 | RETRO: 0.0776 | bv_n: 13.94 | dv_n: 15.15
+➡️ Step 74800 | Total: 2.4481 | FWD: 2.4168 | RETRO: 0.1044 | bv_n: 13.94 | dv_n: 15.16
+➡️ Step 74850 | Total: 2.4647 | FWD: 2.4318 | RETRO: 0.1097 | bv_n: 13.94 | dv_n: 15.16
+➡️ Step 74900 | Total: 2.3335 | FWD: 2.3109 | RETRO: 0.0752 | bv_n: 13.94 | dv_n: 15.16
+➡️ Step 74950 | Total: 2.4104 | FWD: 2.3755 | RETRO: 0.1163 | bv_n: 13.94 | dv_n: 15.16
+➡️ Step 75000 | Total: 2.3928 | FWD: 2.3619 | RETRO: 0.1029 | bv_n: 13.94 | dv_n: 15.16
+💾 Checkpoint reached! Saving Step 75000...
+➡️ Step 75050 | Total: 2.4776 | FWD: 2.4393 | RETRO: 0.1278 | bv_n: 13.94 | dv_n: 15.16
+➡️ Step 75100 | Total: 2.4216 | FWD: 2.3906 | RETRO: 0.1035 | bv_n: 13.94 | dv_n: 15.16
+➡️ Step 75150 | Total: 2.4589 | FWD: 2.4217 | RETRO: 0.1241 | bv_n: 13.94 | dv_n: 15.16
+➡️ Step 75200 | Total: 2.3533 | FWD: 2.3258 | RETRO: 0.0918 | bv_n: 13.95 | dv_n: 15.16
+➡️ Step 75250 | Total: 2.3703 | FWD: 2.3374 | RETRO: 0.1097 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75300 | Total: 2.4783 | FWD: 2.4366 | RETRO: 0.1389 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75350 | Total: 2.3838 | FWD: 2.3576 | RETRO: 0.0872 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75400 | Total: 2.4268 | FWD: 2.3929 | RETRO: 0.1127 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75450 | Total: 2.4898 | FWD: 2.4517 | RETRO: 0.1268 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75500 | Total: 2.4888 | FWD: 2.4466 | RETRO: 0.1407 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75550 | Total: 2.3484 | FWD: 2.3188 | RETRO: 0.0987 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75600 | Total: 2.3749 | FWD: 2.3289 | RETRO: 0.1533 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75650 | Total: 2.3969 | FWD: 2.3577 | RETRO: 0.1305 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75700 | Total: 2.3196 | FWD: 2.2861 | RETRO: 0.1116 | bv_n: 13.95 | dv_n: 15.17
+➡️ Step 75750 | Total: 2.429 | FWD: 2.3965 | RETRO: 0.1083 | bv_n: 13.95 | dv_n: 15.18
+➡️ Step 75800 | Total: 2.4536 | FWD: 2.416 | RETRO: 0.1253 | bv_n: 13.95 | dv_n: 15.18
+➡️ Step 75850 | Total: 2.4138 | FWD: 2.3821 | RETRO: 0.1056 | bv_n: 13.95 | dv_n: 15.18
+➡️ Step 75900 | Total: 2.4688 | FWD: 2.4268 | RETRO: 0.1402 | bv_n: 13.95 | dv_n: 15.18
+➡️ Step 75950 | Total: 2.416 | FWD: 2.3804 | RETRO: 0.1187 | bv_n: 13.95 | dv_n: 15.18
+➡️ Step 76000 | Total: 2.4161 | FWD: 2.3837 | RETRO: 0.1079 | bv_n: 13.96 | dv_n: 15.18
+💾 Checkpoint reached! Saving Step 76000...
+➡️ Step 76050 | Total: 2.4478 | FWD: 2.4139 | RETRO: 0.1128 | bv_n: 13.96 | dv_n: 15.18
+➡️ Step 76100 | Total: 2.4287 | FWD: 2.3998 | RETRO: 0.0962 | bv_n: 13.96 | dv_n: 15.18
+➡️ Step 76150 | Total: 2.3971 | FWD: 2.3674 | RETRO: 0.0989 | bv_n: 13.96 | dv_n: 15.18
+➡️ Step 76200 | Total: 2.4505 | FWD: 2.414 | RETRO: 0.1215 | bv_n: 13.96 | dv_n: 15.18
+➡️ Step 76250 | Total: 2.3845 | FWD: 2.3491 | RETRO: 0.1179 | bv_n: 13.96 | dv_n: 15.18
+➡️ Step 76300 | Total: 2.4469 | FWD: 2.4136 | RETRO: 0.1111 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76350 | Total: 2.3668 | FWD: 2.3241 | RETRO: 0.1425 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76400 | Total: 2.4451 | FWD: 2.4097 | RETRO: 0.1181 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76450 | Total: 2.3486 | FWD: 2.3288 | RETRO: 0.0658 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76500 | Total: 2.4889 | FWD: 2.451 | RETRO: 0.1262 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76550 | Total: 2.3896 | FWD: 2.3562 | RETRO: 0.1112 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76600 | Total: 2.4247 | FWD: 2.3894 | RETRO: 0.1177 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76650 | Total: 2.4247 | FWD: 2.3911 | RETRO: 0.1121 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76700 | Total: 2.4506 | FWD: 2.3996 | RETRO: 0.1699 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76750 | Total: 2.3487 | FWD: 2.3172 | RETRO: 0.1051 | bv_n: 13.96 | dv_n: 15.19
+➡️ Step 76800 | Total: 2.3451 | FWD: 2.3113 | RETRO: 0.1125 | bv_n: 13.97 | dv_n: 15.19
+➡️ Step 76850 | Total: 2.4368 | FWD: 2.4008 | RETRO: 0.1198 | bv_n: 13.97 | dv_n: 15.19
+➡️ Step 76900 | Total: 2.3975 | FWD: 2.3603 | RETRO: 0.1242 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 76950 | Total: 2.411 | FWD: 2.3711 | RETRO: 0.133 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77000 | Total: 2.4511 | FWD: 2.4034 | RETRO: 0.1589 | bv_n: 13.97 | dv_n: 15.2
+💾 Checkpoint reached! Saving Step 77000...
+➡️ Step 77050 | Total: 2.4887 | FWD: 2.4494 | RETRO: 0.1308 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77100 | Total: 2.3839 | FWD: 2.3486 | RETRO: 0.1176 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77150 | Total: 2.4673 | FWD: 2.4226 | RETRO: 0.1491 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77200 | Total: 2.4255 | FWD: 2.395 | RETRO: 0.1017 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77250 | Total: 2.4124 | FWD: 2.3821 | RETRO: 0.101 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77300 | Total: 2.4118 | FWD: 2.3791 | RETRO: 0.1091 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77350 | Total: 2.4261 | FWD: 2.3907 | RETRO: 0.118 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77400 | Total: 2.4107 | FWD: 2.3701 | RETRO: 0.1354 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77450 | Total: 2.4903 | FWD: 2.4479 | RETRO: 0.1414 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77500 | Total: 2.3505 | FWD: 2.3146 | RETRO: 0.1197 | bv_n: 13.97 | dv_n: 15.2
+➡️ Step 77550 | Total: 2.4393 | FWD: 2.4063 | RETRO: 0.1101 | bv_n: 13.97 | dv_n: 15.21
+➡️ Step 77600 | Total: 2.52 | FWD: 2.4566 | RETRO: 0.2114 | bv_n: 13.97 | dv_n: 15.21
+➡️ Step 77650 | Total: 2.3337 | FWD: 2.3047 | RETRO: 0.0966 | bv_n: 13.97 | dv_n: 15.21
+➡️ Step 77700 | Total: 2.3947 | FWD: 2.3655 | RETRO: 0.0974 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 77750 | Total: 2.4538 | FWD: 2.416 | RETRO: 0.126 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 77800 | Total: 2.5354 | FWD: 2.4932 | RETRO: 0.1407 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 77850 | Total: 2.431 | FWD: 2.3818 | RETRO: 0.1639 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 77900 | Total: 2.5135 | FWD: 2.4657 | RETRO: 0.1593 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 77950 | Total: 2.406 | FWD: 2.3748 | RETRO: 0.1038 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 78000 | Total: 2.3317 | FWD: 2.2989 | RETRO: 0.1092 | bv_n: 13.98 | dv_n: 15.21
+💾 Checkpoint reached! Saving Step 78000...
+➡️ Step 78050 | Total: 2.4665 | FWD: 2.4303 | RETRO: 0.1207 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 78100 | Total: 2.4524 | FWD: 2.4093 | RETRO: 0.1437 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 78150 | Total: 2.5391 | FWD: 2.4989 | RETRO: 0.1341 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 78200 | Total: 2.3655 | FWD: 2.339 | RETRO: 0.0883 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 78250 | Total: 2.4312 | FWD: 2.4045 | RETRO: 0.0888 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 78300 | Total: 2.4051 | FWD: 2.3713 | RETRO: 0.1126 | bv_n: 13.98 | dv_n: 15.21
+➡️ Step 78350 | Total: 2.4823 | FWD: 2.4347 | RETRO: 0.1586 | bv_n: 13.98 | dv_n: 15.22
+➡️ Step 78400 | Total: 2.4521 | FWD: 2.4058 | RETRO: 0.1543 | bv_n: 13.98 | dv_n: 15.22
+➡️ Step 78450 | Total: 2.4166 | FWD: 2.3869 | RETRO: 0.099 | bv_n: 13.98 | dv_n: 15.22
+➡️ Step 78500 | Total: 2.4247 | FWD: 2.3844 | RETRO: 0.1341 | bv_n: 13.98 | dv_n: 15.22
+➡️ Step 78550 | Total: 2.3778 | FWD: 2.3458 | RETRO: 0.1066 | bv_n: 13.98 | dv_n: 15.22
+➡️ Step 78600 | Total: 2.3705 | FWD: 2.3462 | RETRO: 0.0808 | bv_n: 13.98 | dv_n: 15.22
+➡️ Step 78650 | Total: 2.3785 | FWD: 2.3407 | RETRO: 0.126 | bv_n: 13.98 | dv_n: 15.22
+➡️ Step 78700 | Total: 2.4187 | FWD: 2.3866 | RETRO: 0.1068 | bv_n: 13.98 | dv_n: 15.22
+➡️ Step 78750 | Total: 2.444 | FWD: 2.4091 | RETRO: 0.1163 | bv_n: 13.99 | dv_n: 15.22
+➡️ Step 78800 | Total: 2.4674 | FWD: 2.4183 | RETRO: 0.1636 | bv_n: 13.99 | dv_n: 15.22
+➡️ Step 78850 | Total: 2.4941 | FWD: 2.4524 | RETRO: 0.1389 | bv_n: 13.99 | dv_n: 15.22
+➡️ Step 78900 | Total: 2.4052 | FWD: 2.3689 | RETRO: 0.121 | bv_n: 13.99 | dv_n: 15.22
+➡️ Step 78950 | Total: 2.5814 | FWD: 2.5299 | RETRO: 0.1719 | bv_n: 13.99 | dv_n: 15.22
+➡️ Step 79000 | Total: 2.4428 | FWD: 2.404 | RETRO: 0.1294 | bv_n: 13.99 | dv_n: 15.22
+💾 Checkpoint reached! Saving Step 79000...
+➡️ Step 79050 | Total: 2.4753 | FWD: 2.427 | RETRO: 0.1609 | bv_n: 13.99 | dv_n: 15.22
+➡️ Step 79100 | Total: 2.3981 | FWD: 2.3638 | RETRO: 0.1143 | bv_n: 13.99 | dv_n: 15.22
+➡️ Step 79150 | Total: 2.4672 | FWD: 2.4227 | RETRO: 0.1483 | bv_n: 13.99 | dv_n: 15.22
+➡️ Step 79200 | Total: 2.4284 | FWD: 2.3892 | RETRO: 0.1307 | bv_n: 13.99 | dv_n: 15.22
+➡️ Step 79250 | Total: 2.4311 | FWD: 2.3958 | RETRO: 0.1176 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79300 | Total: 2.3762 | FWD: 2.341 | RETRO: 0.1174 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79350 | Total: 2.4082 | FWD: 2.3684 | RETRO: 0.1324 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79400 | Total: 2.4526 | FWD: 2.4089 | RETRO: 0.1457 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79450 | Total: 2.4637 | FWD: 2.4202 | RETRO: 0.1451 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79500 | Total: 2.5086 | FWD: 2.4626 | RETRO: 0.1533 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79550 | Total: 2.4235 | FWD: 2.3854 | RETRO: 0.1272 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79600 | Total: 2.4038 | FWD: 2.3698 | RETRO: 0.1134 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79650 | Total: 2.4381 | FWD: 2.3964 | RETRO: 0.1389 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79700 | Total: 2.4315 | FWD: 2.4044 | RETRO: 0.0903 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79750 | Total: 2.4084 | FWD: 2.3688 | RETRO: 0.1321 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79800 | Total: 2.4476 | FWD: 2.4036 | RETRO: 0.1467 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79850 | Total: 2.4664 | FWD: 2.4155 | RETRO: 0.1694 | bv_n: 13.99 | dv_n: 15.23
+➡️ Step 79900 | Total: 2.4185 | FWD: 2.3815 | RETRO: 0.1233 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 79950 | Total: 2.4699 | FWD: 2.4219 | RETRO: 0.1599 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80000 | Total: 2.4534 | FWD: 2.4063 | RETRO: 0.1569 | bv_n: 14.0 | dv_n: 15.23
+💾 Checkpoint reached! Saving Step 80000...
+➡️ Step 80050 | Total: 2.5261 | FWD: 2.478 | RETRO: 0.1604 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80100 | Total: 2.402 | FWD: 2.3663 | RETRO: 0.1188 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80150 | Total: 2.4461 | FWD: 2.4043 | RETRO: 0.1394 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80200 | Total: 2.5253 | FWD: 2.4585 | RETRO: 0.2225 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80250 | Total: 2.423 | FWD: 2.3787 | RETRO: 0.1474 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80300 | Total: 2.3992 | FWD: 2.3581 | RETRO: 0.1371 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80350 | Total: 2.4665 | FWD: 2.4258 | RETRO: 0.1356 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80400 | Total: 2.3902 | FWD: 2.3418 | RETRO: 0.1616 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80450 | Total: 2.4109 | FWD: 2.3729 | RETRO: 0.1269 | bv_n: 14.0 | dv_n: 15.23
+➡️ Step 80500 | Total: 2.4196 | FWD: 2.3742 | RETRO: 0.1513 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 80550 | Total: 2.5091 | FWD: 2.4619 | RETRO: 0.1575 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 80600 | Total: 2.6102 | FWD: 2.5413 | RETRO: 0.2294 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 80650 | Total: 2.4453 | FWD: 2.4073 | RETRO: 0.1265 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 80700 | Total: 2.3536 | FWD: 2.3153 | RETRO: 0.1278 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 80750 | Total: 2.4055 | FWD: 2.368 | RETRO: 0.125 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 80800 | Total: 2.3865 | FWD: 2.3343 | RETRO: 0.1741 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 80850 | Total: 2.4927 | FWD: 2.4496 | RETRO: 0.1436 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 80900 | Total: 2.4505 | FWD: 2.4138 | RETRO: 0.1225 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 80950 | Total: 2.5366 | FWD: 2.4838 | RETRO: 0.1758 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 81000 | Total: 2.4963 | FWD: 2.4552 | RETRO: 0.1368 | bv_n: 14.0 | dv_n: 15.24
+💾 Checkpoint reached! Saving Step 81000...
+➡️ Step 81050 | Total: 2.3923 | FWD: 2.3562 | RETRO: 0.1201 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 81100 | Total: 2.585 | FWD: 2.5169 | RETRO: 0.2271 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 81150 | Total: 2.5778 | FWD: 2.4974 | RETRO: 0.2679 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 81200 | Total: 2.4186 | FWD: 2.3676 | RETRO: 0.1699 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 81250 | Total: 2.5045 | FWD: 2.4402 | RETRO: 0.2145 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 81300 | Total: 2.4383 | FWD: 2.393 | RETRO: 0.151 | bv_n: 14.0 | dv_n: 15.24
+➡️ Step 81350 | Total: 2.4428 | FWD: 2.3955 | RETRO: 0.1577 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81400 | Total: 2.4169 | FWD: 2.3706 | RETRO: 0.1546 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81450 | Total: 2.4289 | FWD: 2.3695 | RETRO: 0.1981 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81500 | Total: 2.5188 | FWD: 2.4661 | RETRO: 0.1756 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81550 | Total: 2.5939 | FWD: 2.5281 | RETRO: 0.2193 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81600 | Total: 2.4998 | FWD: 2.4378 | RETRO: 0.2068 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81650 | Total: 2.4749 | FWD: 2.4127 | RETRO: 0.2073 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81700 | Total: 2.4742 | FWD: 2.4286 | RETRO: 0.1518 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81750 | Total: 2.4981 | FWD: 2.4485 | RETRO: 0.1654 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81800 | Total: 2.5832 | FWD: 2.5313 | RETRO: 0.1731 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81850 | Total: 2.457 | FWD: 2.4077 | RETRO: 0.1641 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81900 | Total: 2.5854 | FWD: 2.5347 | RETRO: 0.169 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 81950 | Total: 2.5481 | FWD: 2.4849 | RETRO: 0.2106 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 82000 | Total: 2.4786 | FWD: 2.4211 | RETRO: 0.1915 | bv_n: 14.01 | dv_n: 15.24
+💾 Checkpoint reached! Saving Step 82000...
+➡️ Step 82050 | Total: 2.5542 | FWD: 2.4777 | RETRO: 0.2549 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 82100 | Total: 2.5157 | FWD: 2.4487 | RETRO: 0.2235 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 82150 | Total: 2.5167 | FWD: 2.4513 | RETRO: 0.218 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 82200 | Total: 2.559 | FWD: 2.4902 | RETRO: 0.2293 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 82250 | Total: 2.4643 | FWD: 2.41 | RETRO: 0.181 | bv_n: 14.01 | dv_n: 15.24
+➡️ Step 82300 | Total: 2.5126 | FWD: 2.4519 | RETRO: 0.2026 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82350 | Total: 2.5192 | FWD: 2.4478 | RETRO: 0.2381 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82400 | Total: 2.5032 | FWD: 2.447 | RETRO: 0.1872 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82450 | Total: 2.5695 | FWD: 2.5053 | RETRO: 0.2141 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82500 | Total: 2.5067 | FWD: 2.45 | RETRO: 0.1891 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82550 | Total: 2.5031 | FWD: 2.4358 | RETRO: 0.2243 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82600 | Total: 2.4404 | FWD: 2.3868 | RETRO: 0.1786 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82650 | Total: 2.5712 | FWD: 2.4978 | RETRO: 0.2448 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82700 | Total: 2.5538 | FWD: 2.4893 | RETRO: 0.2152 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82750 | Total: 2.551 | FWD: 2.4855 | RETRO: 0.2184 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82800 | Total: 2.491 | FWD: 2.429 | RETRO: 0.2066 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82850 | Total: 2.5869 | FWD: 2.5089 | RETRO: 0.2601 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82900 | Total: 2.5455 | FWD: 2.4745 | RETRO: 0.2366 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 82950 | Total: 2.4689 | FWD: 2.4048 | RETRO: 0.2136 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 83000 | Total: 2.5071 | FWD: 2.4326 | RETRO: 0.2483 | bv_n: 14.01 | dv_n: 15.25
+💾 Checkpoint reached! Saving Step 83000...
+➡️ Step 83050 | Total: 2.4767 | FWD: 2.4208 | RETRO: 0.1863 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 83100 | Total: 2.5074 | FWD: 2.4478 | RETRO: 0.1985 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 83150 | Total: 2.6663 | FWD: 2.5966 | RETRO: 0.2324 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 83200 | Total: 2.5545 | FWD: 2.4814 | RETRO: 0.2436 | bv_n: 14.01 | dv_n: 15.25
+➡️ Step 83250 | Total: 2.6012 | FWD: 2.5291 | RETRO: 0.2403 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83300 | Total: 2.6406 | FWD: 2.5614 | RETRO: 0.2641 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83350 | Total: 2.5849 | FWD: 2.5181 | RETRO: 0.2226 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83400 | Total: 2.5481 | FWD: 2.4753 | RETRO: 0.2425 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83450 | Total: 2.5894 | FWD: 2.5023 | RETRO: 0.2905 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83500 | Total: 2.5944 | FWD: 2.5176 | RETRO: 0.2561 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83550 | Total: 2.5399 | FWD: 2.4572 | RETRO: 0.2756 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83600 | Total: 2.507 | FWD: 2.4299 | RETRO: 0.2567 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83650 | Total: 2.5288 | FWD: 2.4521 | RETRO: 0.2559 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83700 | Total: 2.5592 | FWD: 2.4698 | RETRO: 0.298 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83750 | Total: 2.6767 | FWD: 2.5897 | RETRO: 0.2902 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83800 | Total: 2.5492 | FWD: 2.4728 | RETRO: 0.2548 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83850 | Total: 2.5686 | FWD: 2.49 | RETRO: 0.2618 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83900 | Total: 2.6123 | FWD: 2.5279 | RETRO: 0.2813 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 83950 | Total: 2.606 | FWD: 2.5189 | RETRO: 0.2906 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84000 | Total: 2.5259 | FWD: 2.4532 | RETRO: 0.2424 | bv_n: 14.02 | dv_n: 15.25
+💾 Checkpoint reached! Saving Step 84000...
+➡️ Step 84050 | Total: 2.5514 | FWD: 2.4731 | RETRO: 0.2611 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84100 | Total: 2.6293 | FWD: 2.5411 | RETRO: 0.2939 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84150 | Total: 2.5652 | FWD: 2.4865 | RETRO: 0.2624 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84200 | Total: 2.5919 | FWD: 2.4935 | RETRO: 0.3278 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84250 | Total: 2.6794 | FWD: 2.5735 | RETRO: 0.3529 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84300 | Total: 2.5139 | FWD: 2.4184 | RETRO: 0.3182 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84350 | Total: 2.5991 | FWD: 2.4951 | RETRO: 0.3468 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84400 | Total: 2.6357 | FWD: 2.5284 | RETRO: 0.3578 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84450 | Total: 2.5263 | FWD: 2.4273 | RETRO: 0.3299 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84500 | Total: 2.6606 | FWD: 2.5507 | RETRO: 0.3664 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84550 | Total: 2.6418 | FWD: 2.5436 | RETRO: 0.3272 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84600 | Total: 2.556 | FWD: 2.4627 | RETRO: 0.311 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84650 | Total: 2.7057 | FWD: 2.595 | RETRO: 0.3688 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84700 | Total: 2.668 | FWD: 2.5562 | RETRO: 0.3729 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84750 | Total: 2.5785 | FWD: 2.4837 | RETRO: 0.3158 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84800 | Total: 2.697 | FWD: 2.5852 | RETRO: 0.3726 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84850 | Total: 2.6839 | FWD: 2.5624 | RETRO: 0.4052 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84900 | Total: 2.6535 | FWD: 2.5489 | RETRO: 0.3486 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 84950 | Total: 2.6934 | FWD: 2.5816 | RETRO: 0.3726 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85000 | Total: 2.6869 | FWD: 2.577 | RETRO: 0.3664 | bv_n: 14.02 | dv_n: 15.25
+💾 Checkpoint reached! Saving Step 85000...
+➡️ Step 85050 | Total: 2.585 | FWD: 2.4815 | RETRO: 0.3452 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85100 | Total: 2.5761 | FWD: 2.478 | RETRO: 0.3269 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85150 | Total: 2.5857 | FWD: 2.4824 | RETRO: 0.3446 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85200 | Total: 2.6331 | FWD: 2.5192 | RETRO: 0.3798 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85250 | Total: 2.6743 | FWD: 2.5475 | RETRO: 0.4228 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85300 | Total: 2.6423 | FWD: 2.5289 | RETRO: 0.3781 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85350 | Total: 2.6928 | FWD: 2.5541 | RETRO: 0.4624 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85400 | Total: 2.6939 | FWD: 2.5628 | RETRO: 0.4368 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85450 | Total: 2.6521 | FWD: 2.5288 | RETRO: 0.4111 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85500 | Total: 2.6362 | FWD: 2.5091 | RETRO: 0.4239 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85550 | Total: 2.6643 | FWD: 2.5359 | RETRO: 0.428 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85600 | Total: 2.6998 | FWD: 2.5684 | RETRO: 0.438 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85650 | Total: 2.6798 | FWD: 2.5584 | RETRO: 0.4047 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85700 | Total: 2.6491 | FWD: 2.5271 | RETRO: 0.4067 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85750 | Total: 2.6941 | FWD: 2.5663 | RETRO: 0.426 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85800 | Total: 2.752 | FWD: 2.5879 | RETRO: 0.547 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85850 | Total: 2.6666 | FWD: 2.5255 | RETRO: 0.4701 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85900 | Total: 2.7869 | FWD: 2.6198 | RETRO: 0.5568 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 85950 | Total: 2.7365 | FWD: 2.5909 | RETRO: 0.4853 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86000 | Total: 2.7719 | FWD: 2.6239 | RETRO: 0.4931 | bv_n: 14.02 | dv_n: 15.25
+💾 Checkpoint reached! Saving Step 86000...
+➡️ Step 86050 | Total: 2.6451 | FWD: 2.5049 | RETRO: 0.4674 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86100 | Total: 2.7512 | FWD: 2.6027 | RETRO: 0.4952 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86150 | Total: 2.666 | FWD: 2.5129 | RETRO: 0.5106 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86200 | Total: 2.6742 | FWD: 2.5124 | RETRO: 0.539 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86250 | Total: 2.702 | FWD: 2.5487 | RETRO: 0.5111 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86300 | Total: 2.7434 | FWD: 2.5965 | RETRO: 0.4897 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86350 | Total: 2.7093 | FWD: 2.5546 | RETRO: 0.5155 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86400 | Total: 2.6687 | FWD: 2.4959 | RETRO: 0.5761 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86450 | Total: 2.7496 | FWD: 2.5909 | RETRO: 0.529 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86500 | Total: 2.7891 | FWD: 2.6118 | RETRO: 0.5911 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86550 | Total: 2.7293 | FWD: 2.5683 | RETRO: 0.5366 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86600 | Total: 2.8069 | FWD: 2.6137 | RETRO: 0.644 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86650 | Total: 2.782 | FWD: 2.5985 | RETRO: 0.6118 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86700 | Total: 2.7818 | FWD: 2.6064 | RETRO: 0.5845 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86750 | Total: 2.8254 | FWD: 2.6259 | RETRO: 0.665 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86800 | Total: 2.7668 | FWD: 2.5656 | RETRO: 0.6709 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86850 | Total: 2.7336 | FWD: 2.5611 | RETRO: 0.575 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86900 | Total: 2.8672 | FWD: 2.6635 | RETRO: 0.6788 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 86950 | Total: 2.8187 | FWD: 2.6138 | RETRO: 0.683 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87000 | Total: 2.8109 | FWD: 2.618 | RETRO: 0.643 | bv_n: 14.02 | dv_n: 15.25
+💾 Checkpoint reached! Saving Step 87000...
+➡️ Step 87050 | Total: 2.8478 | FWD: 2.6304 | RETRO: 0.7246 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87100 | Total: 2.8357 | FWD: 2.6289 | RETRO: 0.6893 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87150 | Total: 2.8702 | FWD: 2.6555 | RETRO: 0.7155 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87200 | Total: 2.7484 | FWD: 2.5529 | RETRO: 0.6516 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87250 | Total: 2.8432 | FWD: 2.639 | RETRO: 0.6805 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87300 | Total: 2.8222 | FWD: 2.6207 | RETRO: 0.6716 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87350 | Total: 2.8405 | FWD: 2.6213 | RETRO: 0.7307 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87400 | Total: 2.8436 | FWD: 2.6257 | RETRO: 0.7263 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87450 | Total: 2.9045 | FWD: 2.6654 | RETRO: 0.797 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87500 | Total: 2.9005 | FWD: 2.6655 | RETRO: 0.7832 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87550 | Total: 2.8798 | FWD: 2.6377 | RETRO: 0.8071 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87600 | Total: 2.7582 | FWD: 2.5378 | RETRO: 0.7345 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87650 | Total: 2.9777 | FWD: 2.718 | RETRO: 0.8658 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87700 | Total: 2.8537 | FWD: 2.6001 | RETRO: 0.8454 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87750 | Total: 2.8601 | FWD: 2.605 | RETRO: 0.8504 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87800 | Total: 2.8079 | FWD: 2.5767 | RETRO: 0.7705 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87850 | Total: 2.864 | FWD: 2.6087 | RETRO: 0.8508 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87900 | Total: 2.8471 | FWD: 2.5905 | RETRO: 0.8551 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 87950 | Total: 2.9763 | FWD: 2.6883 | RETRO: 0.9598 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 88000 | Total: 2.9548 | FWD: 2.6682 | RETRO: 0.9552 | bv_n: 14.02 | dv_n: 15.25
+💾 Checkpoint reached! Saving Step 88000...
+➡️ Step 88050 | Total: 3.0167 | FWD: 2.7405 | RETRO: 0.9206 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 88100 | Total: 2.9144 | FWD: 2.6418 | RETRO: 0.9089 | bv_n: 14.02 | dv_n: 15.25
+➡️ Step 88150 | Total: 2.8998 | FWD: 2.628 | RETRO: 0.906 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88200 | Total: 2.9857 | FWD: 2.6992 | RETRO: 0.9553 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88250 | Total: 2.9362 | FWD: 2.6612 | RETRO: 0.9167 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88300 | Total: 3.0104 | FWD: 2.7174 | RETRO: 0.9765 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88350 | Total: 3.0983 | FWD: 2.7909 | RETRO: 1.0247 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88400 | Total: 2.9585 | FWD: 2.6775 | RETRO: 0.9366 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88450 | Total: 3.0766 | FWD: 2.7532 | RETRO: 1.0781 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88500 | Total: 3.0129 | FWD: 2.6983 | RETRO: 1.0486 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88550 | Total: 2.9818 | FWD: 2.6869 | RETRO: 0.9831 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88600 | Total: 3.0469 | FWD: 2.7236 | RETRO: 1.0776 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88650 | Total: 2.9814 | FWD: 2.6622 | RETRO: 1.0638 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88700 | Total: 3.0 | FWD: 2.695 | RETRO: 1.0169 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88750 | Total: 3.1197 | FWD: 2.7672 | RETRO: 1.1751 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88800 | Total: 3.1837 | FWD: 2.8159 | RETRO: 1.2258 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88850 | Total: 3.0226 | FWD: 2.691 | RETRO: 1.1052 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88900 | Total: 3.142 | FWD: 2.7737 | RETRO: 1.2277 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 88950 | Total: 3.0667 | FWD: 2.7219 | RETRO: 1.1493 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89000 | Total: 3.0939 | FWD: 2.7286 | RETRO: 1.2178 | bv_n: 14.02 | dv_n: 15.26
+💾 Checkpoint reached! Saving Step 89000...
+➡️ Step 89050 | Total: 3.0885 | FWD: 2.7292 | RETRO: 1.1976 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89100 | Total: 3.1463 | FWD: 2.7684 | RETRO: 1.2597 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89150 | Total: 3.0883 | FWD: 2.7205 | RETRO: 1.226 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89200 | Total: 3.1645 | FWD: 2.7883 | RETRO: 1.2541 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89250 | Total: 3.1645 | FWD: 2.7881 | RETRO: 1.2546 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89300 | Total: 3.094 | FWD: 2.7336 | RETRO: 1.2015 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89350 | Total: 3.1374 | FWD: 2.7425 | RETRO: 1.3164 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89400 | Total: 3.1764 | FWD: 2.777 | RETRO: 1.3311 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89450 | Total: 3.1453 | FWD: 2.7384 | RETRO: 1.3563 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89500 | Total: 3.1878 | FWD: 2.7672 | RETRO: 1.4021 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89550 | Total: 3.1344 | FWD: 2.728 | RETRO: 1.3546 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89600 | Total: 3.1938 | FWD: 2.7749 | RETRO: 1.3965 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89650 | Total: 3.1902 | FWD: 2.7701 | RETRO: 1.4005 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89700 | Total: 3.1876 | FWD: 2.776 | RETRO: 1.3718 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89750 | Total: 3.1775 | FWD: 2.746 | RETRO: 1.4381 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89800 | Total: 3.2232 | FWD: 2.8022 | RETRO: 1.4035 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89850 | Total: 3.2585 | FWD: 2.8208 | RETRO: 1.4592 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89900 | Total: 3.2551 | FWD: 2.8073 | RETRO: 1.4927 | bv_n: 14.02 | dv_n: 15.26
+➡️ Step 89950 | Total: 3.3918 | FWD: 2.9049 | RETRO: 1.623 | bv_n: 14.02 | dv_n: 15.26
+💾 Saving Final Gated Physics Engine Weights...
+✅ Resaved with clean CPU tensors
+✅ Physics Engine Training Complete!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```

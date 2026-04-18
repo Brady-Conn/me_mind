@@ -1,0 +1,707 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Phase 4 - decoder
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Init
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 16, ...>>, true}
+```
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.Probe_Genesis do
+  def init_params(_seed \\ 42) do
+    key = Nx.Random.key(42)
+    # Layer 1
+    {w1, _key} = Nx.Random.normal(key, 0.0, 0.02, shape: {512, 512})
+    b1 = Nx.broadcast(0.0, {512})
+    
+    # ⚡ Layer 2: Zero Init guarantees it starts as a perfect Identity pass-through
+    w2 = Nx.broadcast(0.0, {512, 512})
+    b2 = Nx.broadcast(0.0, {512})
+    
+    {w1, b1, w2, b2}
+  end
+
+  def init_optimizer(params) do
+    zero_like = fn t -> Nx.broadcast(Nx.tensor(0.0, type: :f32), t) end
+    ms = DLM.Tree.map(params, zero_like)
+    vs = DLM.Tree.map(params, zero_like)
+    {ms, vs}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Probe_Genesis, <<70, 79, 82, 49, 0, 0, 12, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Base
+
+```elixir
+defmodule DLM.Main_SSM do
+  import Nx.Defn
+
+  defn swish(x) do
+    x * Nx.sigmoid(x)
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn softplus(x) do
+    # ⚡ UNBREAKABLE SOFTPLUS: Guaranteed stable in forward AND backward passes
+    Nx.max(x, 0.0) + Nx.log1p(Nx.exp(-Nx.abs(x)))
+  end
+
+  defn apply_svd_weight(x, u, v) do
+    x |> Nx.dot(u) |> softplus() |> Nx.dot(v)
+  end
+
+  # ⚡ The core physics step (Used heavily by the new Master Loop)
+  defn ssm_recurrence(x_t, x_p1, x_p2, h_prev, a, bu, bv, cu, cv, du, dv, mu1, mv1, mu2, mv2, vw, vb) do
+    # 1. Local Mixers
+    mix1 = apply_svd_weight(x_p2, mu1, mv1)
+    mix2 = apply_svd_weight(x_p1, mu2, mv2)
+    x_mixed = Nx.add(x_t, Nx.add(mix1, mix2))
+    
+    # 2. Input Force
+    b_proj = apply_svd_weight(x_mixed, bu, bv)
+
+    # ⚡ The Bounded Syntax Valve
+    valve_logit = Nx.add(Nx.dot(x_mixed, vw), vb)
+    shifted_valve = Nx.subtract(valve_logit, 3.0)
+    
+    # Cap the maximum time-step at 1.0 to prevent memory erasure
+    delta = Nx.clip(softplus(shifted_valve), 0.01, 1.0)
+    
+    # 3. Friction
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    b_bar = Nx.multiply(delta, b_proj)
+    
+    # ⚡ 4. XSA Geometric Adaptation
+    h_norm_sq = Nx.add(Nx.sum(Nx.pow(h_prev, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    h_unit = Nx.divide(h_prev, Nx.sqrt(h_norm_sq))
+    
+    overlap = Nx.sum(Nx.multiply(b_bar, h_unit), axes: [-1], keep_axes: true)
+    b_exclusive = Nx.subtract(b_bar, Nx.multiply(overlap, h_unit))
+    
+    # Strictly Orthogonal State Update
+    h_new = Nx.add(Nx.multiply(a_bar, h_prev), b_exclusive)
+    
+    # 5. Output Velocity (Fixed Double-Projection)
+    out_proj = apply_svd_weight(h_new, cu, cv)
+    
+    # 6. Skip Connection
+    skip = apply_svd_weight(x_t, du, dv)
+    
+    y_t = Nx.add(out_proj, skip)
+    
+    {y_t, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Main_SSM, <<70, 79, 82, 49, 0, 0, 33, ...>>, true}
+```
+
+```elixir
+defmodule DLM.TinySSM do
+  import Nx.Defn
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    activated = Nx.tanh(hidden) # ⚡ Let tanh handle the bounding
+    Nx.dot(activated, v)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn forward_step(x_t, h_prev, params) do
+    # ⚡ Unpack all 11 params
+    {a, bu, bv, cu, cv, du, dv, vw, vb, rb, rw} = params
+
+    b_proj = apply_svd(x_t, bu, bv)
+    
+    # 1. The Dynamic Gate
+    gate_proj = apply_svd(x_t, du, dv)
+    shifted_gate = Nx.subtract(gate_proj, 3.0)
+    delta = Nx.max(softplus(shifted_gate), 0.01)
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    
+    # 2. XSA Geometric Adaptation
+    h_norm_sq = Nx.add(Nx.sum(Nx.pow(h_prev, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    h_unit = Nx.divide(h_prev, Nx.sqrt(h_norm_sq))
+    overlap = Nx.sum(Nx.multiply(b_proj, h_unit), axes: [-1], keep_axes: true)
+    b_exclusive = Nx.subtract(b_proj, Nx.multiply(overlap, h_unit))
+    
+    # 3. Strictly Orthogonal State Update
+    h_new = Nx.add(Nx.multiply(a_bar, h_prev), b_exclusive)
+
+    # ⚡ 4. The SVD Bottleneck
+    # We pass the state through the SVD layers to "clean" the signal
+    h_latent = apply_svd(h_new, cu, cv)
+
+    # ⚡ 5. Dual Probes (Decoding the Latent signal)
+    logits_fwd = Nx.add(Nx.dot(h_latent, vw), vb)
+    logits_retro = Nx.add(Nx.dot(h_latent, rw), rb)
+
+    {logits_fwd, logits_retro, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 30, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.Probe_Trainer do
+  import Nx.Defn
+
+  defn get_real_coordinates(batch_tokens, frozen_embeds) do
+    Nx.take(frozen_embeds, Nx.flatten(batch_tokens))
+      |> Nx.reshape({Nx.axis_size(batch_tokens, 0), Nx.axis_size(batch_tokens, 1), 512})
+      |> stop_grad()
+  end
+
+  defn adam_calc(param, grad, m, v, step, lr) do
+    safe_step = step + 1.0
+    beta1 = 0.9
+    beta2 = 0.999
+    eps = 1.0e-8
+
+    new_m = beta1 * m + (1.0 - beta1) * grad
+    new_v = beta2 * v + (1.0 - beta2) * Nx.pow(grad, 2)
+
+    m_hat = new_m / (1.0 - Nx.pow(beta1, safe_step))
+    v_hat = new_v / (1.0 - Nx.pow(beta2, safe_step))
+
+    param_update = param - lr * m_hat / (Nx.sqrt(v_hat) + eps)
+    {param_update, new_m, new_v}
+  end
+
+  # ⚡ Unpack all 4 Non-Linear Adapter parameters
+  defn update_probe_adam(probe_p, grads, probe_m, probe_v, step, lr) do
+    {p_w1, p_b1, p_w2, p_b2} = probe_p
+    {g_w1, g_b1, g_w2, g_b2} = grads
+    {m_w1, m_b1, m_w2, m_b2} = probe_m
+    {v_w1, v_b1, v_w2, v_b2} = probe_v
+
+    {up_w1, nm_w1, nv_w1} = adam_calc(p_w1, g_w1, m_w1, v_w1, step, lr)
+    {up_b1, nm_b1, nv_b1} = adam_calc(p_b1, g_b1, m_b1, v_b1, step, lr)
+    {up_w2, nm_w2, nv_w2} = adam_calc(p_w2, g_w2, m_w2, v_w2, step, lr)
+    {up_b2, nm_b2, nv_b2} = adam_calc(p_b2, g_b2, m_b2, v_b2, step, lr)
+
+    {{up_w1, up_b1, up_w2, up_b2}, 
+     {nm_w1, nm_b1, nm_w2, nm_b2}, 
+     {nv_w1, nv_b1, nv_w2, nv_b2}}
+  end
+
+  defn compute_probe_loss(probe_p, input_tokens, target_tokens_t1, target_tokens_t2, h_base_init, h_top_init, frozen_map, frozen_p2, frozen_p3) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+    
+    in_coords = get_real_coordinates(input_tokens, frozen_map)
+    in_t = Nx.transpose(in_coords, axes: [1, 0, 2])
+
+    c_t1 = get_real_coordinates(target_tokens_t1, frozen_map) |> Nx.transpose(axes: [1, 0, 2])
+    targ_seq_t2 = Nx.transpose(target_tokens_t2, axes: [1, 0])
+
+    zero_frame = Nx.broadcast(0.0, Nx.shape(h_top_init))
+
+    {a_w1, a_b1, a_w2, a_b2} = probe_p
+
+    result =
+      while {i = 0, total_loss = 0.0, 
+             h_base = h_base_init, h_top = h_top_init,
+             xp1 = zero_frame, xp2 = zero_frame,
+             in_seq = in_t, coords_t1 = c_t1, targ_t2 = targ_seq_t2,
+             f_p2 = frozen_p2, f_p3 = frozen_p3, f_map = frozen_map,
+             w1 = a_w1, b1 = a_b1, w2 = a_w2, b2 = a_b2}, 
+            Nx.less(i, seq_len) do
+        
+        x_curr = in_seq[i]
+
+        {_fwd, _retro, h_base_new} = DLM.TinySSM.forward_step(x_curr, h_base, f_p2)
+
+        # ⚡ Generate Ground Truth for t+1 (This prevents Adam from muting the signal)
+        {_, _, base_target_1} = DLM.TinySSM.forward_step(coords_t1[i], h_base_new, f_p2)
+        safe_t1 = stop_grad(base_target_1)
+
+        {_p3_a, _p3_bu, _p3_bv, _p3_cu, _p3_cv, _p3_du, _p3_dv, 
+         _p3_mu1, _p3_mv1, _p3_mu2, _p3_mv2, _p3_vw, _p3_vb, p3_out_w, p3_out_b} = f_p3
+
+        {_y_top1, h_top_1} = DLM.Main_SSM.ssm_recurrence(
+          h_base_new, xp1, xp2, h_top, 
+          elem(f_p3, 0), elem(f_p3, 1), elem(f_p3, 2), elem(f_p3, 3), elem(f_p3, 4), 
+          elem(f_p3, 5), elem(f_p3, 6), elem(f_p3, 7), elem(f_p3, 8), elem(f_p3, 9), 
+          elem(f_p3, 10), elem(f_p3, 11), elem(f_p3, 12)
+        )
+
+        pred_t1 = Nx.dot(h_top_1, p3_out_w) |> Nx.add(p3_out_b)
+
+        # ⚡ 1. The Non-Linear Residual Adapter
+        hidden = Nx.dot(pred_t1, w1) |> Nx.add(b1) |> Nx.tanh()
+        residual = Nx.dot(hidden, w2) |> Nx.add(b2)
+        adapted_pred = Nx.add(pred_t1, residual)
+
+        # ⚡ 2. The Frozen Vocal Cords
+        {_p2_a, _p2_bu, _p2_bv, f_cu, f_cv, _p2_du, _p2_dv, f_vw, f_vb, _p2_rb, _p2_rw} = f_p2
+        h_latent = DLM.TinySSM.apply_svd(adapted_pred, f_cu, f_cv)
+        logits = Nx.add(Nx.dot(h_latent, f_vw), f_vb) |> Nx.reshape({32, 128})
+        
+        # ⚡ 3. The Hybrid Loss (CE Boundary + MSE Anchor)
+        ce_loss = DLM.Loss.cross_entropy(logits, targ_t2[i])
+        mse_loss = Nx.mean(Nx.pow(Nx.subtract(adapted_pred, safe_t1), 2))
+        
+        # Weight the MSE heavily so Adam is forced to maintain the geometry
+        step_loss = Nx.add(ce_loss, Nx.multiply(mse_loss, 5.0))
+        total_loss_new = Nx.add(total_loss, step_loss)
+
+        {i + 1, total_loss_new, h_base_new, h_top_1, h_base_new, xp1, in_seq, coords_t1, targ_t2, f_p2, f_p3, f_map, w1, b1, w2, b2}
+      end
+      
+    Nx.divide(elem(result, 1), seq_len)
+  end
+
+  defn compute_grad_and_step(batch_tokens, probe_p, probe_m, probe_v, step_count, lr, h_base_init, h_top_init, frozen_map, frozen_p2, frozen_p3) do
+    seq_len = Nx.axis_size(batch_tokens, 1) - 2
+    
+    input_tokens = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    
+    # ⚡ Extract BOTH t+1 (for MSE Anchor) and t+2 (for CE boundary)
+    target_tokens_t1 = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+    target_tokens_t2 = Nx.slice_along_axis(batch_tokens, 2, seq_len, axis: 1)
+
+    {loss, raw_grads} = value_and_grad(probe_p, fn p ->
+      compute_probe_loss(p, input_tokens, target_tokens_t1, target_tokens_t2, h_base_init, h_top_init, frozen_map, frozen_p2, frozen_p3)
+    end)
+
+    {up_p, up_m, up_v} = update_probe_adam(probe_p, raw_grads, probe_m, probe_v, step_count, lr)
+
+    {loss, up_p, up_m, up_v}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Probe_Trainer, <<70, 79, 82, 49, 0, 0, 58, ...>>, true}
+```
+
+```elixir
+# ==============================================================================
+# PHASE 4: THE JEPA LINEAR PROBE TRAINER
+# ==============================================================================
+gpu = {EXLA.Backend, client: :rocm}
+batch_size = 32
+seq_len = 128
+total_steps = 14000
+save_interval = 1000
+run_prefix = "v38_DLM_Phase_4_p2_time_nlha"
+
+IO.puts("🌌 Loading Frozen Phase 1 (Manifold)...")
+# Using your clean Sinkhorn manifold!
+%{params: {cpu_embeds, _, _, _}} = File.read!("phase1_sinkhorn_diffusion_25k_COMPLETE.bin") |> :erlang.binary_to_term()
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+IO.puts("⚙️ Loading Frozen Phase 2 (Golden Epoch Base)...")
+base_checkpoint = File.read!("v38_DLM_Phase_2_1_sh_muon_fix_3e4_50n_checkpoint_step_41000.bin") |> :erlang.binary_to_term()
+frozen_p2 = DLM.Tree.map(base_checkpoint, &Nx.backend_copy(&1, gpu))
+
+IO.puts("🧠 Loading Frozen Phase 3 (14k Latent Brain)...")
+top_checkpoint = File.read!("v38_DLM_Phase_3_latent_mse_genesis_checkpoint_step_16000.bin") |> :erlang.binary_to_term()
+# Extract the params tuple from the checkpoint map
+frozen_p3 = DLM.Tree.map(top_checkpoint.params, &Nx.backend_copy(&1, gpu))
+
+IO.puts("✨ Igniting Phase 4 Residual Adapter...")
+{probe_p, probe_m, probe_v} = 
+  DLM.Probe_Genesis.init_params(42)
+  |> then(fn p ->
+    {m, v} = DLM.Probe_Genesis.init_optimizer(p)
+    {p, m, v}
+  end)
+  
+p_gpu = DLM.Tree.map(probe_p, &Nx.backend_copy(&1, gpu))
+m_gpu = DLM.Tree.map(probe_m, &Nx.backend_copy(&1, gpu))
+v_gpu = DLM.Tree.map(probe_v, &Nx.backend_copy(&1, gpu))
+
+h_base_init = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+h_top_init = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.backend_copy(gpu)
+
+IO.puts("📚 Loading Curriculum...")
+dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_term()
+dataset_1d = Nx.flatten(dataset_2d)
+data_stream = DLM.DataStreamer.build_infinite_stream(dataset_1d, batch_size, seq_len)
+
+IO.puts("🚀 Entering Linear Probe Loop...")
+
+{final_p, _, _} =
+  Enum.reduce(Enum.zip(0..(total_steps - 1), data_stream), {p_gpu, m_gpu, v_gpu}, 
+    fn {step, cpu_batch}, {cp, cm, cv} ->
+      
+      gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+      step_t = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
+      
+      # ⚡ Gentle learning rate to widen boundaries without destroying them
+      lr_t = Nx.tensor(3.0e-4, type: :f32) |> Nx.backend_copy(gpu)
+
+      {loss_t, up_p, up_m, up_v} = 
+        DLM.Probe_Trainer.compute_grad_and_step(
+          gpu_batch, cp, cm, cv, step_t, lr_t, 
+          h_base_init, h_top_init, frozen_map, frozen_p2, frozen_p3
+        )
+
+      loss_val = Nx.to_number(loss_t)
+
+      if rem(step, 50) == 0 do
+         mem = :erlang.memory(:total) |> div(1024 * 1024)
+         IO.puts("➡️  Step #{step} | CE Loss: #{Float.round(loss_val, 4)} | RAM: #{mem}MB")
+      end
+
+      if rem(step, save_interval) == 0 and step > 0 do
+        IO.puts("💾 Saving Probe Checkpoint #{step}...")
+        state = %{
+          params: DLM.Tree.map(up_p, &Nx.backend_copy(&1, Nx.BinaryBackend)),
+          step: step
+        }
+        File.write!("#{run_prefix}_step_#{step}.bin", :erlang.term_to_binary(state))
+        :erlang.garbage_collect(self())
+      end
+
+      {up_p, up_m, up_v}
+  end)
+
+IO.puts("🎉 PROBE TRAINING COMPLETE!")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Frozen Phase 1 (Manifold)...
+⚙️ Loading Frozen Phase 2 (Golden Epoch Base)...
+🧠 Loading Frozen Phase 3 (14k Latent Brain)...
+✨ Igniting Phase 4 Residual Adapter...
+📚 Loading Curriculum...
+🚀 Entering Linear Probe Loop...
+
+22:21:18.976 [info] Merging Dots in computation: region_0.12
+
+22:21:18.976 [info] Merging Dots in computation: region_13.39.clone.clone.clone.clone
+➡️  Step 0 | CE Loss: 7.1228 | RAM: 191MB
+➡️  Step 50 | CE Loss: 5.4768 | RAM: 191MB
+➡️  Step 100 | CE Loss: 5.3741 | RAM: 191MB
+➡️  Step 150 | CE Loss: 5.2077 | RAM: 191MB
+➡️  Step 200 | CE Loss: 5.3643 | RAM: 191MB
+➡️  Step 250 | CE Loss: 5.173 | RAM: 191MB
+➡️  Step 300 | CE Loss: 5.2529 | RAM: 191MB
+➡️  Step 350 | CE Loss: 5.2387 | RAM: 191MB
+➡️  Step 400 | CE Loss: 5.1554 | RAM: 191MB
+➡️  Step 450 | CE Loss: 5.1852 | RAM: 192MB
+➡️  Step 500 | CE Loss: 5.1497 | RAM: 192MB
+➡️  Step 550 | CE Loss: 5.1537 | RAM: 192MB
+➡️  Step 600 | CE Loss: 5.0214 | RAM: 192MB
+➡️  Step 650 | CE Loss: 5.0749 | RAM: 192MB
+➡️  Step 700 | CE Loss: 5.2147 | RAM: 192MB
+➡️  Step 750 | CE Loss: 5.1673 | RAM: 193MB
+➡️  Step 800 | CE Loss: 5.0315 | RAM: 193MB
+➡️  Step 850 | CE Loss: 5.1663 | RAM: 193MB
+➡️  Step 900 | CE Loss: 5.0547 | RAM: 193MB
+➡️  Step 950 | CE Loss: 5.083 | RAM: 196MB
+➡️  Step 1000 | CE Loss: 5.1206 | RAM: 196MB
+💾 Saving Probe Checkpoint 1000...
+➡️  Step 1050 | CE Loss: 4.997 | RAM: 198MB
+➡️  Step 1100 | CE Loss: 5.0638 | RAM: 198MB
+➡️  Step 1150 | CE Loss: 5.1182 | RAM: 197MB
+➡️  Step 1200 | CE Loss: 4.9278 | RAM: 197MB
+➡️  Step 1250 | CE Loss: 4.9281 | RAM: 197MB
+➡️  Step 1300 | CE Loss: 5.0848 | RAM: 197MB
+➡️  Step 1350 | CE Loss: 5.1197 | RAM: 194MB
+➡️  Step 1400 | CE Loss: 5.0761 | RAM: 195MB
+➡️  Step 1450 | CE Loss: 4.9923 | RAM: 195MB
+➡️  Step 1500 | CE Loss: 4.9664 | RAM: 195MB
+➡️  Step 1550 | CE Loss: 4.9432 | RAM: 195MB
+➡️  Step 1600 | CE Loss: 4.9515 | RAM: 195MB
+➡️  Step 1650 | CE Loss: 4.8943 | RAM: 195MB
+➡️  Step 1700 | CE Loss: 4.9798 | RAM: 195MB
+➡️  Step 1750 | CE Loss: 4.9968 | RAM: 196MB
+➡️  Step 1800 | CE Loss: 5.1404 | RAM: 195MB
+➡️  Step 1850 | CE Loss: 4.8779 | RAM: 198MB
+➡️  Step 1900 | CE Loss: 5.0087 | RAM: 200MB
+➡️  Step 1950 | CE Loss: 5.0382 | RAM: 199MB
+➡️  Step 2000 | CE Loss: 4.9429 | RAM: 196MB
+💾 Saving Probe Checkpoint 2000...
+➡️  Step 2050 | CE Loss: 4.9422 | RAM: 194MB
+➡️  Step 2100 | CE Loss: 5.0273 | RAM: 196MB
+➡️  Step 2150 | CE Loss: 5.0475 | RAM: 197MB
+➡️  Step 2200 | CE Loss: 4.978 | RAM: 197MB
+➡️  Step 2250 | CE Loss: 5.0476 | RAM: 197MB
+➡️  Step 2300 | CE Loss: 4.9583 | RAM: 197MB
+➡️  Step 2350 | CE Loss: 4.9242 | RAM: 197MB
+➡️  Step 2400 | CE Loss: 4.9415 | RAM: 202MB
+➡️  Step 2450 | CE Loss: 4.9161 | RAM: 201MB
+➡️  Step 2500 | CE Loss: 4.893 | RAM: 201MB
+➡️  Step 2550 | CE Loss: 4.8911 | RAM: 198MB
+➡️  Step 2600 | CE Loss: 5.0051 | RAM: 199MB
+➡️  Step 2650 | CE Loss: 4.986 | RAM: 199MB
+➡️  Step 2700 | CE Loss: 5.0415 | RAM: 199MB
+➡️  Step 2750 | CE Loss: 4.9027 | RAM: 199MB
+➡️  Step 2800 | CE Loss: 5.0669 | RAM: 199MB
+➡️  Step 2850 | CE Loss: 4.9584 | RAM: 203MB
+➡️  Step 2900 | CE Loss: 4.9821 | RAM: 202MB
+➡️  Step 2950 | CE Loss: 5.0133 | RAM: 199MB
+➡️  Step 3000 | CE Loss: 4.9805 | RAM: 200MB
+💾 Saving Probe Checkpoint 3000...
+➡️  Step 3050 | CE Loss: 4.9788 | RAM: 152MB
+➡️  Step 3100 | CE Loss: 4.9769 | RAM: 152MB
+➡️  Step 3150 | CE Loss: 4.9252 | RAM: 153MB
+➡️  Step 3200 | CE Loss: 4.9717 | RAM: 153MB
+➡️  Step 3250 | CE Loss: 4.972 | RAM: 153MB
+➡️  Step 3300 | CE Loss: 4.9186 | RAM: 153MB
+➡️  Step 3350 | CE Loss: 4.9513 | RAM: 153MB
+➡️  Step 3400 | CE Loss: 4.8821 | RAM: 153MB
+➡️  Step 3450 | CE Loss: 4.931 | RAM: 153MB
+➡️  Step 3500 | CE Loss: 4.8911 | RAM: 153MB
+➡️  Step 3550 | CE Loss: 4.9208 | RAM: 154MB
+➡️  Step 3600 | CE Loss: 4.9653 | RAM: 154MB
+➡️  Step 3650 | CE Loss: 4.8007 | RAM: 154MB
+➡️  Step 3700 | CE Loss: 4.989 | RAM: 154MB
+➡️  Step 3750 | CE Loss: 4.9569 | RAM: 154MB
+➡️  Step 3800 | CE Loss: 4.916 | RAM: 154MB
+➡️  Step 3850 | CE Loss: 4.8956 | RAM: 155MB
+➡️  Step 3900 | CE Loss: 4.8744 | RAM: 155MB
+➡️  Step 3950 | CE Loss: 4.9155 | RAM: 155MB
+➡️  Step 4000 | CE Loss: 4.9531 | RAM: 155MB
+💾 Saving Probe Checkpoint 4000...
+➡️  Step 4050 | CE Loss: 5.0417 | RAM: 151MB
+➡️  Step 4100 | CE Loss: 4.9297 | RAM: 151MB
+➡️  Step 4150 | CE Loss: 4.9135 | RAM: 155MB
+➡️  Step 4200 | CE Loss: 4.9168 | RAM: 154MB
+➡️  Step 4250 | CE Loss: 4.9513 | RAM: 149MB
+➡️  Step 4300 | CE Loss: 4.8686 | RAM: 152MB
+➡️  Step 4350 | CE Loss: 4.9217 | RAM: 152MB
+➡️  Step 4400 | CE Loss: 4.8967 | RAM: 149MB
+➡️  Step 4450 | CE Loss: 4.9313 | RAM: 149MB
+➡️  Step 4500 | CE Loss: 5.0001 | RAM: 153MB
+➡️  Step 4550 | CE Loss: 4.9732 | RAM: 150MB
+➡️  Step 4600 | CE Loss: 5.0148 | RAM: 155MB
+➡️  Step 4650 | CE Loss: 5.0412 | RAM: 150MB
+➡️  Step 4700 | CE Loss: 4.9291 | RAM: 150MB
+➡️  Step 4750 | CE Loss: 4.9847 | RAM: 150MB
+➡️  Step 4800 | CE Loss: 4.9268 | RAM: 151MB
+➡️  Step 4850 | CE Loss: 4.9319 | RAM: 150MB
+➡️  Step 4900 | CE Loss: 4.9009 | RAM: 151MB
+➡️  Step 4950 | CE Loss: 4.9756 | RAM: 156MB
+➡️  Step 5000 | CE Loss: 4.9841 | RAM: 151MB
+💾 Saving Probe Checkpoint 5000...
+➡️  Step 5050 | CE Loss: 4.914 | RAM: 154MB
+➡️  Step 5100 | CE Loss: 4.8113 | RAM: 155MB
+➡️  Step 5150 | CE Loss: 4.8598 | RAM: 155MB
+➡️  Step 5200 | CE Loss: 4.8674 | RAM: 155MB
+➡️  Step 5250 | CE Loss: 5.0207 | RAM: 155MB
+➡️  Step 5300 | CE Loss: 4.8832 | RAM: 155MB
+➡️  Step 5350 | CE Loss: 4.9194 | RAM: 155MB
+```
