@@ -1,0 +1,1189 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# DLM P2.4
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.80,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Positional do
+  def build(len, dim) do
+    i = Nx.iota({len, 1})
+    d = Nx.iota({1, dim})
+    dim_f = Nx.tensor(dim, type: :f32) # 🔥 Force float math
+    Nx.sin(Nx.divide(i, Nx.pow(10000.0, Nx.divide(d, dim_f))))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Positional, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:build, 2}}
+```
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN for Rank 2 Tensors)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # pred and target are {batch_size, dim}
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    # 1. Batched Dot Product: {batch, dim} x {dim, batch} -> {batch, batch}
+    # This creates a similarity matrix comparing every pred to every target in the batch
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 2. Create Identity Targets -> {batch, batch}
+    batch_size = Nx.axis_size(pred, 0)
+    # ⚡ THE FIX: Pass a 2D tuple {32, 32} instead of a 1D tuple {32}
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    # 3. Manual Dense Log-Softmax
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))ozen_w2,
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 27, ...>>, true}
+```
+
+```elixir
+defmodule DLM.SinkhornOT do
+  import Nx.Defn
+
+  defn cost_matrix(pred, target) do
+    # ⚡ MEMORY OPTIMIZATION: Use the algebraic expansion a^2 + b^2 - 2ab
+    # This prevents the EXLA compiler from creating a 32GB intermediate tensor!
+    p_sq = Nx.sum(Nx.pow(pred, 2), axes: [-1], keep_axes: true)
+    t_sq = Nx.sum(Nx.pow(target, 2), axes: [-1], keep_axes: true) |> Nx.transpose()
+    
+    dot_prod = Nx.dot(pred, Nx.transpose(target))
+    
+    # Add the squares, subtract 2 * dot_product, and clamp to 0.0 for safety
+    Nx.add(p_sq, t_sq) |> Nx.subtract(Nx.multiply(2.0, dot_prod)) |> Nx.max(0.0)
+  end
+
+  defn compute(pred, target, epsilon \\ 10.0, max_iters \\ 32 ) do
+    # ... (Keep the rest of your compute function exactly as you have it)
+    c = cost_matrix(pred, target)
+    k = Nx.exp(Nx.divide(Nx.negate(c), epsilon))
+    
+    batch_size = Nx.axis_size(pred, 0)
+    mass = 1.0 / batch_size
+    mu = Nx.broadcast(mass, {batch_size})
+    nu = Nx.broadcast(mass, {batch_size})
+
+    {_final_k, u_final, v_final, _mu, _nu, _i} =
+      while {k_mat = k, 
+             u = Nx.broadcast(1.0, {batch_size}), 
+             _v = Nx.broadcast(1.0, {batch_size}), 
+             m = mu, n = nu, i = 0},
+            Nx.less(i, max_iters) do
+            
+        denom_v = Nx.add(Nx.dot(Nx.transpose(k_mat), u), 1.0e-8)
+        v_new = Nx.divide(n, denom_v)
+        
+        denom_u = Nx.add(Nx.dot(k_mat, v_new), 1.0e-8)
+        u_new = Nx.divide(m, denom_u)
+
+        {k_mat, u_new, v_new, m, n, i + 1}
+      end
+
+    u_exp = Nx.new_axis(u_final, 1)
+    v_exp = Nx.new_axis(v_final, 0)
+    p = Nx.multiply(Nx.multiply(u_exp, k), v_exp)
+
+    Nx.sum(Nx.multiply(p, c))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SinkhornOT, <<70, 79, 82, 49, 0, 0, 26, ...>>, true}
+```
+
+```elixir
+defmodule DLM.SparseSinkGD do
+  import Nx.Defn
+
+  @doc """
+  Applies Sinkhorn Gradient Scaling strictly to active (non-zero) gradients.
+  """
+  defn normalize_sparse_grad(grad, iterations \\ 3) do
+    eps = 1.0e-8
+    
+    # 1. Identify which characters actually appeared in this batch
+    raw_row_norms = Nx.pow(grad, 2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
+    active_mask = Nx.greater(raw_row_norms, eps)
+    
+    # 2. Sinkhorn Alternating Loop
+    result = while {i = 0, g = grad, am = active_mask}, Nx.less(i, iterations) do
+      # --- Row Normalization ---
+      row_norms = g |> Nx.pow(2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
+      safe_row_norms = Nx.select(am, row_norms, 1.0)
+      g_row = Nx.divide(g, safe_row_norms)
+      
+      # --- Column Normalization ---
+      col_norms = g_row |> Nx.pow(2) |> Nx.sum(axes: [0], keep_axes: true) |> Nx.sqrt()
+      safe_col_norms = Nx.select(Nx.greater(col_norms, eps), col_norms, 1.0)
+      g_col = Nx.divide(g_row, safe_col_norms)
+      
+      {i + 1, g_col, am}
+    end
+    
+    elem(result, 1)
+  end
+
+  @doc """
+  Stateful Update Step with Momentum for Sparse Embeddings
+  """
+  defn sinkgd_step(embed_matrix, grad, m_prev, lr, beta \\ 0.9) do
+    # 1. Scale the raw sparse gradient first to preserve the boolean mask logic
+    scaled_grad = normalize_sparse_grad(grad)
+    
+    # 2. Update Momentum (Exponential Moving Average)
+    # Mix 90% of the old momentum with 10% of the newly scaled gradient
+    m_new = Nx.add(Nx.multiply(beta, m_prev), Nx.multiply(1.0 - beta, scaled_grad))
+    
+    # 3. Apply the gradient descent subtraction using the momentum buffer
+    new_embeds = Nx.subtract(embed_matrix, Nx.multiply(m_new, lr))
+    
+    {new_embeds, m_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SparseSinkGD, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## SSM
+
+```elixir
+defmodule DLM.TinySSM do
+  import Nx.Defn
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    activated = Nx.tanh(hidden) # ⚡ Let tanh handle the bounding
+    Nx.dot(activated, v)
+  end
+
+  defn softplus(x) do
+    Nx.select(x > 20.0, x, Nx.log1p(Nx.exp(x)))
+  end
+
+  defn forward_step(x_t, h_prev, params) do
+    # ⚡ Unpack all 11 params
+    {a, bu, bv, cu, cv, du, dv, vw, vb, rb, rw} = params
+
+    b_proj = apply_svd(x_t, bu, bv)
+    
+    # 1. The Dynamic Gate
+    gate_proj = apply_svd(x_t, du, dv)
+    shifted_gate = Nx.subtract(gate_proj, 1.0)
+    delta = Nx.max(softplus(shifted_gate), 0.01)
+    
+    a_bar = Nx.exp(Nx.multiply(delta, -Nx.abs(a)))
+    # ⚡ NEW: Scale the incoming write force by the gate!
+    b_bar = Nx.multiply(delta, b_proj) 
+    
+    # 2. XSA Geometric Adaptation (Using b_bar instead of b_proj)
+    h_norm_sq = Nx.add(Nx.sum(Nx.pow(h_prev, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    h_unit = Nx.divide(h_prev, Nx.sqrt(h_norm_sq))
+    
+    overlap = Nx.sum(Nx.multiply(b_bar, h_unit), axes: [-1], keep_axes: true)
+    b_exclusive = Nx.subtract(b_bar, Nx.multiply(overlap, h_unit))
+    
+    # 3. Strictly Orthogonal State Update
+    h_new = Nx.add(Nx.multiply(a_bar, h_prev), b_exclusive)
+
+    # ⚡ 4. The SVD Bottleneck
+    # We pass the state through the SVD layers to "clean" the signal
+    h_latent = apply_svd(h_new, cu, cv)
+
+    # ⚡ 5. Dual Probes (Decoding the Latent signal)
+    logits_fwd = Nx.add(Nx.dot(h_latent, vw), vb)
+    logits_retro = Nx.add(Nx.dot(h_latent, rw), rb)
+
+    {logits_fwd, logits_retro, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.TinySSM, <<70, 79, 82, 49, 0, 0, 31, ...>>, true}
+```
+
+```elixir
+defmodule DLM.AdamMuonHybrid do
+  import Nx.Defn
+
+  # ⚡ 1. The Global Norm Clipper
+  # Correctly scales the entire matrix to preserve geometric direction
+  defn clip_norm(tensor, max_norm) do
+    norm = Nx.add(Nx.sqrt(Nx.sum(Nx.pow(tensor, 2))), 1.0e-8)
+    scale = Nx.min(1.0, Nx.divide(max_norm, norm))
+    Nx.multiply(tensor, scale)
+  end
+
+  # -------------------------------------------------------------------------
+  # AdamW (For 1D Friction/Inertia vectors and Biases)
+  # -------------------------------------------------------------------------
+  defn adam_step(p, g, m, v, step, lr) do
+    beta1 = 0.9
+    beta2 = 0.999
+    flat_decay = 1.0e-4
+
+    m_new = Nx.add(Nx.multiply(beta1, m), Nx.multiply(1.0 - beta1, g))
+    v_new = Nx.add(Nx.multiply(beta2, v), Nx.multiply(1.0 - beta2, Nx.pow(g, 2)))
+
+    m_hat = Nx.divide(m_new, Nx.subtract(1.0, Nx.pow(beta1, step)))
+    v_hat = Nx.divide(v_new, Nx.subtract(1.0, Nx.pow(beta2, step)))
+
+    update_val = Nx.multiply(lr, Nx.divide(m_hat, Nx.add(Nx.sqrt(v_hat), 1.0e-8)))
+
+    p_decayed = Nx.subtract(p, Nx.multiply(flat_decay, p))
+    p_new = Nx.subtract(p_decayed, update_val)
+
+    # ⚡ Weight limits removed! The manifold can expand.
+    {p_new, m_new, v_new}
+  end
+
+  # -------------------------------------------------------------------------
+  # The 11-Parameter Router
+  # -------------------------------------------------------------------------
+  defn update(params, grads, ms, vs, step, lr) do
+    {a, bu, bv, cu, cv, du, dv, vw, vb, rb, rw} = params
+    {ga, gbu, gbv, gcu, gcv, gdu, gdv, gvw, gvb, grb, grw} = grads
+    {ma, mbu, mbv, mcu, mcv, mdu, mdv, mvw, mvb, mrb, mrw} = ms
+    {va, vbu, vbv, vcu, vcv, vdu, vdv, vvw, vvb, vrb, vrw} = vs
+
+    new_step = Nx.add(step, 1)
+
+    # ⚡ PRE-EMPTIVE GRADIENT CLIPPING (Global Norm = 1.0)
+    norm_cap = Nx.tensor(10.0, type: :f32)
+    c_ga  = clip_norm(ga, norm_cap)
+    c_gbu = clip_norm(gbu, norm_cap)
+    c_gbv = clip_norm(gbv, norm_cap)
+    c_gcu = clip_norm(gcu, norm_cap)
+    c_gcv = clip_norm(gcv, norm_cap)
+    c_gdu = clip_norm(gdu, norm_cap)
+    c_gdv = clip_norm(gdv, norm_cap)
+    c_gvw = clip_norm(gvw, norm_cap)
+    c_gvb = clip_norm(gvb, norm_cap)
+    c_grb = clip_norm(grb, norm_cap)
+    c_grw = clip_norm(grw, norm_cap)
+
+    # ⚡ 1. AdamW (Scalars, 1D Vectors, Biases)
+    {a_new, ma_new, va_new}   = adam_step(a, c_ga, ma, va, new_step, lr)
+    {vb_new, mvb_new, vvb_new} = adam_step(vb, c_gvb, mvb, vvb, new_step, lr)
+    {rb_new, mrb_new, vrb_new} = adam_step(rb, c_grb, mrb, vrb, new_step, lr)
+    
+    # ⚡ 2. SinkGD (2D Transformation Matrices)
+    {bu_new, mbu_new} = DLM.SparseSinkGD.sinkgd_step(bu, c_gbu, mbu, lr)
+    {bv_new, mbv_new} = DLM.SparseSinkGD.sinkgd_step(bv, c_gbv, mbv, lr)
+    {cu_new, mcu_new} = DLM.SparseSinkGD.sinkgd_step(cu, c_gcu, mcu, lr)
+    {cv_new, mcv_new} = DLM.SparseSinkGD.sinkgd_step(cv, c_gcv, mcv, lr)
+    {du_new, mdu_new} = DLM.SparseSinkGD.sinkgd_step(du, c_gdu, mdu, lr)
+    {dv_new, mdv_new} = DLM.SparseSinkGD.sinkgd_step(dv, c_gdv, mdv, lr)
+    {rw_new, mrw_new} = DLM.SparseSinkGD.sinkgd_step(rw, c_grw, mrw, lr)
+    {vw_new, mvw_new} = DLM.SparseSinkGD.sinkgd_step(vw, c_gvw, mvw, lr)
+
+    new_params = {a_new, bu_new, bv_new, cu_new, cv_new, du_new, dv_new, vw_new, vb_new, rb_new, rw_new}
+    new_ms = {ma_new, mbu_new, mbv_new, mcu_new, mcv_new, mdu_new, mdv_new, mvw_new, mvb_new, mrb_new, mrw_new}
+    new_vs = {va_new, vbu, vbv, vcu, vcv, vdu, vdv, vvw, vvb_new, vrb_new, vrw}
+    
+    {new_params, new_ms, new_vs, new_step}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.AdamMuonHybrid, <<70, 79, 82, 49, 0, 0, 36, ...>>, true}
+```
+
+```elixir
+defmodule DLM.PhysicsGenesis do
+  import Nx.Defn
+
+  @dim 512
+  @rank 256
+
+  defn ignite(key) do
+    # a_diag: Friction/Inertia (Kept stable)
+    {a, k1} = Nx.Random.normal(key, -0.1, 0.01, shape: {@dim})
+    
+    # ⚡ UPGRADE 1: Xavier/Glorot Initialization for all SVD Bottlenecks
+    std_dev = Nx.divide(1.0, Nx.sqrt(512))
+    
+    # b: Input Force Matrices
+    {bu, k2} = Nx.Random.normal(k1, 0.0, std_dev, shape: {@dim, @rank})
+    {bv, k3} = Nx.Random.normal(k2, 0.0, std_dev, shape: {@rank, @dim})
+    
+    # c: Output Velocity Matrices
+    {cu, k4} = Nx.Random.normal(k3, 0.0, std_dev, shape: {@dim, @rank})
+    {cv, k5} = Nx.Random.normal(k4, 0.0, std_dev, shape: {@rank, @dim})
+
+    # d: Dynamic Gating Matrices (Now with healthy variance!)
+    {du, k6} = Nx.Random.normal(k5, 0.0, std_dev, shape: {@dim, @rank})
+    {dv, k7} = Nx.Random.normal(k6, 0.0, std_dev, shape: {@rank, @dim})
+
+    # ⚡ UPGRADE 2: Identity Initialization for Final Spatial Rotations
+    identity = Nx.eye({@dim, @dim}, type: :f32)
+    # Scale by 0.5 so it isn't completely rigid on Step 0
+    vocab_w = Nx.multiply(identity, 0.5) 
+    rw = Nx.multiply(identity, 0.5)
+    
+    # Biases
+    vocab_b = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
+    rb = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
+    
+    {{a, bu, bv, cu, cv, du, dv, vocab_w, vocab_b, rb, rw}, k7}
+  end
+
+  def init_optimizer(params) do
+    zero_state = DLM.Tree.map(params, fn p -> Nx.broadcast(0.0, Nx.shape(p)) end)
+    {zero_state, zero_state, Nx.tensor(0)}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 18, ...>>, {:init_optimizer, 1}}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## BLiMP
+
+```elixir
+defmodule DLM.Phase2_Eval do
+  import Nx.Defn
+
+  defn compute_sentence_loss(input_tokens, target_tokens, orig_seq_len, h_init, params, frozen_map) do
+    seq_len = Nx.axis_size(input_tokens, 1) 
+    
+    # 1. Map BOTH inputs and targets to the continuous 512D Sinkhorn space
+    input_coords =
+      Nx.take(frozen_map, Nx.flatten(input_tokens))
+      |> Nx.reshape({1, seq_len, 512})
+      |> stop_grad()
+
+    # ⚡ NEW: We need the targets as coordinates, not integer IDs
+    target_coords =
+      Nx.take(frozen_map, Nx.flatten(target_tokens))
+      |> Nx.reshape({1, seq_len, 512})
+      |> stop_grad()
+  
+    in_t = Nx.transpose(input_coords, axes: [1, 0, 2])
+    targ_t = Nx.transpose(target_coords, axes: [1, 0, 2]) 
+
+    int_lt = Nx.tensor(0.0, type: :f32)
+  
+    # 2. The Physics Loop
+    result =
+      while {i = 0, total_loss = int_lt,
+             h = h_init,
+             x_in = in_t, y_targ = targ_t,
+             p = params, f_map = frozen_map, sq_ln = orig_seq_len},
+            Nx.less(i, seq_len) do
+  
+        x_curr = x_in[i]
+  
+        # ⚡ 3. The Core Physics
+        {logits_fwd, _logits_retro, h_new} = DLM.TinySSM.forward_step(x_curr, h, p)
+        
+        # ⚡ 4. Trajectory Error (Spatial Distance)
+        # L2 normalize both points to match the space your model was trained in
+        p_norm = DLM.Loss.l2_normalize(logits_fwd)
+        t_norm = DLM.Loss.l2_normalize(y_targ[i])
+        
+        # Calculate Squared Euclidean Distance between predicted and actual coordinates
+        diff = Nx.subtract(p_norm, t_norm)
+        step_loss = Nx.sum(Nx.pow(diff, 2), axes: [-1]) |> Nx.squeeze()
+        
+        # 5. THE MASK: Zero out the loss if we are in the padded void
+        valid_mask = Nx.select(Nx.less(i, sq_ln), 1.0, 0.0)
+        masked_loss = Nx.multiply(step_loss, valid_mask)
+
+        {i + 1, Nx.add(total_loss, masked_loss), h_new, x_in, y_targ, p, f_map, sq_ln}
+      end
+  
+    # Divide the accumulated spatial deviation by the original true sentence length
+    Nx.divide(elem(result, 1), Nx.as_type(orig_seq_len, :f32))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase2_Eval, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+
+# ==============================================================================
+# 1. LOAD MODELS
+# ==============================================================================
+IO.puts("🌌 Loading Phase 1 Frozen Manifold...") # phase1_sinkhorn_diffusion_25k_COMPLETE phase1_shape_diffusion_25k_COMPLETE.bin
+%{params: {cpu_embeds, _, _, _}} = File.read!("phase1_sinkGD_diffusion_256sq3e5_14k_COMPLETE.bin") |> :erlang.binary_to_term()
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+IO.puts("⚙️ Loading Phase 2.1 Introspective SSM...")
+# ⚡ Read the 11-parameter tuple directly
+checkpoint_path = "v38_DLM_Phase_2_4_cbow256_3e5_eps03_checkpoint_step_1000.bin"
+phase2_p = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+
+# Move the tuple to GPU
+p = DLM.Tree.map(phase2_p, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# PRE-WARM: compile the JIT kernel once
+# ==============================================================================
+IO.puts("🔥 Pre-warming JIT compiler...")
+warmup_tokens = Nx.tensor([[72, 101, 108, 108, 111]], type: :s32) |> Nx.backend_copy(gpu)
+warmup_input  = Nx.slice_along_axis(warmup_tokens, 0, 4, axis: 1)
+warmup_target = Nx.slice_along_axis(warmup_tokens, 1, 4, axis: 1)
+h_init_warm   = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+warmup_len = Nx.tensor(4, type: :s32)
+
+DLM.Phase2_Eval.compute_sentence_loss(warmup_input, warmup_target, warmup_len, h_init_warm, p, frozen_map)
+IO.puts("✅ JIT warm, starting batch...\n")
+
+# ==============================================================================
+# 2. EVAL FUNCTION
+# ==============================================================================
+run_blimp = fn path ->
+  pairs =
+    File.read!(path)
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
+
+  total_pairs = length(pairs)
+
+  {passes, total_loss_diff} =
+    Enum.reduce(pairs, {0, 0.0}, fn pair, {pass_count, diff_acc} ->
+      good_sentence = pair["sentence_good"]
+      bad_sentence  = pair["sentence_bad"]
+  
+      good_val_tokens = good_sentence |> to_charlist() |> Nx.tensor(type: :s32)
+      bad_val_tokens  = bad_sentence  |> to_charlist() |> Nx.tensor(type: :s32)
+
+      good_seq_len = Nx.size(good_val_tokens) - 1
+      bad_seq_len  = Nx.size(bad_val_tokens)  - 1
+
+      # ⚡ UPDATE: Pad explicitly to 256 to lock the JIT compiler to your new manifold
+      good_pad = 256 - good_seq_len
+      bad_pad  = 256 - bad_seq_len
+
+      # Slice and Pad (using ASCII 1 as the padding token)
+      good_input  = Nx.slice_along_axis(good_val_tokens, 0, good_seq_len, axis: 0) |> Nx.pad(1, [{0, good_pad, 0}]) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      good_target = Nx.slice_along_axis(good_val_tokens, 1, good_seq_len, axis: 0) |> Nx.pad(1, [{0, good_pad, 0}]) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      bad_input   = Nx.slice_along_axis(bad_val_tokens,  0, bad_seq_len,  axis: 0) |> Nx.pad(1, [{0, bad_pad, 0}]) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      bad_target  = Nx.slice_along_axis(bad_val_tokens,  1, bad_seq_len,  axis: 0) |> Nx.pad(1, [{0, bad_pad, 0}]) |> Nx.new_axis(0) |> Nx.backend_copy(gpu)
+      
+      # Send original lengths to GPU for the loss mask
+      good_len_t = Nx.tensor(good_seq_len, type: :s32) |> Nx.backend_copy(gpu)
+      bad_len_t  = Nx.tensor(bad_seq_len, type: :s32) |> Nx.backend_copy(gpu)
+  
+      h_init = Nx.broadcast(0.0, {1, 512}) |> Nx.backend_copy(gpu)
+  
+      # Execute using Phase 2 Eval
+      good_loss = DLM.Phase2_Eval.compute_sentence_loss(good_input, good_target, good_len_t, h_init, p, frozen_map) |> Nx.to_number()
+      bad_loss  = DLM.Phase2_Eval.compute_sentence_loss(bad_input,  bad_target,  bad_len_t, h_init, p, frozen_map) |> Nx.to_number()
+  
+      # Explicit cleanup
+      :erlang.garbage_collect(self())
+  
+      new_pass_count = if good_loss < bad_loss, do: pass_count + 1, else: pass_count
+      {new_pass_count, diff_acc + (bad_loss - good_loss)}
+    end)
+
+  accuracy   = (passes / total_pairs) * 100.0
+  avg_margin = total_loss_diff / total_pairs
+  name       = Path.basename(path, ".jsonl")
+
+  {name, accuracy, avg_margin, passes, total_pairs}
+end
+
+# ==============================================================================
+# 3. BATCH RUN
+# ==============================================================================
+dataset_files = Path.wildcard("./data/blimp_filtered/*.jsonl") |> Enum.sort()
+total_files   = length(dataset_files)
+
+IO.puts("🚀 Running BLiMP batch eval across #{total_files} datasets...\n")
+
+results =
+  dataset_files
+  |> Enum.with_index(1)
+  |> Enum.map(fn {path, idx} ->
+    IO.puts("  [#{idx}/#{total_files}] #{Path.basename(path)}...")
+    result = run_blimp.(path)
+    :erlang.garbage_collect(self())
+    result
+  end)
+
+# ==============================================================================
+# 4. SORTED SUMMARY
+# ==============================================================================
+sorted = Enum.sort_by(results, fn {_, acc, _, _, _} -> acc end, :desc)
+
+IO.puts("\n")
+IO.puts(String.duplicate("=", 70))
+IO.puts("🏆 BLIMP BATCH RESULTS — sorted by accuracy")
+IO.puts(String.duplicate("=", 70))
+IO.puts(String.pad_trailing("Dataset", 48) <> "Accuracy   Margin")
+IO.puts(String.duplicate("-", 70))
+
+Enum.each(sorted, fn {name, acc, margin, passes, total} ->
+  flag = cond do
+    acc >= 60.0 -> "✅"
+    acc <= 40.0 -> "❌"
+    true        -> "〰️"
+  end
+  IO.puts("#{flag} #{String.pad_trailing(name, 46)} #{String.pad_leading("#{Float.round(acc, 1)}%", 7)} (#{passes}/#{total})   #{Float.round(margin, 4)}")
+end)
+
+IO.puts(String.duplicate("-", 70))
+
+# Overall average
+avg_acc = results |> Enum.map(fn {_, acc, _, _, _} -> acc end) |> Enum.sum() |> Kernel./(total_files)
+IO.puts("📊 Overall average accuracy: #{Float.round(avg_acc, 2)}%")
+IO.puts(String.duplicate("=", 70))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 Loading Phase 1 Frozen Manifold...
+⚙️ Loading Phase 2.1 Introspective SSM...
+🔥 Pre-warming JIT compiler...
+✅ JIT warm, starting batch...
+
+🚀 Running BLiMP batch eval across 67 datasets...
+
+  [1/67] adjunct_island.jsonl...
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.Phase2Trainer do
+  import Nx.Defn
+
+  defn compute_sequence_loss(input_tokens, target_tokens, h_init, params, embeds) do
+    # 1. Grab Input Coordinates
+    input_coords =
+      Nx.take(embeds, Nx.flatten(input_tokens))
+      |> Nx.reshape({Nx.axis_size(input_tokens, 0), Nx.axis_size(input_tokens, 1), 512})
+      |> stop_grad()
+  
+    # ⚡ FIX 2: Grab Target Coordinates from the Frozen Map!
+    target_coords =
+      Nx.take(embeds, Nx.flatten(target_tokens))
+      |> Nx.reshape({Nx.axis_size(target_tokens, 0), Nx.axis_size(target_tokens, 1), 512})
+      |> stop_grad()
+
+    inputs_time_first = Nx.transpose(input_coords, axes: [1, 0, 2])
+    # The targets are now the 512D coordinates, not the integers
+    targets_fwd_time_first = Nx.transpose(target_coords, axes: [1, 0, 2])
+    targets_retro_time_first = Nx.transpose(input_coords, axes: [1, 0, 2])
+  
+    # The main unroll loop
+    result =
+      while {i = 0, total_fwd = 0.0, total_retro = 0.0, h = h_init, 
+             inf = inputs_time_first, tf = targets_fwd_time_first, tr = targets_retro_time_first, p = params},
+            Nx.less(i, Nx.axis_size(inf, 0)) do
+    
+        x_curr = inf[i]
+        
+        {logits_fwd, logits_retro, h_new} = DLM.TinySSM.forward_step(x_curr, h, p)
+
+        # ⚡ FIX 3: Do NOT flatten the batch dimension! 
+        # Both logits and targets are now perfectly shaped {batch_size, 512}
+        fwd_norm = DLM.Loss.l2_normalize(logits_fwd)
+        retro_norm = DLM.Loss.l2_normalize(logits_retro)
+
+        tf_norm = DLM.Loss.l2_normalize(tf[i])
+        tr_norm = DLM.Loss.l2_normalize(tr[i])
+        
+        # Calculate OT across the batch cloud
+        l_fwd = DLM.SinkhornOT.compute(fwd_norm, tf_norm, 0.1, 16)
+        l_retro = DLM.SinkhornOT.compute(retro_norm, tr_norm, 0.1, 16)
+        
+        {i + 1, total_fwd + l_fwd, total_retro + l_retro, h_new, inf, tf, tr, p}
+      end
+  
+    {_, acc_fwd, acc_retro, _, _, _, _, _} = result
+    
+    seq_len = Nx.axis_size(inputs_time_first, 0)
+    mean_fwd = acc_fwd / seq_len
+    mean_retro = acc_retro / seq_len
+    
+    total_loss = mean_fwd + (0.3 * mean_retro)
+    
+    {total_loss, {mean_fwd, mean_retro}}
+  end
+
+ defn compute_grad(params, batch_tokens, h_init, frozen_embeds) do
+    {_batch_size, full_seq_len} = Nx.shape(batch_tokens)
+    seq_len = full_seq_len - 1
+    
+    input_tokens  = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+
+    # ⚡ FIX 1: Run the full pass first to extract telemetry for your IO
+    {total_loss, {fwd_loss, retro_loss}} = compute_sequence_loss(
+      input_tokens, target_tokens, h_init, params, frozen_embeds
+    )
+  
+    # ⚡ FIX 2: value_and_grad closure MUST return only the scalar total_loss
+    {_loss, raw_grads} = value_and_grad(params, fn p ->
+      {tot_loss, _aux} = compute_sequence_loss(input_tokens, target_tokens, h_init, p, frozen_embeds)
+      tot_loss
+    end)
+  
+    {total_loss, fwd_loss, retro_loss, raw_grads}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase2Trainer, <<70, 79, 82, 49, 0, 0, 30, ...>>, true}
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Scans the directory for the latest checkpoint of a specific run prefix.
+  If no checkpoints exist, it triggers a completely fresh initialization.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("✨ Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("✨ No checkpoints found for '#{run_prefix}'. Starting FRESH from Genesis.")
+        {:fresh, 0}
+      end
+    else
+      # Extract step numbers using regex and find the maximum
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("🚀 Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.CheckpointManager, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:get_resume_state, 1}}
+```
+
+```elixir
+run_prefix  = "v38_DLM_Phase_2_4_cbow256_1e4_10n"  
+total_steps = 120000
+
+# ⚡ 2. CHECK RESUME STATE (No more base_weights passed in!)
+{load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
+
+if start_step == :completed do
+  IO.puts("✅ This run has already reached #{total_steps} steps. Exiting.")
+else
+  # 1. Load the completed Phase 1 state
+  %{params: phase1_p} = File.read!("phase1_sinkGD_diffusion_256sq3e5_14k_COMPLETE.bin") |> :erlang.binary_to_term()
+  
+  {cpu_embeds, _w1, _w2, _key} = phase1_p
+  
+  # 3. Push the finalized map to the GPU and L2 Normalize it one last time to be safe
+  frozen_map = cpu_embeds
+               |> Nx.backend_copy(gpu)
+               |> DLM.Loss.l2_normalize()
+  
+  IO.puts("🌌 Phase 1 Frozen Manifold Loaded & Normalized!")
+
+  batch_size = 24
+  seq_len = 256  
+
+  IO.puts("🧠 Loading LPSSM 256seqlen training data CPU Memory...")
+  dataset_2d = File.read!("scholar_full_mixed_256.bin") |> :erlang.binary_to_term()
+  dataset = Nx.flatten(dataset_2d)
+  data_stream = DLM.DataStreamer.build_infinite_stream(dataset, batch_size, seq_len)
+
+  # ⚡ 3. BRANCHING WEIGHT INITIALIZATION
+  {starting_params, initial_key} =
+    if load_path == :fresh do
+      IO.puts("✨ Igniting brand new Genesis weights for #{run_prefix}...")
+      DLM.PhysicsGenesis.ignite(Nx.Random.key(System.system_time()))
+    else
+      IO.puts("✨ Loading Weights from #{load_path}...")
+      loaded_p = File.read!(load_path) |> :erlang.binary_to_term()
+      # Give it a fresh noise key even if resuming
+      {loaded_p, Nx.Random.key(System.system_time())}
+    end
+
+    # Initialize the optimizer states with zeroes
+    {m, v, _step_count} = DLM.PhysicsGenesis.init_optimizer(starting_params)
+  
+    # Move everything to the GPU
+    p = DLM.Tree.map(starting_params, &Nx.backend_copy(&1, gpu))
+    m = DLM.Tree.map(m, &Nx.backend_copy(&1, gpu))
+    v = DLM.Tree.map(v, &Nx.backend_copy(&1, gpu))
+    step_count = Nx.tensor(start_step) |> Nx.backend_copy(gpu)
+  
+    # ⚡ 4. ZIP FROM THE START_STEP
+    {final_p, _m, _v, _key, _step} = 
+      Enum.reduce(Enum.zip(start_step..(total_steps - 1), data_stream), {p, m, v, initial_key, step_count}, fn {step, cpu_batch}, {cp, cm, cv, cur_key, c_step} ->
+        
+        gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+        
+        # DYNAMIC LEARNING RATE SCHEDULER
+        max_lr = 1.0e-4
+        warmup_steps = 1000
+  
+        current_lr =
+          if step < warmup_steps do
+            max_lr * (step / warmup_steps)
+          else
+            decay_ratio = (step - warmup_steps) / (total_steps - warmup_steps)
+            max_lr * 0.5 * (1.0 + :math.cos(:math.pi() * decay_ratio))
+          end
+        
+        lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+        h_init = Nx.broadcast(0.0, {batch_size, 512}) |> Nx.as_type(:f32) |> Nx.backend_copy(gpu)
+  
+        split_keys = Nx.Random.split(cur_key)
+        next_key = split_keys[1]
+        
+        # ⚡ UPDATE: Catch all three loss components
+        {loss_tensor, fwd_tensor, retro_tensor, grads} = DLM.Phase2Trainer.compute_grad(
+          cp, gpu_batch, h_init, frozen_map
+        )
+  
+        # ⚡ UPDATE: Telemetry capture for all components
+        loss_vals = if rem(step, 50) == 0 do
+          {Nx.to_number(loss_tensor), Nx.to_number(fwd_tensor), Nx.to_number(retro_tensor)}
+        else
+          {0.0, 0.0, 0.0}
+        end
+  
+        # ⚡ Use the 11-param Optimizer (AdamMuonHybrid)
+        {up_p, up_m, up_v, up_step} = DLM.AdamMuonHybrid.update(cp, grads, cm, cv, c_step, lr_tensor)
+  
+        # ➡️ Telemetry
+        if rem(step, 50) == 0 do
+          {tot_v, fwd_v, ret_v} = loss_vals
+          # ⚡ Unpack the 11 params for norm checking
+          {a, bu, bv, cu, cv, du, dv, vw, vb, rb, rw} = up_p
+          a_norm = a |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          bu_norm = bu |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          bv_norm = bv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          cu_norm = cu |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          cv_norm = cv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          du_norm = du |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          dv_norm = dv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          vw_norm = vw |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          vb_norm = vb |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          rb_norm = rb |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+          rw_norm = rw |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+
+  
+          IO.puts("➡️ Step #{step} | Total: #{Float.round(tot_v, 4)} | FWD: #{Float.round(fwd_v, 4)} | RETRO: #{Float.round(ret_v, 4)} | LR: #{Float.round(current_lr, 6)}")
+          IO.puts("Grad Norms: a #{a_norm} | bu #{bu_norm} | bv #{bv_norm} | cu #{cu_norm} | cv #{cv_norm} | du #{du_norm} | dv #{dv_norm} | rw #{rw_norm} | rb #{rb_norm} | vw #{vw_norm} | vb #{vb_norm}")
+          :erlang.garbage_collect()
+        end
+  
+        # 💾 DYNAMIC CHECKPOINT SAVING
+        if rem(step, 1000) == 0 and step > 0 do
+          IO.puts("💾 Checkpoint reached! Saving Step #{step}...")
+          cpu_snapshot = DLM.Tree.map(up_p, &Nx.backend_copy(&1, Nx.BinaryBackend))
+          filename = "#{run_prefix}_checkpoint_step_#{step}.bin"
+          File.write!(filename, :erlang.term_to_binary(cpu_snapshot)) 
+        end
+  
+        {up_p, up_m, up_v, next_key, up_step}
+    end)
+
+  IO.puts("💾 Saving Final Gated Physics Engine Weights...")
+  # It is safe to use backend_transfer here because the run is over
+  good_params = DLM.Tree.map(final_p, &Nx.backend_transfer(&1, Nx.BinaryBackend))
+  File.write!("#{run_prefix}_final.bin", :erlang.term_to_binary(good_params))
+  IO.puts("✅ Resaved with clean CPU tensors")
+  IO.puts("✅ Physics Engine Training Complete!")
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🚀 Auto-Resuming 'v38_DLM_Phase_2_4_cbow256_1e4_10n' from Step 3000...
+
+08:32:21.464 [info] XLA service 0x7a9eb0005bd0 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+08:32:21.465 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+08:32:21.465 [info] Using BFC allocator.
+
+08:32:21.465 [info] XLA backend will use up to 6858525900 bytes on device 0 for BFCAllocator.
+
+08:32:21.465 [info] XLA backend will use up to 1714631475 bytes on device 0 for CollectiveBFCAllocator.
+🌌 Phase 1 Frozen Manifold Loaded & Normalized!
+🧠 Loading LPSSM 256seqlen training data CPU Memory...
+✨ Loading Weights from v38_DLM_Phase_2_4_cbow256_1e4_10n_checkpoint_step_3000.bin...
+
+08:32:22.209 [info] Merging Dots in computation: region_0.17.clone
+
+08:32:22.210 [info] Merging Dots in computation: region_18.56.clone.clone
+➡️ Step 3000 | Total: 3.0629 | FWD: 2.3564 | RETRO: 2.355 | LR: 0.0001
+Grad Norms: a 2.6322 | bu 15.9078 | bv 15.8771 | cu 15.8573 | cv 15.8666 | du 16.0675 | dv 16.0859 | rw 11.2033 | rb 0.3845 | vw 11.2066 | vb 0.3802
+💾 Checkpoint reached! Saving Step 3000...
+➡️ Step 3050 | Total: 3.0671 | FWD: 2.3594 | RETRO: 2.359 | LR: 0.0001
+Grad Norms: a 2.6481 | bu 15.9075 | bv 15.8764 | cu 15.8566 | cv 15.8656 | du 16.0678 | dv 16.0865 | rw 11.2027 | rb 0.3943 | vw 11.2061 | vb 0.3896
+➡️ Step 3100 | Total: 3.0731 | FWD: 2.3642 | RETRO: 2.3628 | LR: 0.0001
+Grad Norms: a 2.662 | bu 15.907 | bv 15.8756 | cu 15.8558 | cv 15.8645 | du 16.0681 | dv 16.0872 | rw 11.2021 | rb 0.3996 | vw 11.2055 | vb 0.3943
+➡️ Step 3150 | Total: 3.0422 | FWD: 2.3401 | RETRO: 2.3406 | LR: 0.0001
+Grad Norms: a 2.6719 | bu 15.9066 | bv 15.8748 | cu 15.855 | cv 15.8634 | du 16.0684 | dv 16.0879 | rw 11.2014 | rb 0.4022 | vw 11.2048 | vb 0.3965
+➡️ Step 3200 | Total: 3.0729 | FWD: 2.364 | RETRO: 2.363 | LR: 0.0001
+Grad Norms: a 2.6811 | bu 15.9061 | bv 15.874 | cu 15.8542 | cv 15.8622 | du 16.0687 | dv 16.0887 | rw 11.2007 | rb 0.405 | vw 11.2042 | vb 0.3992
+➡️ Step 3250 | Total: 3.0766 | FWD: 2.3671 | RETRO: 2.3649 | LR: 0.0001
+Grad Norms: a 2.6894 | bu 15.9057 | bv 15.8732 | cu 15.8535 | cv 15.8611 | du 16.069 | dv 16.0895 | rw 11.2001 | rb 0.4063 | vw 11.2036 | vb 0.4007
+➡️ Step 3300 | Total: 3.0736 | FWD: 2.3641 | RETRO: 2.365 | LR: 0.0001
+Grad Norms: a 2.6926 | bu 15.9052 | bv 15.8725 | cu 15.8527 | cv 15.86 | du 16.0693 | dv 16.0901 | rw 11.1995 | rb 0.4076 | vw 11.2031 | vb 0.4018
+➡️ Step 3350 | Total: 3.0581 | FWD: 2.3525 | RETRO: 2.3519 | LR: 0.0001
+Grad Norms: a 2.6952 | bu 15.9047 | bv 15.8718 | cu 15.852 | cv 15.8589 | du 16.0695 | dv 16.0908 | rw 11.1988 | rb 0.4086 | vw 11.2024 | vb 0.403
+➡️ Step 3400 | Total: 3.0582 | FWD: 2.3529 | RETRO: 2.3512 | LR: 0.0001
+Grad Norms: a 2.6982 | bu 15.9043 | bv 15.8711 | cu 15.8512 | cv 15.8579 | du 16.0698 | dv 16.0915 | rw 11.1981 | rb 0.4091 | vw 11.2019 | vb 0.4033
+➡️ Step 3450 | Total: 3.0607 | FWD: 2.3541 | RETRO: 2.3555 | LR: 0.0001
+Grad Norms: a 2.7042 | bu 15.9038 | bv 15.8703 | cu 15.8504 | cv 15.8568 | du 16.0701 | dv 16.0923 | rw 11.1975 | rb 0.4103 | vw 11.2013 | vb 0.4047
+➡️ Step 3500 | Total: 3.0682 | FWD: 2.3602 | RETRO: 2.3603 | LR: 0.0001
+Grad Norms: a 2.7046 | bu 15.9033 | bv 15.8695 | cu 15.8498 | cv 15.8558 | du 16.0704 | dv 16.093 | rw 11.1969 | rb 0.4102 | vw 11.2008 | vb 0.4047
+➡️ Step 3550 | Total: 3.1004 | FWD: 2.3852 | RETRO: 2.3843 | LR: 0.0001
+Grad Norms: a 2.7034 | bu 15.903 | bv 15.8689 | cu 15.8491 | cv 15.8548 | du 16.0707 | dv 16.0936 | rw 11.1963 | rb 0.4105 | vw 11.2003 | vb 0.4049
+➡️ Step 3600 | Total: 3.0559 | FWD: 2.3509 | RETRO: 2.35 | LR: 0.0001
+Grad Norms: a 2.7031 | bu 15.9026 | bv 15.8682 | cu 15.8485 | cv 15.8539 | du 16.071 | dv 16.0943 | rw 11.1957 | rb 0.4107 | vw 11.1997 | vb 0.405
+➡️ Step 3650 | Total: 3.0619 | FWD: 2.3552 | RETRO: 2.3558 | LR: 0.0001
+Grad Norms: a 2.7033 | bu 15.9022 | bv 15.8674 | cu 15.8478 | cv 15.8528 | du 16.0713 | dv 16.0951 | rw 11.1951 | rb 0.4113 | vw 11.1992 | vb 0.4052
+➡️ Step 3700 | Total: 3.0618 | FWD: 2.3552 | RETRO: 2.3552 | LR: 0.0001
+Grad Norms: a 2.7065 | bu 15.9017 | bv 15.8665 | cu 15.847 | cv 15.8517 | du 16.0716 | dv 16.0958 | rw 11.1945 | rb 0.4116 | vw 11.1986 | vb 0.4056
+➡️ Step 3750 | Total: 3.0391 | FWD: 2.3377 | RETRO: 2.338 | LR: 0.0001
+Grad Norms: a 2.7034 | bu 15.9014 | bv 15.8658 | cu 15.8464 | cv 15.8508 | du 16.0719 | dv 16.0964 | rw 11.1939 | rb 0.4116 | vw 11.198 | vb 0.4052
+➡️ Step 3800 | Total: 3.0514 | FWD: 2.3475 | RETRO: 2.3465 | LR: 0.0001
+Grad Norms: a 2.7048 | bu 15.9009 | bv 15.8651 | cu 15.8457 | cv 15.8498 | du 16.0722 | dv 16.097 | rw 11.1933 | rb 0.4117 | vw 11.1975 | vb 0.4054
+➡️ Step 3850 | Total: 3.058 | FWD: 2.3526 | RETRO: 2.3511 | LR: 0.0001
+Grad Norms: a 2.7005 | bu 15.9006 | bv 15.8644 | cu 15.8451 | cv 15.8489 | du 16.0724 | dv 16.0977 | rw 11.1928 | rb 0.4113 | vw 11.197 | vb 0.405
+➡️ Step 3900 | Total: 3.0836 | FWD: 2.3721 | RETRO: 2.3718 | LR: 0.0001
+Grad Norms: a 2.701 | bu 15.9002 | bv 15.8636 | cu 15.8444 | cv 15.8479 | du 16.0728 | dv 16.0985 | rw 11.1923 | rb 0.4113 | vw 11.1965 | vb 0.4051
+➡️ Step 3950 | Total: 3.0634 | FWD: 2.3564 | RETRO: 2.3565 | LR: 0.0001
+Grad Norms: a 2.703 | bu 15.8997 | bv 15.8629 | cu 15.8437 | cv 15.847 | du 16.073 | dv 16.0991 | rw 11.1917 | rb 0.4116 | vw 11.196 | vb 0.4055
+➡️ Step 4000 | Total: 3.0743 | FWD: 2.3651 | RETRO: 2.3641 | LR: 0.0001
+Grad Norms: a 2.6992 | bu 15.8993 | bv 15.8623 | cu 15.8431 | cv 15.846 | du 16.0733 | dv 16.0999 | rw 11.1912 | rb 0.4112 | vw 11.1955 | vb 0.4052
+💾 Checkpoint reached! Saving Step 4000...
+➡️ Step 4050 | Total: 3.0518 | FWD: 2.3476 | RETRO: 2.3475 | LR: 0.0001
+Grad Norms: a 2.6966 | bu 15.8989 | bv 15.8615 | cu 15.8425 | cv 15.845 | du 16.0735 | dv 16.1006 | rw 11.1907 | rb 0.4108 | vw 11.195 | vb 0.4049
+➡️ Step 4100 | Total: 3.0681 | FWD: 2.3601 | RETRO: 2.36 | LR: 0.0001
+Grad Norms: a 2.6962 | bu 15.8984 | bv 15.8608 | cu 15.8418 | cv 15.8441 | du 16.0738 | dv 16.1013 | rw 11.1901 | rb 0.4106 | vw 11.1945 | vb 0.4049
+➡️ Step 4150 | Total: 3.0544 | FWD: 2.3493 | RETRO: 2.3501 | LR: 0.0001
+Grad Norms: a 2.6952 | bu 15.898 | bv 15.8602 | cu 15.8412 | cv 15.8432 | du 16.074 | dv 16.102 | rw 11.1896 | rb 0.4105 | vw 11.1941 | vb 0.4047
+➡️ Step 4200 | Total: 3.0503 | FWD: 2.3466 | RETRO: 2.3457 | LR: 0.0001
+Grad Norms: a 2.6933 | bu 15.8976 | bv 15.8595 | cu 15.8407 | cv 15.8424 | du 16.0743 | dv 16.1027 | rw 11.1891 | rb 0.4101 | vw 11.1936 | vb 0.4044
+➡️ Step 4250 | Total: 3.0737 | FWD: 2.3642 | RETRO: 2.3647 | LR: 0.0001
+Grad Norms: a 2.6909 | bu 15.8971 | bv 15.8589 | cu 15.8401 | cv 15.8415 | du 16.0746 | dv 16.1034 | rw 11.1886 | rb 0.4097 | vw 11.1932 | vb 0.4041
+➡️ Step 4300 | Total: 3.0821 | FWD: 2.3706 | RETRO: 2.3715 | LR: 0.0001
+Grad Norms: a 2.6872 | bu 15.8967 | bv 15.8583 | cu 15.8395 | cv 15.8407 | du 16.0749 | dv 16.104 | rw 11.1881 | rb 0.4096 | vw 11.1928 | vb 0.404
+➡️ Step 4350 | Total: 3.0618 | FWD: 2.3555 | RETRO: 2.3543 | LR: 0.0001
+Grad Norms: a 2.6846 | bu 15.8964 | bv 15.8577 | cu 15.839 | cv 15.84 | du 16.0751 | dv 16.1046 | rw 11.1877 | rb 0.4094 | vw 11.1924 | vb 0.404
+➡️ Step 4400 | Total: 3.095 | FWD: 2.3806 | RETRO: 2.3812 | LR: 0.0001
+Grad Norms: a 2.6787 | bu 15.896 | bv 15.8572 | cu 15.8385 | cv 15.8391 | du 16.0754 | dv 16.1053 | rw 11.1872 | rb 0.4089 | vw 11.1919 | vb 0.4035
+➡️ Step 4450 | Total: 3.0727 | FWD: 2.3633 | RETRO: 2.3646 | LR: 0.0001
+Grad Norms: a 2.6733 | bu 15.8956 | bv 15.8566 | cu 15.8379 | cv 15.8383 | du 16.0757 | dv 16.106 | rw 11.1868 | rb 0.4083 | vw 11.1916 | vb 0.4027
+➡️ Step 4500 | Total: 3.0572 | FWD: 2.3517 | RETRO: 2.3515 | LR: 0.0001
+Grad Norms: a 2.6722 | bu 15.8953 | bv 15.8561 | cu 15.8374 | cv 15.8374 | du 16.076 | dv 16.1067 | rw 11.1863 | rb 0.4076 | vw 11.1911 | vb 0.4024
+➡️ Step 4550 | Total: 3.0462 | FWD: 2.3438 | RETRO: 2.3415 | LR: 0.0001
+Grad Norms: a 2.6727 | bu 15.8949 | bv 15.8555 | cu 15.8368 | cv 15.8366 | du 16.0763 | dv 16.1073 | rw 11.1859 | rb 0.4079 | vw 11.1907 | vb 0.4027
+➡️ Step 4600 | Total: 3.0422 | FWD: 2.3402 | RETRO: 2.34 | LR: 0.0001
+Grad Norms: a 2.6685 | bu 15.8945 | bv 15.8548 | cu 15.8363 | cv 15.8358 | du 16.0765 | dv 16.1079 | rw 11.1854 | rb 0.4075 | vw 11.1903 | vb 0.4021
+➡️ Step 4650 | Total: 3.0559 | FWD: 2.3506 | RETRO: 2.3509 | LR: 0.0001
+Grad Norms: a 2.6624 | bu 15.8943 | bv 15.8543 | cu 15.8357 | cv 15.835 | du 16.0769 | dv 16.1087 | rw 11.185 | rb 0.4066 | vw 11.1899 | vb 0.4011
+➡️ Step 4700 | Total: 3.0597 | FWD: 2.3535 | RETRO: 2.3539 | LR: 0.0001
+Grad Norms: a 2.666 | bu 15.8938 | bv 15.8537 | cu 15.8351 | cv 15.8341 | du 16.0772 | dv 16.1093 | rw 11.1845 | rb 0.4071 | vw 11.1895 | vb 0.4015
+➡️ Step 4750 | Total: 3.055 | FWD: 2.3502 | RETRO: 2.3494 | LR: 0.0001
+Grad Norms: a 2.6633 | bu 15.8935 | bv 15.8531 | cu 15.8346 | cv 15.8334 | du 16.0775 | dv 16.1099 | rw 11.184 | rb 0.4067 | vw 11.1891 | vb 0.4012
+➡️ Step 4800 | Total: 3.0899 | FWD: 2.3767 | RETRO: 2.3773 | LR: 0.0001
+Grad Norms: a 2.6588 | bu 15.8931 | bv 15.8525 | cu 15.834 | cv 15.8326 | du 16.0777 | dv 16.1106 | rw 11.1835 | rb 0.4061 | vw 11.1886 | vb 0.4006
+➡️ Step 4850 | Total: 3.0307 | FWD: 2.3312 | RETRO: 2.3314 | LR: 0.0001
+Grad Norms: a 2.6542 | bu 15.8927 | bv 15.852 | cu 15.8335 | cv 15.8318 | du 16.0779 | dv 16.1113 | rw 11.1832 | rb 0.4056 | vw 11.1883 | vb 0.4001
+➡️ Step 4900 | Total: 3.0588 | FWD: 2.3528 | RETRO: 2.3534 | LR: 0.0001
+Grad Norms: a 2.6482 | bu 15.8924 | bv 15.8514 | cu 15.833 | cv 15.831 | du 16.0782 | dv 16.1119 | rw 11.1828 | rb 0.4046 | vw 11.1879 | vb 0.3993
+➡️ Step 4950 | Total: 3.0679 | FWD: 2.3598 | RETRO: 2.3602 | LR: 0.0001
+Grad Norms: a 2.647 | bu 15.892 | bv 15.8508 | cu 15.8324 | cv 15.8301 | du 16.0784 | dv 16.1127 | rw 11.1823 | rb 0.4044 | vw 11.1875 | vb 0.3989
+➡️ Step 5000 | Total: 3.0746 | FWD: 2.3651 | RETRO: 2.3653 | LR: 0.0001
+Grad Norms: a 2.6436 | bu 15.8916 | bv 15.8503 | cu 15.8319 | cv 15.8294 | du 16.0787 | dv 16.1133 | rw 11.1819 | rb 0.4038 | vw 11.1871 | vb 0.3984
+💾 Checkpoint reached! Saving Step 5000...
+➡️ Step 5050 | Total: 3.0583 | FWD: 2.3528 | RETRO: 2.3519 | LR: 0.0001
+Grad Norms: a 2.6391 | bu 15.8914 | bv 15.8499 | cu 15.8315 | cv 15.8288 | du 16.0791 | dv 16.114 | rw 11.1816 | rb 0.4028 | vw 11.1868 | vb 0.3976
+➡️ Step 5100 | Total: 3.0765 | FWD: 2.3671 | RETRO: 2.365 | LR: 0.0001
+Grad Norms: a 2.637 | bu 15.891 | bv 15.8493 | cu 15.831 | cv 15.8279 | du 16.0794 | dv 16.1146 | rw 11.1811 | rb 0.4024 | vw 11.1864 | vb 0.397
+➡️ Step 5150 | Total: 3.076 | FWD: 2.3662 | RETRO: 2.3658 | LR: 0.0001
+Grad Norms: a 2.6345 | bu 15.8906 | bv 15.8487 | cu 15.8305 | cv 15.8271 | du 16.0796 | dv 16.1153 | rw 11.1807 | rb 0.4019 | vw 11.186 | vb 0.3969
+➡️ Step 5200 | Total: 3.0508 | FWD: 2.3467 | RETRO: 2.3471 | LR: 0.0001
+Grad Norms: a 2.6317 | bu 15.8903 | bv 15.8482 | cu 15.83 | cv 15.8264 | du 16.08 | dv 16.1161 | rw 11.1803 | rb 0.4011 | vw 11.1856 | vb 0.396
+➡️ Step 5250 | Total: 3.0502 | FWD: 2.3465 | RETRO: 2.3458 | LR: 0.0001
+Grad Norms: a 2.6294 | bu 15.89 | bv 15.8477 | cu 15.8295 | cv 15.8256 | du 16.0802 | dv 16.1167 | rw 11.1799 | rb 0.401 | vw 11.1853 | vb 0.3959
+➡️ Step 5300 | Total: 3.0463 | FWD: 2.3433 | RETRO: 2.3433 | LR: 0.0001
+Grad Norms: a 2.6273 | bu 15.8897 | bv 15.8472 | cu 15.829 | cv 15.8249 | du 16.0805 | dv 16.1174 | rw 11.1796 | rb 0.4005 | vw 11.185 | vb 0.3955
+➡️ Step 5350 | Total: 3.0673 | FWD: 2.3592 | RETRO: 2.3603 | LR: 0.0001
+Grad Norms: a 2.6239 | bu 15.8893 | bv 15.8466 | cu 15.8284 | cv 15.8241 | du 16.0808 | dv 16.118 | rw 11.1792 | rb 0.4002 | vw 11.1847 | vb 0.3953
+➡️ Step 5400 | Total: 3.0562 | FWD: 2.3509 | RETRO: 2.3512 | LR: 0.0001
+Grad Norms: a 2.6212 | bu 15.889 | bv 15.8461 | cu 15.828 | cv 15.8234 | du 16.0811 | dv 16.1186 | rw 11.1788 | rb 0.3996 | vw 11.1843 | vb 0.3947
+➡️ Step 5450 | Total: 3.0627 | FWD: 2.3559 | RETRO: 2.3559 | LR: 0.0001
+Grad Norms: a 2.6191 | bu 15.8886 | bv 15.8456 | cu 15.8275 | cv 15.8226 | du 16.0814 | dv 16.1193 | rw 11.1784 | rb 0.3993 | vw 11.184 | vb 0.3945
+➡️ Step 5500 | Total: 3.0416 | FWD: 2.3397 | RETRO: 2.3397 | LR: 0.0001
+Grad Norms: a 2.6157 | bu 15.8883 | bv 15.8451 | cu 15.827 | cv 15.8219 | du 16.0817 | dv 16.1199 | rw 11.1781 | rb 0.3986 | vw 11.1836 | vb 0.3941
+➡️ Step 5550 | Total: 3.0964 | FWD: 2.3819 | RETRO: 2.3816 | LR: 0.0001
+Grad Norms: a 2.6123 | bu 15.888 | bv 15.8446 | cu 15.8266 | cv 15.8211 | du 16.082 | dv 16.1206 | rw 11.1777 | rb 0.3978 | vw 11.1833 | vb 0.393
+➡️ Step 5600 | Total: 3.0479 | FWD: 2.3447 | RETRO: 2.3441 | LR: 0.0001
+Grad Norms: a 2.614 | bu 15.8876 | bv 15.8441 | cu 15.826 | cv 15.8204 | du 16.0823 | dv 16.1212 | rw 11.1773 | rb 0.3978 | vw 11.1829 | vb 0.3931
+➡️ Step 5650 | Total: 3.0853 | FWD: 2.3735 | RETRO: 2.3727 | LR: 0.0001
+Grad Norms: a 2.6086 | bu 15.8873 | bv 15.8436 | cu 15.8256 | cv 15.8197 | du 16.0826 | dv 16.1218 | rw 11.177 | rb 0.3968 | vw 11.1826 | vb 0.3921
+➡️ Step 5700 | Total: 3.0524 | FWD: 2.3478 | RETRO: 2.3485 | LR: 0.0001
+Grad Norms: a 2.6075 | bu 15.8869 | bv 15.8431 | cu 15.8252 | cv 15.8189 | du 16.0828 | dv 16.1225 | rw 11.1766 | rb 0.3964 | vw 11.1823 | vb 0.3918
+➡️ Step 5750 | Total: 3.0715 | FWD: 2.3626 | RETRO: 2.363 | LR: 0.0001
+Grad Norms: a 2.6045 | bu 15.8866 | bv 15.8425 | cu 15.8248 | cv 15.8182 | du 16.0831 | dv 16.1231 | rw 11.1762 | rb 0.3955 | vw 11.1819 | vb 0.391
+➡️ Step 5800 | Total: 3.0691 | FWD: 2.3609 | RETRO: 2.3607 | LR: 0.0001
+Grad Norms: a 2.6015 | bu 15.8863 | bv 15.8421 | cu 15.8243 | cv 15.8176 | du 16.0834 | dv 16.1237 | rw 11.1758 | rb 0.3947 | vw 11.1816 | vb 0.3902
+➡️ Step 5850 | Total: 3.0605 | FWD: 2.3542 | RETRO: 2.3545 | LR: 0.0001
+Grad Norms: a 2.5997 | bu 15.8859 | bv 15.8416 | cu 15.8239 | cv 15.8169 | du 16.0836 | dv 16.1243 | rw 11.1755 | rb 0.3944 | vw 11.1813 | vb 0.3901
+➡️ Step 5900 | Total: 3.0591 | FWD: 2.3532 | RETRO: 2.3528 | LR: 0.0001
+Grad Norms: a 2.5951 | bu 15.8857 | bv 15.8411 | cu 15.8235 | cv 15.8162 | du 16.0838 | dv 16.1249 | rw 11.1752 | rb 0.3934 | vw 11.181 | vb 0.3891
+➡️ Step 5950 | Total: 3.0541 | FWD: 2.3488 | RETRO: 2.351 | LR: 0.0001
+Grad Norms: a 2.5919 | bu 15.8853 | bv 15.8407 | cu 15.8231 | cv 15.8155 | du 16.084 | dv 16.1256 | rw 11.1749 | rb 0.393 | vw 11.1807 | vb 0.3886
+➡️ Step 6000 | Total: 3.0548 | FWD: 2.3497 | RETRO: 2.3502 | LR: 0.0001
+Grad Norms: a 2.5882 | bu 15.885 | bv 15.8403 | cu 15.8227 | cv 15.8149 | du 16.0843 | dv 16.1262 | rw 11.1745 | rb 0.3922 | vw 11.1804 | vb 0.3883
+💾 Checkpoint reached! Saving Step 6000...
+➡️ Step 6050 | Total: 3.041 | FWD: 2.3393 | RETRO: 2.3388 | LR: 0.0001
+Grad Norms: a 2.5843 | bu 15.8847 | bv 15.8398 | cu 15.8223 | cv 15.8142 | du 16.0845 | dv 16.1268 | rw 11.1742 | rb 0.3919 | vw 11.1801 | vb 0.3876
+```

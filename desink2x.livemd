@@ -1,6 +1,6 @@
 <!-- livebook:{"persist_outputs":true} -->
 
-# Diffusion Encoder - sinkhorn
+# Diffusion Encoder - sinkhorn - sinkgd
 
 ```elixir
 System.put_env("XLA_BUILD", "true")
@@ -184,6 +184,65 @@ end
 ```
 
 ```elixir
+defmodule DLM.SparseSinkGD do
+  import Nx.Defn
+
+  @doc """
+  Applies Sinkhorn Gradient Scaling strictly to active (non-zero) gradients.
+  """
+  defn normalize_sparse_grad(grad, iterations) do
+    eps = 1.0e-8
+    
+    # 1. Identify which characters actually appeared in this batch
+    raw_row_norms = Nx.pow(grad, 2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
+    active_mask = Nx.greater(raw_row_norms, eps)
+    
+    # 2. Sinkhorn Alternating Loop
+    result = while {i = 0, g = grad,
+                    am = active_mask}, 
+            Nx.less(i, iterations) do
+      # --- Row Normalization ---
+      row_norms = g |> Nx.pow(2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
+      safe_row_norms = Nx.select(am, row_norms, 1.0)
+      g_row = Nx.divide(g, safe_row_norms)
+      
+      # --- Column Normalization ---
+      col_norms = g_row |> Nx.pow(2) |> Nx.sum(axes: [0], keep_axes: true) |> Nx.sqrt()
+      safe_col_norms = Nx.select(Nx.greater(col_norms, eps), col_norms, 1.0)
+      g_col = Nx.divide(g_row, safe_col_norms)
+      
+      {i + 1, g_col, am}
+    end
+    
+    elem(result, 1)
+  end
+
+  @doc """
+  Stateful Update Step with Momentum for Sparse Embeddings
+  """
+  defn step(embed_matrix, grad, m_prev, lr, beta \\ 0.9) do
+    # 1. Scale the raw sparse gradient first to preserve the boolean mask logic
+    scaled_grad = normalize_sparse_grad(grad, 3)
+    
+    # 2. Update Momentum (Exponential Moving Average)
+    # Mix 90% of the old momentum with 10% of the newly scaled gradient
+    m_new = Nx.add(Nx.multiply(beta, m_prev), Nx.multiply(1.0 - beta, scaled_grad))
+    
+    # 3. Apply the gradient descent subtraction using the momentum buffer
+    new_embeds = Nx.subtract(embed_matrix, Nx.multiply(m_new, lr))
+    
+    {new_embeds, m_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SparseSinkGD, <<70, 79, 82, 49, 0, 0, 24, ...>>, true}
+```
+
+```elixir
 defmodule DLM.ContextualEmbedTrainer do
   import Nx.Defn
 
@@ -218,58 +277,17 @@ defmodule DLM.ContextualEmbedTrainer do
     DLM.SinkhornOT.compute(p_norm, t_norm, 0.1)
   end
 
-  # ⚡ 2. Newton-Schulz Iteration for Orthogonal Isometry
-  defn newton_schulz(g) do
-    norm = Nx.sqrt(Nx.sum(Nx.pow(g, 2)))
-    x_init = Nx.divide(g, Nx.add(norm, 1.0e-8))
-
-    {x_final, _} =
-      while {x = x_init, i = 0}, Nx.less(i, 5) do
-        x_t = Nx.transpose(x)
-        x_t_x = Nx.dot(x_t, x)
-        term = Nx.dot(x, x_t_x)
-        
-        x_next = Nx.subtract(Nx.multiply(1.5, x), Nx.multiply(0.5, term))
-        {x_next, i + 1}
-      end
-      
-    x_final
-  end
-
-  # ⚡ 3. The Muon Update Step
-  defn muon_step(p, g, m, lr, max_norm \\ 20.0) do
-    beta1 = 0.95
-    new_m = beta1 * m + (1.0 - beta1) * g
-    ortho_update = newton_schulz(new_m)
-    
-    r = Nx.axis_size(p, 0)
-    c = Nx.axis_size(p, 1)
-    scale = Nx.divide(Nx.max(r, c), 5.0) |> Nx.as_type(:f32)
-    
-    p_new = p - lr * scale * ortho_update
-    
-    # Clamp norm to prevent runaway expansion
-    current_norm = Nx.sqrt(Nx.sum(Nx.pow(p_new, 2)))
-    p_clipped = Nx.select(
-      current_norm > max_norm,
-      p_new * (max_norm / (current_norm + 1.0e-8)),
-      p_new
-    )
-    
-    {p_clipped, new_m}
-  end
-
   # ⚡ 4. The Unified Master Step
-  defn compute_grad_and_step(e, m, batch_tokens, _step_t, lr) do
-    # Calculate the global transport cost and the exact gradient to minimize it
-    {loss, grad_e} = value_and_grad(e, fn e_params -> 
-      compute_loss(e_params, batch_tokens) 
+  defn compute_grad_and_step(embeds, m_embeds, v_embeds, token_sequences, _step, lr) do
+    {loss, grad_e} = value_and_grad(embeds, fn e ->
+      compute_loss(e, token_sequences)
     end)
-
-    # Pass the gradient through the Muon forge to strictly enforce orthogonality
-    {new_e, new_m} = DLM.SparseSinkGD.step(e, grad_e, m, lr)
-
-    {loss, new_e, new_m}
+  
+    # Pass the momentum buffer (m_embeds) into the step function
+    {new_embeds, new_m} = DLM.SparseSinkGD.step(embeds, grad_e, m_embeds, lr)
+  
+    # Pass v_embeds straight through since we are only using 1st-order momentum
+    {loss, new_embeds, new_m, v_embeds}
   end
 end
 ```
@@ -277,7 +295,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.ContextualEmbedTrainer, <<70, 79, 82, 49, 0, 0, 38, ...>>, true}
+{:module, DLM.ContextualEmbedTrainer, <<70, 79, 82, 49, 0, 0, 23, ...>>, true}
 ```
 
 ```elixir
@@ -287,6 +305,7 @@ key = Nx.Random.key(42) |> Nx.backend_copy(gpu)
 
 embeds = Nx.Random.normal(key, 0.0, 0.1, shape: {128, 512}) |> elem(0) |> Nx.backend_copy(gpu)
 m_embeds = Nx.broadcast(0.0, {128, 512}) |> Nx.backend_copy(gpu)
+v_embeds = Nx.broadcast(0.0, {128, 512}) |> Nx.backend_copy(gpu)
 lr = Nx.tensor(3.0e-5, type: :f32) |> Nx.backend_copy(gpu)
 
 # Flatten the 2D dataset to 1D for the streamer
@@ -294,25 +313,25 @@ full_dataset_2d = File.read!("scholar_full_mixed_128.bin") |> :erlang.binary_to_
 dataset_1d = Nx.flatten(full_dataset_2d)
 data_stream = DLM.DataStreamer.build_infinite_stream(dataset_1d, batch_size, seq_len)
 
-total_steps = 13206
+total_steps = 13300
 IO.puts("🚀 IGNITION: Phase 1 Contextual Shape Training...")
 
-{final_embeds, _final_m} =
+{final_embeds, final_m, final_v} =
   Enum.reduce(
     Enum.zip(0..(total_steps - 1), data_stream),
-    {embeds, m_embeds},
-    fn {step, batch}, {e, m} ->
+    {embeds, m_embeds, v_embeds},
+    fn {step, batch}, {e, m, v} ->
       gpu_batch = Nx.backend_copy(batch, gpu) |> Nx.as_type(:s32)
       step_t = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
 
-      {loss, new_e, new_m} =
-        DLM.ContextualEmbedTrainer.compute_grad_and_step(e, m, gpu_batch, step_t, lr)
+      {loss, new_e, new_m, new_v} =
+        DLM.ContextualEmbedTrainer.compute_grad_and_step(e, m, v, gpu_batch, step_t, lr)
 
       if rem(step, 100) == 0 do
         IO.puts("Step #{step} | Loss: #{Nx.to_number(loss)}")
       end
 
-      {new_e, new_m}
+      {new_e, new_m, new_v}
     end
   )
 
@@ -320,37 +339,35 @@ IO.puts("🎉 PHASE 1 TRAINING COMPLETE!")
 
 # Save — embeddings only, matching the format your downstream code expects
 cpu_embeds = Nx.backend_copy(final_embeds, Nx.BinaryBackend)
+cpu_m = Nx.backend_copy(final_m, Nx.BinaryBackend)
+cpu_v = Nx.backend_copy(final_v, Nx.BinaryBackend)
 
 # ⚡ Match the tuple format your Phase 2 loader expects:
 # %{params: phase1_p} -> {cpu_embeds, _w1, _w2, _key}
 dummy = Nx.broadcast(0.0, {1}) |> Nx.backend_copy(Nx.BinaryBackend)
 File.write!(
-  "phase1_sink_diffusion_13k_COMPLETE.bin",
-  :erlang.term_to_binary(%{params: {cpu_embeds, dummy, dummy, dummy}})
+  "phase1_sinkGD_diffusion_128sq_13k_COMPLETE.bin",
+  :erlang.term_to_binary(%{params: {cpu_embeds, cpu_m, cpu_v, dummy}})
 )
 ```
 
 <!-- livebook:{"output":true} -->
 
 ```
-
-22:16:57.349 [info] XLA service 0x7619280b6080 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
-
-22:16:57.351 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
-
-22:16:57.351 [info] Using BFC allocator.
-
-22:16:57.351 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
-
-22:16:57.351 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
 🚀 IGNITION: Phase 1 Contextual Shape Training...
-
-22:16:57.913 [info] Merging Dots in computation: region_17.18
 Step 0 | Loss: 4.953514007866033e-7
-Step 100 | Loss: 4.928349994770542e-7
-Step 200 | Loss: 1.0723611012508627e-5
-Step 300 | Loss: 1.3578316429629922e-4
-Step 400 | Loss: 1.2233336747158319e-5
+Step 100 | Loss: 4.95813026191172e-7
+Step 200 | Loss: 1.0599093002383597e-5
+Step 300 | Loss: 1.3300817226991057e-4
+Step 400 | Loss: 1.2027465345454402e-5
+Step 500 | Loss: 5.031526670791209e-4
+Step 600 | Loss: 9.024394103107625e-7
+Step 700 | Loss: 1.9743806660699192e-6
+Step 800 | Loss: 6.005242994433502e-6
+Step 900 | Loss: 4.8502953723073006e-4
+Step 1000 | Loss: 1.8057778561342275e-6
+Step 1100 | Loss: 7.293613180081593e-7
+Step 1200 | Loss: 5.380154561862582e-7
 ```
 
 ```elixir

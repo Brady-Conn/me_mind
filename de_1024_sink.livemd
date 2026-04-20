@@ -1,0 +1,940 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Diffusion Encoder - CBOW - SinkGD 1024
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:kino_vega_lite, "~> 0.1.11"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  Works perfectly both in standard Elixir AND inside Nx `defn`.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule DLM.Loss do
+  import Nx.Defn
+
+  defn cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    
+    # Create a 1-hot vector for the correct answer
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    # Stable Log-Softmax
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Cross Entropy calculation
+    Nx.mean(Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1])))
+  end
+
+  # ⚡ Universal L2 Normalizer (Works on 2D, 3D, N-D tensors)
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  # ⚡ 1. Angular Alignment (Cosine Distance)
+  defn cosine_distance(pred, target) do
+    p_norm = l2_normalize(pred)
+    t_norm = l2_normalize(target)
+
+    # Dot product across the 512 dimension
+    cos_sim = Nx.sum(Nx.multiply(p_norm, t_norm), axes: [-1])
+    
+    # Minimize distance (1.0 - similarity)
+    Nx.mean(Nx.subtract(1.0, cos_sim))
+  end
+
+  # ⚡ 2. Repulsion (Memory-Safe Batched Soft-NN for Rank 2 Tensors)
+  defn soft_nn_loss(pred, target, temperature \\ 0.1) do
+    # pred and target are {batch_size, dim}
+    p_l2 = l2_normalize(pred)
+    t_l2 = l2_normalize(target)
+
+    # 1. Batched Dot Product: {batch, dim} x {dim, batch} -> {batch, batch}
+    # This creates a similarity matrix comparing every pred to every target in the batch
+    sim_tensor = Nx.dot(p_l2, Nx.transpose(t_l2))
+    sim_tensor = Nx.divide(sim_tensor, temperature)
+
+    # 2. Create Identity Targets -> {batch, batch}
+    batch_size = Nx.axis_size(pred, 0)
+    # ⚡ THE FIX: Pass a 2D tuple {32, 32} instead of a 1D tuple {32}
+    labels = Nx.eye({batch_size, batch_size}, type: :f32)
+
+    # 3. Manual Dense Log-Softmax
+    # Step A: Max trick for numerical stability
+    max_sim = Nx.reduce_max(sim_tensor, axes: [-1], keep_axes: true)
+    shifted_sim = Nx.subtract(sim_tensor, max_sim)
+    
+    # Step B: Log(Sum(Exp))ozen_w2,
+    log_sum_exp = Nx.log(Nx.sum(Nx.exp(shifted_sim), axes: [-1], keep_axes: true))
+    log_softmax = Nx.subtract(shifted_sim, log_sum_exp)
+
+    # Step C: -Sum(Targets * Log_Softmax)
+    Nx.multiply(labels, log_softmax)
+    |> Nx.sum(axes: [-1])
+    |> Nx.negate()
+    |> Nx.mean()
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Loss, <<70, 79, 82, 49, 0, 0, 27, ...>>, true}
+```
+
+```elixir
+defmodule DLM.SinkhornOT do
+  import Nx.Defn
+
+  defn cost_matrix(pred, target) do
+    # ⚡ MEMORY OPTIMIZATION: Use the algebraic expansion a^2 + b^2 - 2ab
+    # This prevents the EXLA compiler from creating a 32GB intermediate tensor!
+    p_sq = Nx.sum(Nx.pow(pred, 2), axes: [-1], keep_axes: true)
+    t_sq = Nx.sum(Nx.pow(target, 2), axes: [-1], keep_axes: true) |> Nx.transpose()
+    
+    dot_prod = Nx.dot(pred, Nx.transpose(target))
+    
+    # Add the squares, subtract 2 * dot_product, and clamp to 0.0 for safety
+    Nx.add(p_sq, t_sq) |> Nx.subtract(Nx.multiply(2.0, dot_prod)) |> Nx.max(0.0)
+  end
+
+  defn compute(pred, target, epsilon \\ 10.0, max_iters \\ 32 ) do
+    # ... (Keep the rest of your compute function exactly as you have it)
+    c = cost_matrix(pred, target)
+    k = Nx.exp(Nx.divide(Nx.negate(c), epsilon))
+    
+    batch_size = Nx.axis_size(pred, 0)
+    mass = 1.0 / batch_size
+    mu = Nx.broadcast(mass, {batch_size})
+    nu = Nx.broadcast(mass, {batch_size})
+
+    {_final_k, u_final, v_final, _mu, _nu, _i} =
+      while {k_mat = k, 
+             u = Nx.broadcast(1.0, {batch_size}), 
+             _v = Nx.broadcast(1.0, {batch_size}), 
+             m = mu, n = nu, i = 0},
+            Nx.less(i, max_iters) do
+            
+        denom_v = Nx.add(Nx.dot(Nx.transpose(k_mat), u), 1.0e-8)
+        v_new = Nx.divide(n, denom_v)
+        
+        denom_u = Nx.add(Nx.dot(k_mat, v_new), 1.0e-8)
+        u_new = Nx.divide(m, denom_u)
+
+        {k_mat, u_new, v_new, m, n, i + 1}
+      end
+
+    u_exp = Nx.new_axis(u_final, 1)
+    v_exp = Nx.new_axis(v_final, 0)
+    p = Nx.multiply(Nx.multiply(u_exp, k), v_exp)
+
+    Nx.sum(Nx.multiply(p, c))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SinkhornOT, <<70, 79, 82, 49, 0, 0, 26, ...>>, true}
+```
+
+```elixir
+defmodule DLM.DataStreamer do
+  def stream(path, seq_len, batch_size) do
+    lines = path |> File.read!() |> String.split("\n", trim: true) |> Enum.shuffle()
+
+    lines
+    |> Enum.join("\n")
+    |> to_charlist()
+    |> Stream.chunk_every(seq_len + 1, seq_len, :discard)
+    |> Stream.map(fn chunk ->
+      ins = chunk |> Enum.take(seq_len) |> Nx.tensor(type: :s32)
+      tgs = chunk |> Enum.drop(1)      |> Nx.tensor(type: :s32)
+      {ins, tgs}
+    end)
+    |> Stream.chunk_every(batch_size, batch_size, :discard)
+    |> Stream.map(fn batch ->
+      {ins_list, tgs_list} = Enum.unzip(batch)
+      {Nx.stack(ins_list), Nx.stack(tgs_list)}
+    end)
+  end
+
+  @doc """
+  Takes a massive 1D tensor of dataset tokens and creates an infinite stream
+  of {batch_size, seq_len} matrices for the Physics Engine.
+  """
+  def build_infinite_stream(dataset_1d, batch_size, seq_len) do
+    chunk_size = batch_size * seq_len
+    total_tokens = Nx.size(dataset_1d)
+    
+    # Calculate how many full batches we can make
+    total_batches = div(total_tokens, chunk_size)
+
+    0..(total_batches - 1)
+    |> Stream.cycle() # ⚡ Loops infinitely!
+    |> Stream.map(fn batch_idx ->
+      start_idx = batch_idx * chunk_size
+      
+      # Slice out the flat chunk and reshape it for the batch
+      dataset_1d
+      |> Nx.slice_along_axis(start_idx, chunk_size, axis: 0)
+      |> Nx.reshape({batch_size, seq_len})
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.DataStreamer, <<70, 79, 82, 49, 0, 0, 19, ...>>, {:build_infinite_stream, 3}}
+```
+
+```elixir
+defmodule DLM.SparseSinkGD do
+  import Nx.Defn
+
+  @doc """
+  Applies Sinkhorn Gradient Scaling strictly to active (non-zero) gradients.
+  """
+  defn normalize_sparse_grad(grad, iterations \\ 8) do
+    eps = 1.0e-9
+    
+    # 1. Identify which characters actually appeared in this batch
+    raw_row_norms = Nx.pow(grad, 2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
+    active_mask = Nx.greater(raw_row_norms, eps)
+    
+    # 2. Sinkhorn Alternating Loop
+    result = while {i = 0, g = grad, am = active_mask}, Nx.less(i, iterations) do
+      # --- Row Normalization ---
+      row_norms = g |> Nx.pow(2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
+      safe_row_norms = Nx.select(am, row_norms, 1.0)
+      g_row = Nx.divide(g, safe_row_norms)
+      
+      # --- Column Normalization ---
+      col_norms = g_row |> Nx.pow(2) |> Nx.sum(axes: [0], keep_axes: true) |> Nx.sqrt()
+      safe_col_norms = Nx.select(Nx.greater(col_norms, eps), col_norms, 1.0)
+      g_col = Nx.divide(g_row, safe_col_norms)
+      
+      {i + 1, g_col, am}
+    end
+    
+    elem(result, 1)
+  end
+
+  @doc """
+  Stateful Update Step with Momentum for Sparse Embeddings
+  """
+  defn step(embed_matrix, grad, m_prev, lr, beta \\ 0.9) do
+    # 1. Scale the raw sparse gradient first to preserve the boolean mask logic
+    scaled_grad = normalize_sparse_grad(grad)
+    
+    # 2. Update Momentum (Exponential Moving Average)
+    # Mix 90% of the old momentum with 10% of the newly scaled gradient
+    m_new = Nx.add(Nx.multiply(beta, m_prev), Nx.multiply(1.0 - beta, scaled_grad))
+    
+    # 3. Apply the gradient descent subtraction using the momentum buffer
+    new_embeds = Nx.subtract(embed_matrix, Nx.multiply(m_new, lr))
+    
+    {new_embeds, m_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SparseSinkGD, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Data
+
+```elixir
+defmodule BabyLM.ScholarParser do
+  @sequence_length 256 
+
+  @datasets %{
+    childes: ["childes.train.txt"], 
+    bnc: ["bnc_spoken.train.txt"],
+    switchboard: ["switchboard.train.txt"],
+    subtitles: ["open_subtitles.train.txt"], 
+    wiki: ["simple_wiki.train.txt"],
+    gutenberg: ["gutenberg.train.txt"]
+  }
+
+  def build_scholar_curriculum(directory_path) do
+    childes_chunks = load_and_chunk(directory_path, @datasets.childes)
+    bnc_chunks = load_and_chunk(directory_path, @datasets.bnc)
+    switchboard_chunks = load_and_chunk(directory_path, @datasets.switchboard)
+    subtitles_chunks = load_and_chunk(directory_path, @datasets.subtitles)
+    wiki_chunks = load_and_chunk(directory_path, @datasets.wiki)
+    gutenberg_chunks = load_and_chunk(directory_path, @datasets.gutenberg)
+
+
+    # A fully shuffled mix: 49% scholar, 50% child, 1% subtitle/switchboard
+    IO.puts("\n🧬 Mixing FULL Dataset Timeline...")
+
+    # Smash all the chunks together into one massive list, then shuffle
+    master_timeline = 
+      (wiki_chunks ++ gutenberg_chunks ++ subtitles_chunks ++ 
+       switchboard_chunks ++ childes_chunks ++ bnc_chunks)
+
+    IO.puts("📦 Packing #{length(master_timeline)} sequences into Nx Tensor...")
+    dataset_tensor = 
+      Nx.tensor(master_timeline, type: :u8)
+      |> Nx.backend_transfer(Nx.BinaryBackend) 
+    
+    File.write!("scholar_full_un_mixed_256.bin", :erlang.term_to_binary(dataset_tensor))
+    IO.puts("🎉 scholar_full_un_mixed_256.bin successfully generated!")
+  end
+
+  defp normalize_char(c) do
+    cond do
+      c < 128 -> c              # ASCII passthrough
+      
+      # Common accented Latin — map to base character
+      c in 0xC0..0xC5 -> ?A     # À Á Â Ã Ä Å
+      c in 0xC8..0xCB -> ?E     # È É Ê Ë
+      c in 0xCC..0xCF -> ?I     # Ì Í Î Ï
+      c in 0xD2..0xD6 -> ?O     # Ò Ó Ô Õ Ö
+      c in 0xD9..0xDC -> ?U     # Ù Ú Û Ü
+      c in 0xE0..0xE5 -> ?a     # à á â ã ä å
+      c in 0xE8..0xEB -> ?e     # è é ê ë
+      c in 0xEC..0xEF -> ?i     # ì í î ï
+      c in 0xF2..0xF6 -> ?o     # ò ó ô õ ö
+      c in 0xF9..0xFC -> ?u     # ù ú û ü
+      c == 0xD1 -> ?N           # Ñ
+      c == 0xF1 -> ?n           # ñ
+      c == 0xC7 -> ?C           # Ç
+      c == 0xE7 -> ?c           # ç
+      c == 0xDF -> ?s           # ß -> ss would be ideal but single char is fine
+      c == 0xD8 -> ?O           # Ø
+      c == 0xF8 -> ?o           # ø
+      c == 0xC6 -> ?A           # Æ
+      c == 0xE6 -> ?a           # æ
+  
+      # Smart quotes -> straight quotes
+      c in [0x2018, 0x2019] -> ?'
+      c in [0x201C, 0x201D] -> ?"
+      
+      # Dashes
+      c in [0x2013, 0x2014] -> ?-   # en-dash, em-dash
+      
+      # Ellipsis
+      c == 0x2026 -> ?.
+      
+      # Everything else — use a dedicated replacement token
+      # Use ASCII 1 (SOH) which never appears naturally in text
+      true -> 1
+    end
+  end
+
+  defp load_and_chunk(dir, files) do
+    raw_text =
+      files
+      |> Enum.map(fn file ->
+        path = Path.join(dir, file)
+        if File.exists?(path) do
+          IO.puts("  ✅ Loaded #{file}")
+          File.read!(path) |> String.replace(~r/\s+/, " ")
+        else
+          IO.puts("  ❌ Missing #{file} (Skipping...)")
+          ""
+        end
+      end)
+      |> Enum.join(" ")
+  
+    raw_text
+    |> String.to_charlist()
+    |> Enum.map(&normalize_char/1)
+    # Filter out chunks with too many replacement tokens (token 1)
+    # rather than too many 63s
+    |> Enum.chunk_every(@sequence_length, @sequence_length, :discard)
+    |> Enum.filter(fn chunk -> 
+      replacement_count = Enum.count(chunk, &(&1 == 1))
+      replacement_count < 8   # stricter than before — less than 3% replacements
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, BabyLM.ScholarParser, <<70, 79, 82, 49, 0, 0, 29, ...>>, {:load_and_chunk, 2}}
+```
+
+```elixir
+# === RUN THE PARSER ===
+# Point this to the folder containing your new BabyLM text files.
+# It will ignore everything else in the folder.
+data_dir = "./" 
+
+BabyLM.ScholarParser.build_scholar_curriculum(data_dir)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+  ✅ Loaded childes.train.txt
+  ✅ Loaded bnc_spoken.train.txt
+  ✅ Loaded switchboard.train.txt
+  ✅ Loaded open_subtitles.train.txt
+  ✅ Loaded simple_wiki.train.txt
+  ✅ Loaded gutenberg.train.txt
+
+🧬 Mixing FULL Dataset Timeline...
+📦 Packing 211413 sequences into Nx Tensor...
+
+10:45:06.873 [info] XLA service 0x7cef46194bb0 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+10:45:06.884 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+10:45:06.885 [info] Using BFC allocator.
+
+10:45:06.885 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+10:45:06.885 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+🎉 scholar_full_un_mixed_256.bin successfully generated!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Section
+
+```elixir
+defmodule DLM.ContextualEmbedTrainer do
+  import Nx.Defn
+
+  defn masked_prediction_loss(token_sequences, embeds) do
+    seq_len = Nx.axis_size(token_sequences, 1)
+    valid_len = seq_len - 4
+
+    # 1. Sliding Window Extraction
+    ctx1 = Nx.slice_along_axis(token_sequences, 0, valid_len, axis: 1)
+    ctx2 = Nx.slice_along_axis(token_sequences, 1, valid_len, axis: 1)
+    targets = Nx.slice_along_axis(token_sequences, 2, valid_len, axis: 1)
+    ctx3 = Nx.slice_along_axis(token_sequences, 3, valid_len, axis: 1)
+    ctx4 = Nx.slice_along_axis(token_sequences, 4, valid_len, axis: 1)
+
+    # 2. Map targets to their 1024D Embeddings
+    e1 = Nx.take(embeds, ctx1)
+    e2 = Nx.take(embeds, ctx2)
+    e3 = Nx.take(embeds, ctx3)
+    e4 = Nx.take(embeds, ctx4)
+    target_emb = Nx.take(embeds, targets)
+
+    # 3. Pool the Context
+    context_sum = Nx.add(e1, e2) |> Nx.add(e3) |> Nx.add(e4)
+    context_emb = Nx.divide(context_sum, 4.0)
+
+    # 4. Flatten for Point Cloud OT
+    p_flat = Nx.reshape(context_emb, {:auto, 1024})
+    t_flat = Nx.reshape(target_emb, {:auto, 1024})
+
+    p_norm = DLM.Loss.l2_normalize(p_flat)
+    t_norm = DLM.Loss.l2_normalize(t_flat)
+    
+    # 5. Core SinkhornOT Loss (Batch-specific)
+    ot_loss = DLM.SinkhornOT.compute(p_norm, t_norm, 1.0, 16)
+
+    # ====================================================================
+    # ⚡ 6. NEW: Global Repulsion (Absence as Data)
+    # ====================================================================
+    # We L2 normalize the entire 256x1024 vocabulary matrix
+    # all_vocab = DLM.Loss.l2_normalize(embeds)
+    
+    # # Calculate pairwise squared distances for ALL characters (Algebraic Expansion)
+    # v_sq = Nx.sum(Nx.pow(all_vocab, 2), axes: [-1], keep_axes: true)
+    # v_dot = Nx.dot(all_vocab, Nx.transpose(all_vocab))
+    
+    # pairwise_dist = 
+    #   Nx.add(v_sq, Nx.transpose(v_sq)) 
+    #   |> Nx.subtract(Nx.multiply(2.0, v_dot)) 
+    #   |> Nx.max(0.0)
+    
+    # # We want to MAXIMIZE distance, which means MINIMIZING the inverse distance.
+    # # We add 1.0 to the diagonal so a character doesn't violently repel itself.
+    # safe_dist = Nx.add(pairwise_dist, Nx.eye({256, 256}))
+    # inverse_dist = Nx.divide(1.0, Nx.add(safe_dist, 1.0e-6))
+    
+    # # Calculate the average repulsive force across the whole void
+    # repulsion = Nx.mean(inverse_dist)
+    
+    # # Scale the repulsion so it gently inflates the space without overpowering the OT
+    # repulsion_penalty = Nx.multiply(repulsion, 0.05) 
+
+    # #7. Total Physics Loss
+    # Nx.add(ot_loss, repulsion_penalty)
+    ot_loss
+  end
+
+  defn compute_grad_and_step(embeds, m_embeds, v_embeds, token_sequences, _step, lr) do
+    {loss, grad_e} = value_and_grad(embeds, fn e ->
+      masked_prediction_loss(token_sequences, e)
+    end)
+  
+    {new_embeds, new_m} = DLM.SparseSinkGD.step(embeds, grad_e, m_embeds, lr)
+  
+    {loss, new_embeds, new_m, v_embeds}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.ContextualEmbedTrainer, <<70, 79, 82, 49, 0, 0, 26, ...>>, true}
+```
+
+```elixir
+batch_size = 32
+seq_len = 256
+key = Nx.Random.key(42) |> Nx.backend_copy(gpu)
+
+embeds = Nx.Random.normal(key, 0.0, 0.1, shape: {256, 1024}) |> elem(0) |> Nx.backend_copy(gpu)
+m_embeds = Nx.broadcast(0.0, {256, 1024}) |> Nx.backend_copy(gpu)
+v_embeds = Nx.broadcast(0.0, {256, 1024}) |> Nx.backend_copy(gpu)
+lr = Nx.tensor(3.0e-5, type: :f32) |> Nx.backend_copy(gpu)
+
+# Flatten the 2D dataset to 1D for the streamer
+full_dataset_2d = File.read!("scholar_full_un_mixed_256.bin") |> :erlang.binary_to_term()
+dataset_1d = Nx.flatten(full_dataset_2d)
+data_stream = DLM.DataStreamer.build_infinite_stream(dataset_1d, batch_size, seq_len)
+
+total_steps = 6608
+IO.puts("🚀 IGNITION: Phase 1 SinkGD Training...")
+
+{final_embeds, final_m, final_v} =
+  Enum.reduce(
+    Enum.zip(0..(total_steps - 1), data_stream),
+    {embeds, m_embeds, v_embeds},
+    fn {step, batch}, {e, m, v} ->
+      gpu_batch = Nx.backend_copy(batch, gpu) |> Nx.as_type(:s32)
+      step_t = Nx.tensor(step, type: :f32) |> Nx.backend_copy(gpu)
+
+      {loss, new_e, new_m, new_v} =
+        DLM.ContextualEmbedTrainer.compute_grad_and_step(e, m, v, gpu_batch, step_t, lr)
+
+      if rem(step, 100) == 0 do
+        IO.puts("Step #{step} | Loss: #{Float.round(Nx.to_number(loss), 4)}")
+        :erlang.garbage_collect()
+      end
+
+      {new_e, new_m, new_v}
+    end
+  )
+
+IO.puts("🎉 PHASE 1 TRAINING COMPLETE!")
+
+# Save — embeddings only, matching the format your downstream code expects
+cpu_embeds = Nx.backend_copy(final_embeds, Nx.BinaryBackend)
+cpu_m = Nx.backend_copy(final_m, Nx.BinaryBackend)
+cpu_v = Nx.backend_copy(final_v, Nx.BinaryBackend)
+
+# ⚡ Match the tuple format your Phase 2 loader expects:
+# %{params: phase1_p} -> {cpu_embeds, _w1, _w2, _key}
+dummy = Nx.broadcast(0.0, {1}) |> Nx.backend_copy(Nx.BinaryBackend)
+File.write!(
+  "phase1_sinkGD_nomix_1024_256x32sq3e5_13k_COMPLETE.bin",
+  :erlang.term_to_binary(%{params: {cpu_embeds, cpu_m, cpu_v, dummy}})
+)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+
+14:30:06.032 [info] XLA service 0x74897400cdb0 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+14:30:06.034 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+14:30:06.034 [info] Using BFC allocator.
+
+14:30:06.034 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+14:30:06.034 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+🚀 IGNITION: Phase 1 SinkGD Training...
+
+14:30:06.393 [info] Merging Dots in computation: main.32
+Step 0 | Loss: 1.5727
+Step 100 | Loss: 1.5778
+Step 200 | Loss: 1.567
+Step 300 | Loss: 1.5892
+Step 400 | Loss: 1.5868
+Step 500 | Loss: 1.5859
+Step 600 | Loss: 1.5622
+Step 700 | Loss: 1.5608
+Step 800 | Loss: 1.5769
+Step 900 | Loss: 1.5517
+Step 1000 | Loss: 1.5752
+Step 1100 | Loss: 1.5598
+Step 1200 | Loss: 1.5754
+Step 1300 | Loss: 1.547
+Step 1400 | Loss: 1.531
+Step 1500 | Loss: 1.5463
+Step 1600 | Loss: 1.5554
+Step 1700 | Loss: 1.5352
+Step 1800 | Loss: 1.5573
+Step 1900 | Loss: 1.5472
+Step 2000 | Loss: 1.55
+Step 2100 | Loss: 1.5399
+Step 2200 | Loss: 1.499
+Step 2300 | Loss: 1.5165
+Step 2400 | Loss: 1.5031
+Step 2500 | Loss: 1.517
+Step 2600 | Loss: 1.4869
+Step 2700 | Loss: 1.4766
+Step 2800 | Loss: 1.6099
+Step 2900 | Loss: 1.5023
+Step 3000 | Loss: 1.4879
+Step 3100 | Loss: 1.4755
+Step 3200 | Loss: 1.4879
+Step 3300 | Loss: 1.4889
+Step 3400 | Loss: 1.4811
+Step 3500 | Loss: 1.479
+Step 3600 | Loss: 1.4753
+Step 3700 | Loss: 1.4688
+Step 3800 | Loss: 1.4542
+Step 3900 | Loss: 1.4439
+Step 4000 | Loss: 1.4517
+Step 4100 | Loss: 1.4754
+Step 4200 | Loss: 1.4636
+Step 4300 | Loss: 1.4657
+Step 4400 | Loss: 1.4694
+Step 4500 | Loss: 1.4689
+Step 4600 | Loss: 1.4419
+Step 4700 | Loss: 1.4528
+Step 4800 | Loss: 1.4721
+Step 4900 | Loss: 1.4667
+Step 5000 | Loss: 1.4589
+Step 5100 | Loss: 1.4531
+Step 5200 | Loss: 1.4361
+Step 5300 | Loss: 1.4287
+Step 5400 | Loss: 1.4264
+Step 5500 | Loss: 1.4451
+Step 5600 | Loss: 1.4424
+Step 5700 | Loss: 1.4468
+Step 5800 | Loss: 1.4374
+Step 5900 | Loss: 1.4463
+Step 6000 | Loss: 1.4417
+Step 6100 | Loss: 1.4332
+Step 6200 | Loss: 1.4619
+Step 6300 | Loss: 1.442
+Step 6400 | Loss: 1.4306
+Step 6500 | Loss: 1.4339
+Step 6600 | Loss: 1.4396
+Step 6700 | Loss: 1.4368
+Step 6800 | Loss: 1.43
+Step 6900 | Loss: 1.4265
+Step 7000 | Loss: 1.439
+Step 7100 | Loss: 1.2783
+Step 7200 | Loss: 1.434
+Step 7300 | Loss: 1.3966
+Step 7400 | Loss: 1.4074
+Step 7500 | Loss: 1.3941
+Step 7600 | Loss: 1.4106
+Step 7700 | Loss: 1.408
+Step 7800 | Loss: 1.3901
+Step 7900 | Loss: 1.3914
+Step 8000 | Loss: 1.41
+Step 8100 | Loss: 1.3794
+Step 8200 | Loss: 1.3829
+Step 8300 | Loss: 1.3867
+Step 8400 | Loss: 1.3913
+Step 8500 | Loss: 1.3812
+Step 8600 | Loss: 1.4469
+Step 8700 | Loss: 1.4518
+Step 8800 | Loss: 1.4656
+Step 8900 | Loss: 1.4364
+Step 9000 | Loss: 1.4562
+Step 9100 | Loss: 1.4721
+Step 9200 | Loss: 1.448
+Step 9300 | Loss: 1.4347
+Step 9400 | Loss: 1.4452
+Step 9500 | Loss: 1.4108
+Step 9600 | Loss: 1.4072
+Step 9700 | Loss: 1.412
+Step 9800 | Loss: 1.4265
+Step 9900 | Loss: 1.4559
+Step 10000 | Loss: 1.4236
+Step 10100 | Loss: 1.4095
+Step 10200 | Loss: 1.4261
+Step 10300 | Loss: 1.4433
+Step 10400 | Loss: 1.3823
+Step 10500 | Loss: 1.3973
+Step 10600 | Loss: 1.3904
+Step 10700 | Loss: 1.3888
+Step 10800 | Loss: 1.3459
+Step 10900 | Loss: 1.364
+Step 11000 | Loss: 1.3938
+Step 11100 | Loss: 1.3823
+Step 11200 | Loss: 1.3956
+Step 11300 | Loss: 1.3788
+Step 11400 | Loss: 1.348
+Step 11500 | Loss: 1.3569
+Step 11600 | Loss: 1.3762
+Step 11700 | Loss: 1.3483
+Step 11800 | Loss: 1.3573
+Step 11900 | Loss: 1.3461
+Step 12000 | Loss: 1.3533
+Step 12100 | Loss: 1.3462
+Step 12200 | Loss: 1.3445
+Step 12300 | Loss: 1.2431
+Step 12400 | Loss: 1.2546
+Step 12500 | Loss: 1.2475
+Step 12600 | Loss: 1.2498
+Step 12700 | Loss: 1.2303
+Step 12800 | Loss: 1.2268
+Step 12900 | Loss: 1.2119
+Step 13000 | Loss: 1.2239
+Step 13100 | Loss: 1.2203
+Step 13200 | Loss: 1.2247
+🎉 PHASE 1 TRAINING COMPLETE!
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Test
+
+```elixir
+# =====================================================================
+# Phase 1: Manifold Visualization
+# =====================================================================
+alias VegaLite, as: Vl
+
+# 1. Extract the learned 256x1024 embeddings from your final params tuple
+# {final_embeds, _w1, _w2, _key} = final_p
+
+# Bring it back to the CPU for LinAlg processing
+%{params: {cpu_embeds, _, _, _}} = File.read!("phase1_sinkGD_nomix_1024_256sq3e5_13k_COMPLETE.bin") |> :erlang.binary_to_term()
+
+
+# 2. PCA: Squash 512D down to 2D
+mean = Nx.mean(cpu_embeds, axes: [0], keep_axes: true)
+centered = Nx.subtract(cpu_embeds, mean)
+
+# Perform Singular Value Decomposition
+{_u, _s, vt} = Nx.LinAlg.svd(centered)
+
+# Extract the top 2 Principal Components
+v_top2 = Nx.transpose(vt)[[.., 0..1]]
+
+# Project the 512D coordinates onto the new 2D plane
+coords_2d = Nx.dot(centered, v_top2)
+
+# 3. Extract X and Y for graphing
+x_vals = coords_2d[[.., 0]] |> Nx.to_flat_list()
+y_vals = coords_2d[[.., 1]] |> Nx.to_flat_list()
+
+# 4. Tag and categorize the printable ASCII characters
+plot_data =
+  Enum.map(32..126, fn ascii ->
+    char = List.to_string([ascii])
+    
+    type = cond do
+      char == " " -> "Space"
+      char =~ ~r/[aeiouAEIOU]/ -> "Vowel"
+      char =~ ~r/[a-zA-Z]/ -> "Consonant"
+      char =~ ~r/[0-9]/ -> "Number"
+      true -> "Punctuation"
+    end
+
+    %{
+      "character" => char,
+      "x" => Enum.at(x_vals, ascii),
+      "y" => Enum.at(y_vals, ascii),
+      "type" => type
+    }
+  end)
+
+# 5. Render the Latent Map
+Vl.new(width: 800, height: 600, title: "Diffusion-Molded 512D Latent Manifold")
+|> Vl.data_from_values(plot_data)
+|> Vl.mark(:text, size: 16, font: "monospace", font_weight: "bold")
+|> Vl.encode_field(:x, "x", type: :quantitative, title: "Principal Component 1")
+|> Vl.encode_field(:y, "y", type: :quantitative, title: "Principal Component 2")
+|> Vl.encode_field(:text, "character", type: :nominal)
+|> Vl.encode_field(:color, "type", type: :nominal, scale: [
+  domain: ["Space", "Vowel", "Consonant", "Number", "Punctuation"],
+  range: ["#FF0000", "#00AEEF", "#2A363B", "#99B898", "#E84A5F"]
+])
+|> Kino.VegaLite.new()
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+
+15:32:00.008 [info] Merging Dots in computation: region_7.7
+
+15:32:00.008 [info] Merging Dots in computation: region_16.14
+
+15:32:00.009 [info] Merging Dots in computation: region_54.58
+
+15:32:00.009 [info] Merging Dots in computation: region_6.61
+```
+
+```elixir
+defmodule DLM.LatentRadar do
+  import Nx.Defn
+
+  # Calculate the Squared Euclidean distance between all points simultaneously
+  defn pairwise_squared_distances(coords) do
+    a = Nx.new_axis(coords, 1)
+    b = Nx.new_axis(coords, 0)
+    
+    diff = Nx.subtract(a, b)
+    # ⚡ No Nx.sqrt() here! We match the Sinkhorn cost_matrix exactly.
+    Nx.sum(Nx.pow(diff, 2), axes: [-1]) 
+  end
+end
+
+# =====================================================================
+# Execution & Analysis
+# =====================================================================
+
+gpu = {EXLA.Backend, client: :rocm}
+
+# 1. Load the frozen dictionary directly
+%{params: {cpu_embeds, _, _, _}} = File.read!("phase1_sinkGD_nomix_1024_256sq3e5_13k_COMPLETE.bin") |> :erlang.binary_to_term()
+
+# 2. L2 Normalize it (This is exactly how Phase 2 sees the targets)
+frozen_map = cpu_embeds |> Nx.backend_copy(gpu) |> DLM.Loss.l2_normalize()
+
+vocab_size = Nx.axis_size(frozen_map, 0)
+
+# 3. Generate the 256x256 Distance Matrix
+dist_matrix = DLM.LatentRadar.pairwise_squared_distances(frozen_map)
+
+# 4. Mask the diagonal (distance from a character to itself is 0.0)
+mask = Nx.eye({vocab_size, vocab_size}) |> Nx.multiply(9999.0) |> Nx.backend_copy(gpu)
+masked_dists = Nx.add(dist_matrix, mask)
+
+# Extract the vital statistics
+min_dist = Nx.reduce_min(masked_dists) |> Nx.to_number()
+max_dist = Nx.reduce_max(dist_matrix) |> Nx.to_number()
+avg_dist = Nx.mean(dist_matrix) |> Nx.to_number() 
+
+IO.puts "🌌 1024D Latent Void Geometry (Squared Euclidean) 🌌"
+IO.puts "=================================================="
+IO.puts "Absolute Closest Neighbors: #{Float.round(min_dist, 4)}"
+IO.puts "Furthest Two Characters:    #{Float.round(max_dist, 4)}"
+IO.puts "Average Distance:           #{Float.round(avg_dist, 4)}\n"
+
+# Let's inspect the letter 'e' (ASCII 101)
+e_ascii = 101
+e_masked = masked_dists[e_ascii]
+closest_idx = Nx.argmin(e_masked) |> Nx.to_number()
+closest_dist = e_masked[closest_idx] |> Nx.to_number()
+
+IO.puts "🔍 Probe: The Letter 'e' (ASCII #{e_ascii})"
+IO.puts "Closest neighbor is ASCII #{closest_idx} (Squared Dist: #{Float.round(closest_dist, 4)})"
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🌌 1024D Latent Void Geometry (Squared Euclidean) 🌌
+==================================================
+Absolute Closest Neighbors: 1.4318
+Furthest Two Characters:    2.2038
+Average Distance:           2.0
+
+🔍 Probe: The Letter 'e' (ASCII 101)
+Closest neighbor is ASCII 32 (Squared Dist: 1.4646)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
