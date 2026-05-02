@@ -1,0 +1,1518 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# super simple ssm - lg - test
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Tree, <<70, 79, 82, 49, 0, 0, 8, ...>>, {:map, 2}}
+```
+
+```elixir
+defmodule BabyLM.CurriculumStreamer do
+  def build_infinite_stream(directory_path, batch_size) do
+    target_shards = Path.wildcard(Path.join(directory_path, "*.bin"))
+
+    if length(target_shards) == 0 do
+      raise "CRITICAL: No .bin shards found in directory: #{directory_path}"
+    end
+
+    Stream.iterate(1, &(&1 + 1))
+    |> Stream.flat_map(fn epoch ->
+      IO.puts("\n🔄 Epoch #{epoch} Started | Shuffling #{length(target_shards)} shards...")
+      
+      # ⚡ 1. DETERMINISTIC SEED: Guarantees the same shuffle order across restarts
+      :rand.seed(:exsss, {epoch, epoch, epoch})
+      shuffled_shards = Enum.shuffle(target_shards)
+
+      Stream.flat_map(shuffled_shards, fn path ->
+        tensor = File.read!(path) |> :erlang.binary_to_term()
+          
+        total_seqs = Nx.axis_size(tensor, 0)
+        num_batches = div(total_seqs, batch_size)
+
+        # 1. Generate all the slice indices
+        0..(num_batches - 1)
+        # 2. Slice the tensor into actual batch tensors
+        |> Enum.map(fn i ->
+          Nx.slice_along_axis(tensor, i * batch_size, batch_size, axis: 0)
+        end)
+        # 3. Shuffle the list of batches!
+        |> Enum.shuffle()
+      end)
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, BabyLM.CurriculumStreamer, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:build_infinite_stream, 2}}
+```
+
+```elixir
+defmodule DLM.SparseSinkGD do
+  import Nx.Defn
+
+  @doc """
+  Applies Sinkhorn Gradient Scaling strictly to active (non-zero) gradients.
+  """
+  defn normalize_sparse_grad(grad) do
+    eps = 1.0e-8
+    
+    # 1. Identify which characters actually appeared in this batch
+    raw_row_norms = Nx.pow(grad, 2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
+    active_mask = Nx.greater(raw_row_norms, eps)
+    
+    # 2. Sinkhorn Alternating Loop
+    result = while {i = 0, g = grad, am = active_mask}, Nx.less(i, 3) do
+      # --- Row Normalization ---
+      row_norms = g |> Nx.pow(2) |> Nx.sum(axes: [-1], keep_axes: true) |> Nx.sqrt()
+      safe_row_norms = Nx.select(am, row_norms, 1.0)
+      g_row = Nx.divide(g, safe_row_norms)
+      
+      # --- Column Normalization ---
+      col_norms = g_row |> Nx.pow(2) |> Nx.sum(axes: [0], keep_axes: true) |> Nx.sqrt()
+      safe_col_norms = Nx.select(Nx.greater(col_norms, eps), col_norms, 1.0)
+      g_col = Nx.divide(g_row, safe_col_norms)
+      
+      {i + 1, g_col, am}
+    end
+    
+    elem(result, 1)
+  end
+
+  defn sink_step(embed_matrix, grad, lr) do
+    # 1. Scale the raw sparse gradient first to preserve the boolean mask logic
+    scaled_grad = normalize_sparse_grad(grad)
+    
+    # 3. Apply the gradient descent subtraction using the momentum buffer
+    new_embeds = Nx.subtract(embed_matrix, Nx.multiply(scaled_grad, lr))
+    
+    new_embeds
+  end
+
+  defn sink_step_with_decay(embed_matrix, grad, lr, decay \\ 0.01) do
+    # 1. Sparse gradient scaling
+    scaled_grad = normalize_sparse_grad(grad)
+    
+    # 2. Standard step
+    stepped_embeds = Nx.subtract(embed_matrix, Nx.multiply(scaled_grad, lr))
+    
+    # 3. Decoupled decay (applied directly to the weights)
+    penalty = Nx.multiply(embed_matrix, Nx.multiply(lr, decay))
+    
+    Nx.subtract(stepped_embeds, penalty)
+  end
+
+  defn newton_schulz(g) do
+    frobenius_norm = Nx.LinAlg.norm(g) # defaults to frobenius if type not given
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, 5) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_step(em, grad, lr) do
+    ns_grad = newton_schulz(grad)
+    update = Nx.multiply(lr, ns_grad)
+    Nx.subtract(em, update)
+  end
+
+  defn svd_step(p, g, lr) do
+    norm = Nx.LinAlg.norm(g)
+    update = Nx.divide(g, norm) |> Nx.multiply(lr)
+    Nx.subtract(p, update)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SparseSinkGD, <<70, 79, 82, 49, 0, 0, 38, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## SSM
+
+```elixir
+defmodule DLM.SvdSSM do
+  import Nx.Defn
+
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn apply_svd(x, u, v) do
+    hidden = Nx.dot(x, u)
+    bound = Nx.tanh(hidden)
+    Nx.dot(bound, v)
+  end
+
+  defn softplus(x) do
+    Nx.log1p(Nx.exp(x))
+  end
+
+  defn forward_step(xt_idx, h_prev, params) do
+
+    {em, eq, er, es, au, av, bu, bv, cu, cv, du, dv} = params
+
+    x_t = Nx.take(em, xt_idx)
+
+    # svd projections
+    a_proj = apply_svd(h_prev, au, av)
+    g_proj = apply_svd(x_t, au, av)
+    b_proj = apply_svd(x_t, bu, bv)
+
+    # Discretization
+    a_bar = Nx.multiply(g_proj, a_proj) |> rms_norm()
+    b_bar = Nx.multiply(g_proj, b_proj) |> rms_norm()
+
+    # Geometric Adaptation
+    a_nsq = Nx.add(Nx.sum(Nx.pow(a_proj, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    a_unit = Nx.divide(a_proj, Nx.sqrt(a_nsq))
+  
+    a_ov = Nx.sum(Nx.multiply(b_bar, a_unit), axes: [-1], keep_axes: true)
+    a_ovl = Nx.multiply(a_ov, a_unit)
+    b_exclusive = Nx.subtract(b_bar, a_ovl)
+    
+    # Strictly Orthogonal State Update
+    h_new = Nx.add(Nx.multiply(a_bar, a_proj), b_exclusive)
+
+    h_latent = apply_svd(h_new, cu, cv)
+    d_latent = apply_svd(x_t, du, dv)
+
+    h_bar = Nx.multiply(d_latent, h_latent) |> rms_norm()
+
+
+    logits_fwd1 = Nx.dot(Nx.multiply(h_bar, h_latent), eq)
+    logits_fwd2 = Nx.dot(Nx.multiply(h_bar, h_latent), er) 
+    logits_fwd3 = Nx.dot(Nx.multiply(h_bar, h_latent), es) 
+
+    {logits_fwd1, logits_fwd2, logits_fwd3, h_new}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SvdSSM, <<70, 79, 82, 49, 0, 0, 33, ...>>, true}
+```
+
+```elixir
+defmodule DLM.SvdOptimizer do
+  import Nx.Defn
+
+  defn update(params, grads, step, lr) do
+    {em, eq, er, es, au, av, bu, bv, cu, cv, du, dv} = params
+    {gem, geq, ger, ges, gau, gav, gbu, gbv, gcu, gcv, gdu, gdv} = grads
+
+    new_step = Nx.add(step, 1)
+
+    # optimizer update step
+    em_new = DLM.SparseSinkGD.muon_step(em, gem, lr)
+    eq_new = DLM.SparseSinkGD.muon_step(eq, geq, lr)
+    er_new = DLM.SparseSinkGD.muon_step(er, ger, lr)
+    es_new = DLM.SparseSinkGD.muon_step(es, ges, lr)
+    au_new = DLM.SparseSinkGD.muon_step(au, gau, lr)
+    av_new = DLM.SparseSinkGD.muon_step(av, gav, lr)
+    bu_new = DLM.SparseSinkGD.muon_step(bu, gbu, lr)
+    bv_new = DLM.SparseSinkGD.muon_step(bv, gbv, lr)
+    cu_new = DLM.SparseSinkGD.muon_step(cu, gcu, lr)
+    cv_new = DLM.SparseSinkGD.muon_step(cv, gcv, lr)
+    du_new = DLM.SparseSinkGD.muon_step(du, gdu, lr)
+    dv_new = DLM.SparseSinkGD.muon_step(dv, gdv, lr)
+    
+    new_params = {em_new, eq_new, er_new, es_new, au_new, av_new, 
+                  bu_new, bv_new, cu_new, cv_new, 
+                  du_new, dv_new}
+
+    {new_params, new_step}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.SvdOptimizer, <<70, 79, 82, 49, 0, 0, 17, ...>>, true}
+```
+
+```elixir
+defmodule DLM.PhysicsGenesis do
+  import Nx.Defn
+
+  @dim 256
+  @rank 128
+
+  defn ignite(key) do
+
+    # Xavier/Glorot Initialization
+    std_128 = Nx.divide(1.0, Nx.sqrt(128))
+    std_256 = Nx.divide(1.0, Nx.sqrt(256))
+    
+    # a: Friction/Inertia
+    {au, k1} = Nx.Random.normal(key, 0.0, std_256, shape: {@dim, @rank})
+    {av, k2} = Nx.Random.normal(k1, 0.0, std_128, shape: {@rank, @dim})
+    
+    # b: Input Force Matrices
+    {bu, k3} = Nx.Random.normal(k2, 0.0, std_256, shape: {@dim, @rank})
+    {bv, k4} = Nx.Random.normal(k3, 0.0, std_128, shape: {@rank, @dim})
+    
+    # c: Output Velocity Matrices
+    {cu, k5} = Nx.Random.normal(k4, 0.0, std_256, shape: {@dim, @rank})
+    {cv, k6} = Nx.Random.normal(k5, 0.0, std_128, shape: {@rank, @dim})
+
+    # d: Dynamic Gating Matrices
+    {du, k7} = Nx.Random.normal(k6, 0.0, std_256, shape: {@dim, @rank})
+    {dv, k8} = Nx.Random.normal(k7, 0.0, std_128, shape: {@rank, @dim})
+
+    # e: entropy encoder/decoder
+    {em, k9} = Nx.Random.normal(k8, 0.0, std_128, shape: {@rank, @dim})
+    {eq, k10} = Nx.Random.normal(k9, 0.0, std_256, shape: {@dim, @rank})
+    {er, k11} = Nx.Random.normal(k10, 0.0, std_256, shape: {@dim, @rank})
+    {es, k12} = Nx.Random.normal(k11, 0.0, std_256, shape: {@dim, @rank})
+
+
+    {{em, eq, er, es, au, av, bu, bv, cu, cv, du, dv}, k12}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 16, ...>>, true}
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## BLiMP
+
+```elixir
+defmodule DLM.Phase2_Eval do
+  import Nx.Defn
+
+  # ⚡ 1. The exact same un-meaned CE from the updated Trainer
+  defn step_cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1]))
+  end
+
+  # ⚡ 2. Signature updated: orig_seq_len removed
+  defn compute_sentence_loss(input_tokens, target_tokens, h_init, params) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+    batch_size = Nx.axis_size(input_tokens, 0)
+    
+    in_t = Nx.transpose(input_tokens, axes: [1, 0])
+    targ_t = Nx.transpose(target_tokens, axes: [1, 0])
+  
+    # Explicitly initialize the {32} batch-sized accumulators
+    zero_batch = Nx.broadcast(0.0, {batch_size})
+
+    result =
+      while {i = 0, total_loss = zero_batch, valid_tokens = zero_batch, 
+             h = h_init,
+             x_in = in_t, y_targ = targ_t,
+             p = params},
+            Nx.less(i, seq_len) do
+  
+        x_curr = x_in[i]
+        t_curr = y_targ[i]
+
+        {logits_fwd, _, _, h_new} = DLM.SvdSSM.forward_step(x_curr, h, p)
+        
+        step_loss = step_cross_entropy(logits_fwd, t_curr)
+        
+        # ⚡ THE MASK: 1.0 if valid text, 0.0 if ASCII 1 (SOH)
+        mask = Nx.not_equal(t_curr, 1) |> Nx.as_type(:f32)
+        
+        masked_loss = Nx.multiply(step_loss, mask)
+
+        {i + 1, 
+         Nx.add(total_loss, masked_loss), 
+         Nx.add(valid_tokens, mask), 
+         h_new, x_in, y_targ, p}
+      end
+  
+    {_, acc_loss, val_tokens, _, _, _, _} = result
+    
+    # ⚡ Divide the accumulated masked loss by the actual valid token count
+    Nx.divide(acc_loss, Nx.add(val_tokens, 1.0e-8))
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase2_Eval, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+
+IO.puts("⚙️ Loading Phase 2.11 SinkhornSSM...")
+checkpoint_path = "v39_DLM_Phase_2m_fw3_redu_256_checkpoint_step_26000.bin"
+%{params: phase2_p} = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+
+p = DLM.Tree.map(phase2_p, &Nx.backend_copy(&1, gpu))
+
+# ==============================================================================
+# PRE-WARM: Compile the exact Batched JIT kernel
+# ==============================================================================
+IO.puts("🔥 Pre-warming Batched JIT compiler (Shape: {32, 512})...")
+
+warmup_input  = Nx.broadcast(1, {64, 256}) |> Nx.as_type(:s32) |> Nx.backend_copy(gpu)
+warmup_target = Nx.broadcast(1, {64, 256}) |> Nx.as_type(:s32) |> Nx.backend_copy(gpu)
+h_init_warm   = Nx.broadcast(0.0, {64, 256}) |> Nx.backend_copy(gpu)
+
+# ⚡ Signature updated here
+DLM.Phase2_Eval.compute_sentence_loss(warmup_input, warmup_target, h_init_warm, p)
+IO.puts("✅ Batched JIT warm, starting eval...\n")
+
+# ==============================================================================
+# 2. EVAL FUNCTION (Batched)
+# ==============================================================================
+run_blimp = fn path ->
+  pairs =
+    File.read!(path)
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
+
+  total_pairs = length(pairs)
+  pairs_per_batch = 100 
+
+  {passes, total_loss_diff} =
+    pairs
+    |> Enum.chunk_every(pairs_per_batch)
+    |> Enum.reduce({0, 0.0}, fn chunk, {acc_passes, acc_diff} ->
+      
+      # 1. Convert the chunk of pairs into a flat list of formatted tensors
+      flat_data =
+        Enum.flat_map(chunk, fn pair ->
+          good_chars = pair["sentence_good"] |> to_charlist()
+          bad_chars  = pair["sentence_bad"]  |> to_charlist()
+
+          good_len = length(good_chars) - 1
+          bad_len  = length(bad_chars)  - 1
+
+          good_t = Nx.tensor(good_chars, type: :s32)
+          bad_t  = Nx.tensor(bad_chars,  type: :s32)
+
+          good_pad = 512 - good_len
+          bad_pad  = 512 - bad_len
+
+          # Slice and Pad (using ASCII 1 as the padding token)
+          good_in = Nx.slice_along_axis(good_t, 0, good_len) |> Nx.pad(1, [{0, good_pad, 0}])
+          good_tg = Nx.slice_along_axis(good_t, 1, good_len) |> Nx.pad(1, [{0, good_pad, 0}])
+
+          bad_in = Nx.slice_along_axis(bad_t, 0, bad_len) |> Nx.pad(1, [{0, bad_pad, 0}])
+          bad_tg = Nx.slice_along_axis(bad_t, 1, bad_len) |> Nx.pad(1, [{0, bad_pad, 0}])
+
+          [
+            {good_in, good_tg, good_len},
+            {bad_in, bad_tg, bad_len}
+          ]
+        end)
+
+      actual_sentences = length(flat_data)
+
+      batch_input  = flat_data |> Enum.map(&elem(&1, 0)) |> Nx.stack() |> Nx.backend_copy(gpu)
+      batch_target = flat_data |> Enum.map(&elem(&1, 1)) |> Nx.stack() |> Nx.backend_copy(gpu)
+      
+      h_init = Nx.broadcast(0.0, {actual_sentences, 256}) |> Nx.backend_copy(gpu)
+      # 3. ⚡ Single GPU Dispatch! (batch_lens removed)
+      losses = DLM.Phase2_Eval.compute_sentence_loss(
+        batch_input, batch_target, h_init, p
+      )
+
+      # Extract the array of float values cleanly to the CPU
+      losses_list = Nx.to_flat_list(losses)
+
+      # 4. Compare the [good, bad] pairs sequentially
+      {chunk_passes, chunk_diff} =
+        losses_list
+        |> Enum.chunk_every(2)
+        |> Enum.reduce({0, 0.0}, fn [g_loss, b_loss], {p_acc, d_acc} ->
+          new_p = if g_loss < b_loss, do: p_acc + 1, else: p_acc
+          {new_p, d_acc + (b_loss - g_loss)}
+        end)
+
+      # Explicitly clear the BEAM mailbox after the batch
+      :erlang.garbage_collect(self())
+
+      {acc_passes + chunk_passes, acc_diff + chunk_diff}
+    end)
+
+  accuracy   = (passes / total_pairs) * 100.0
+  avg_margin = total_loss_diff / total_pairs
+  name       = Path.basename(path, ".jsonl")
+
+  {name, accuracy, avg_margin, passes, total_pairs}
+end
+
+# ==============================================================================
+# 3. BATCH RUN
+# ==============================================================================
+dataset_files = Path.wildcard("./data/bblm_blimp_26_quick/*.jsonl") |> Enum.sort()
+total_files   = length(dataset_files)
+
+IO.puts("🚀 Running BLiMP batched eval across #{total_files} datasets...\n")
+
+results =
+  dataset_files
+  |> Enum.with_index(1)
+  |> Enum.map(fn {path, idx} ->
+    IO.puts("  [#{idx}/#{total_files}] #{Path.basename(path)}...")
+    result = run_blimp.(path)
+    :erlang.garbage_collect(self())
+    result
+  end)
+
+# ==============================================================================
+# 4. SORTED SUMMARY
+# ==============================================================================
+sorted = Enum.sort_by(results, fn {_, acc, _, _, _} -> acc end, :desc)
+
+IO.puts("\n")
+IO.puts(String.duplicate("=", 70))
+IO.puts("🏆 BLIMP BATCH RESULTS — sorted by accuracy")
+IO.puts(String.duplicate("=", 70))
+IO.puts(String.pad_trailing("Dataset", 48) <> "Accuracy   Margin")
+IO.puts(String.duplicate("-", 70))
+
+Enum.each(sorted, fn {name, acc, margin, passes, total} ->
+  flag = cond do
+    acc >= 60.0 -> "✅"
+    acc <= 40.0 -> "❌"
+    true        -> "〰️"
+  end
+  IO.puts("#{flag} #{String.pad_trailing(name, 46)} #{String.pad_leading("#{Float.round(acc, 1)}%", 7)} (#{passes}/#{total})   #{Float.round(margin, 4)}")
+end)
+
+IO.puts(String.duplicate("-", 70))
+
+# Overall average
+avg_acc = results |> Enum.map(fn {_, acc, _, _, _} -> acc end) |> Enum.sum() |> Kernel./(total_files)
+IO.puts("📊 Overall average accuracy: #{Float.round(avg_acc, 2)}%")
+IO.puts(String.duplicate("=", 70))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+⚙️ Loading Phase 2.11 SinkhornSSM...
+🔥 Pre-warming Batched JIT compiler (Shape: {32, 512})...
+✅ Batched JIT warm, starting eval...
+
+🚀 Running BLiMP batched eval across 66 datasets...
+
+  [1/66] adjunct_island.jsonl...
+  [2/66] anaphor_gender_agreement.jsonl...
+  [3/66] anaphor_number_agreement.jsonl...
+  [4/66] animate_subject_passive.jsonl...
+  [5/66] animate_subject_trans.jsonl...
+  [6/66] causative.jsonl...
+  [7/66] complex_NP_island.jsonl...
+  [8/66] coordinate_structure_constraint_complex_left_branch.jsonl...
+  [9/66] coordinate_structure_constraint_object_extraction.jsonl...
+  [10/66] determiner_noun_agreement_1.jsonl...
+  [11/66] determiner_noun_agreement_2.jsonl...
+  [12/66] determiner_noun_agreement_irregular_1.jsonl...
+  [13/66] determiner_noun_agreement_irregular_2.jsonl...
+  [14/66] determiner_noun_agreement_with_adj_2.jsonl...
+  [15/66] determiner_noun_agreement_with_adj_irregular_1.jsonl...
+  [16/66] determiner_noun_agreement_with_adj_irregular_2.jsonl...
+  [17/66] determiner_noun_agreement_with_adjective_1.jsonl...
+  [18/66] distractor_agreement_relational_noun.jsonl...
+  [19/66] distractor_agreement_relative_clause.jsonl...
+  [20/66] ellipsis_n_bar_1.jsonl...
+  [21/66] ellipsis_n_bar_2.jsonl...
+  [22/66] existential_there_object_raising.jsonl...
+  [23/66] existential_there_quantifiers_1.jsonl...
+  [24/66] existential_there_quantifiers_2.jsonl...
+  [25/66] existential_there_subject_raising.jsonl...
+  [26/66] expletive_it_object_raising.jsonl...
+  [27/66] inchoative.jsonl...
+  [28/66] intransitive.jsonl...
+  [29/66] irregular_past_participle_adjectives.jsonl...
+  [30/66] irregular_past_participle_verbs.jsonl...
+  [31/66] irregular_plural_subject_verb_agreement_1.jsonl...
+  [32/66] irregular_plural_subject_verb_agreement_2.jsonl...
+  [33/66] left_branch_island_echo_question.jsonl...
+  [34/66] left_branch_island_simple_question.jsonl...
+  [35/66] matrix_question_npi_licensor_present.jsonl...
+  [36/66] npi_present_1.jsonl...
+  [37/66] npi_present_2.jsonl...
+  [38/66] only_npi_licensor_present.jsonl...
+  [39/66] only_npi_scope.jsonl...
+  [40/66] passive_1.jsonl...
+  [41/66] passive_2.jsonl...
+  [42/66] principle_A_c_command.jsonl...
+  [43/66] principle_A_case_1.jsonl...
+  [44/66] principle_A_case_2.jsonl...
+  [45/66] principle_A_domain_1.jsonl...
+  [46/66] principle_A_domain_2.jsonl...
+  [47/66] principle_A_domain_3.jsonl...
+  [48/66] principle_A_reconstruction.jsonl...
+  [49/66] regular_plural_subject_verb_agreement_1.jsonl...
+  [50/66] regular_plural_subject_verb_agreement_2.jsonl...
+  [51/66] sentential_negation_npi_licensor_present.jsonl...
+  [52/66] sentential_negation_npi_scope.jsonl...
+  [53/66] sentential_subject_island.jsonl...
+  [54/66] superlative_quantifiers_1.jsonl...
+  [55/66] superlative_quantifiers_2.jsonl...
+  [56/66] tough_vs_raising_1.jsonl...
+  [57/66] tough_vs_raising_2.jsonl...
+  [58/66] transitive.jsonl...
+  [59/66] wh_island.jsonl...
+  [60/66] wh_questions_object_gap.jsonl...
+  [61/66] wh_questions_subject_gap.jsonl...
+  [62/66] wh_questions_subject_gap_long_distance.jsonl...
+  [63/66] wh_vs_that_no_gap.jsonl...
+  [64/66] wh_vs_that_no_gap_long_distance.jsonl...
+  [65/66] wh_vs_that_with_gap.jsonl...
+  [66/66] wh_vs_that_with_gap_long_distance.jsonl...
+
+
+======================================================================
+🏆 BLIMP BATCH RESULTS — sorted by accuracy
+======================================================================
+Dataset                                         Accuracy   Margin
+----------------------------------------------------------------------
+✅ principle_A_case_1                               99.0% (198/200)   0.0591
+✅ wh_vs_that_no_gap_long_distance                  94.0% (188/200)   0.0366
+✅ wh_questions_subject_gap                         91.0% (182/200)   0.0636
+✅ wh_vs_that_no_gap                                90.5% (181/200)   0.0495
+✅ wh_questions_subject_gap_long_distance           87.5% (175/200)   0.0379
+✅ principle_A_domain_1                             78.5% (157/200)   0.0405
+✅ principle_A_case_2                               77.5% (155/200)   0.0342
+✅ wh_questions_object_gap                          77.0% (154/200)   0.0378
+✅ anaphor_gender_agreement                         74.0% (148/200)   0.054
+✅ left_branch_island_echo_question                 73.0% (146/200)   0.0591
+✅ wh_island                                        67.5% (135/200)   0.0084
+✅ superlative_quantifiers_2                        65.5% (131/200)   0.0201
+✅ coordinate_structure_constraint_complex_left_branch   64.5% (129/200)   0.006
+✅ determiner_noun_agreement_irregular_2            64.0% (128/200)   0.0347
+✅ sentential_negation_npi_licensor_present         63.5% (127/200)   0.0084
+✅ tough_vs_raising_2                               63.0% (126/200)   0.0447
+✅ existential_there_subject_raising                62.0% (124/200)   0.0531
+✅ determiner_noun_agreement_with_adj_irregular_2   61.5% (123/200)   0.0203
+✅ transitive                                       60.5% (121/200)   0.0319
+✅ existential_there_quantifiers_2                  60.0% (120/200)   -0.0178
+〰️ determiner_noun_agreement_with_adj_irregular_1   58.0% (116/200)   0.0037
+〰️ anaphor_number_agreement                         57.0% (114/200)   0.0136
+〰️ ellipsis_n_bar_1                                 56.0% (112/200)   -0.0025
+〰️ determiner_noun_agreement_with_adjective_1       54.5% (109/200)   0.0027
+〰️ existential_there_quantifiers_1                  54.5% (109/200)   0.0124
+〰️ existential_there_object_raising                 53.0% (106/200)   0.0058
+〰️ causative                                        52.5% (105/200)   0.0221
+〰️ irregular_past_participle_verbs                  52.5% (105/200)   -0.0335
+〰️ animate_subject_passive                          52.0% (104/200)   0.0057
+〰️ determiner_noun_agreement_2                      52.0% (104/200)   0.0098
+〰️ principle_A_domain_3                             52.0% (104/200)   0.0013
+〰️ irregular_plural_subject_verb_agreement_2        51.5% (103/200)   -0.0076
+〰️ passive_1                                        51.0% (102/200)   0.0018
+〰️ passive_2                                        51.0% (102/200)   0.0102
+〰️ determiner_noun_agreement_1                      50.5% (101/200)   0.0029
+〰️ superlative_quantifiers_1                        50.0% (100/200)   -0.0122
+〰️ expletive_it_object_raising                      49.5% (99/200)   -0.0015
+〰️ complex_NP_island                                49.0% (98/200)   0.0013
+〰️ determiner_noun_agreement_with_adj_2             49.0% (98/200)   -0.0041
+〰️ coordinate_structure_constraint_object_extraction   48.5% (97/200)   -0.0007
+〰️ adjunct_island                                   48.0% (96/200)   -0.0035
+〰️ irregular_plural_subject_verb_agreement_1        48.0% (96/200)   -0.0011
+〰️ determiner_noun_agreement_irregular_1            47.5% (95/200)   -0.011
+〰️ distractor_agreement_relative_clause             47.0% (94/200)   0.0007
+〰️ distractor_agreement_relational_noun             46.5% (93/200)   -0.0032
+〰️ regular_plural_subject_verb_agreement_2          46.0% (92/200)   -0.012
+〰️ regular_plural_subject_verb_agreement_1          45.0% (90/200)   -0.0186
+〰️ ellipsis_n_bar_2                                 43.5% (87/200)   -0.0136
+〰️ sentential_negation_npi_scope                    43.5% (87/200)   -0.0028
+〰️ tough_vs_raising_1                               41.5% (83/200)   -0.0401
+〰️ principle_A_c_command                            41.0% (82/200)   -0.0112
+❌ left_branch_island_simple_question               38.0% (76/200)   -0.0132
+❌ principle_A_reconstruction                       38.0% (76/200)   -0.0086
+❌ principle_A_domain_2                             37.5% (75/200)   -0.0129
+❌ npi_present_1                                    36.5% (73/200)   -0.0675
+❌ npi_present_2                                    36.5% (73/200)   -0.0764
+❌ sentential_subject_island                        36.5% (73/200)   -0.0093
+❌ inchoative                                       36.0% (72/200)   -0.0784
+❌ intransitive                                     32.0% (64/200)   -0.1203
+❌ irregular_past_participle_adjectives             28.5% (57/200)   -0.0124
+❌ animate_subject_trans                            26.0% (52/200)   -0.127
+❌ wh_vs_that_with_gap                              10.5% (21/200)   -0.0533
+❌ matrix_question_npi_licensor_present              7.0% (14/200)   -0.1692
+❌ only_npi_scope                                    6.0% (12/200)   -0.094
+❌ wh_vs_that_with_gap_long_distance                 5.0% (10/200)   -0.0377
+❌ only_npi_licensor_present                         0.0% (0/200)   -0.2322
+----------------------------------------------------------------------
+📊 Overall average accuracy: 51.36%
+======================================================================
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Train
+
+```elixir
+defmodule DLM.Phase2Trainer do
+  import Nx.Defn
+
+  # Local un-meaned CE to prevent pre-diluting the loss
+  defn step_cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Returns a {batch_size} 1D tensor of individual sequence losses
+    Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1]))
+  end
+
+  defn compute_sequence_loss(input_tokens, target_tokens, params) do
+    # hidden state init
+    h_start = Nx.broadcast(0.0, {64, 256})
+
+    targ_t = Nx.transpose(target_tokens, axes: [1, 0])
+    
+    # Explicitly initialize accumulator tensors
+    zero_scalar = Nx.tensor(0.0, type: :f32)
+  
+    result =
+      while {i = 0, 
+             total_fwd1 = zero_scalar, 
+             valid_fwd1 = zero_scalar,
+             total_fwd2 = zero_scalar, 
+             valid_fwd2 = zero_scalar,
+             total_fwd3 = zero_scalar, 
+             valid_fwd3 = zero_scalar,
+             h = h_start, 
+             inf = input_tokens, tf = targ_t, p = params},
+            Nx.less(i, (Nx.axis_size(inf, 0) - 3)) do
+        
+        x_curr = inf[[.., i]]
+        t_fwd1 = tf[i]
+        t_fwd2 = tf[i+1]
+        t_fwd3 = tf[i+2]
+        
+        {logits_fwd1, logits_fwd2, logits_fwd3, h_new} = DLM.SvdSSM.forward_step(x_curr, h, p)
+        
+        # Get raw losses per item in the batch (Shape: {32})
+        l1_fwd = step_cross_entropy(logits_fwd1, t_fwd1)
+        l2_fwd = step_cross_entropy(logits_fwd2, t_fwd2)
+        l3_fwd = step_cross_entropy(logits_fwd3, t_fwd3)
+        
+        mask_fwd1 = Nx.not_equal(t_fwd1, 1) |> Nx.as_type(:f32)
+        mask_fwd2 = Nx.not_equal(t_fwd2, 1) |> Nx.as_type(:f32)
+        mask_fwd3 = Nx.not_equal(t_fwd3, 1) |> Nx.as_type(:f32)
+        
+        # Mask the individual losses and sum across the batch to get a true scalar
+        step_loss_fwd1 = Nx.sum(Nx.multiply(l1_fwd, mask_fwd1))
+        step_loss_fwd2 = Nx.sum(Nx.multiply(l2_fwd, mask_fwd2))
+        step_loss_fwd3 = Nx.sum(Nx.multiply(l3_fwd, mask_fwd3))
+        
+        # sum the loss from valid tokens in this timestep
+        step_valid_fwd1 = Nx.sum(mask_fwd1)
+        step_valid_fwd2 = Nx.sum(mask_fwd2)
+        step_valid_fwd3 = Nx.sum(mask_fwd3)
+        
+        {i + 1, 
+         Nx.add(total_fwd1, step_loss_fwd1), 
+         Nx.add(valid_fwd1, step_valid_fwd1),
+         Nx.add(total_fwd2, step_loss_fwd2), 
+         Nx.add(valid_fwd2, step_valid_fwd2),
+         Nx.add(total_fwd3, step_loss_fwd3), 
+         Nx.add(valid_fwd3, step_valid_fwd3),
+         h_new, inf, tf, p}
+      end
+  
+    {_, acc_fwd1, val_fwd1, acc_fwd2, val_fwd2, acc_fwd3, val_fwd3, _final_h, _, _, _} = result
+    
+    # Divide ONLY by the actual number of valid tokens 
+    total_loss1 = Nx.divide(acc_fwd1, Nx.add(val_fwd1, 1.0e-8))
+    total_loss2 = Nx.divide(acc_fwd2, Nx.add(val_fwd2, 1.0e-8))
+    total_loss3 = Nx.divide(acc_fwd3, Nx.add(val_fwd3, 1.0e-8))
+    
+    
+    tot_l = total_loss1 + (total_loss2 * 0.5) + (total_loss3 * 0.25)
+
+    {tot_l, {total_loss1, total_loss2, total_loss3}}
+  end
+
+  defn compute_grad(params, batch_tokens) do
+    {_batch_size, full_seq_len} = Nx.shape(batch_tokens)
+    seq_len = full_seq_len - 1
+    
+    input_tokens  = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+
+    {{total_loss, {total_loss1, total_loss2, total_loss3}}, raw_grads} = 
+      value_and_grad(params, 
+        fn p -> compute_sequence_loss(input_tokens, target_tokens, p) end,
+        &elem(&1, 0)
+      )
+  
+    {total_loss, total_loss1, total_loss2, total_loss3, raw_grads}
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.Phase2Trainer, <<70, 79, 82, 49, 0, 0, 37, ...>>, true}
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Scans the directory for the latest checkpoint of a specific run prefix.
+  If no checkpoints exist, it triggers a completely fresh initialization.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("✨ Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("✨ No checkpoints found for '#{run_prefix}'. Starting FRESH from Genesis.")
+        {:fresh, 0}
+      end
+    else
+      # Extract step numbers using regex and find the maximum
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("🚀 Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, DLM.CheckpointManager, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:get_resume_state, 1}}
+```
+
+```elixir
+run_prefix  = "v39_DLM_Phase_2m_fw3_redu_256"  
+total_steps = 90000
+
+# ⚡ 1. CHECK RESUME STATE
+{load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
+
+if start_step == :completed do
+  IO.puts("✅ This run has already reached #{total_steps} steps. Exiting.")
+else
+
+  batch_size = 64
+  
+  # ⚡ THE INFINITE CURRICULUM STREAM
+  data_dir = "./data/bbylm_512_strict" 
+  
+  IO.puts("🧠 Initializing Lazy Curriculum Data Stream from [#{data_dir}]...")
+  
+  data_stream = 
+    BabyLM.CurriculumStreamer.build_infinite_stream(data_dir, batch_size)
+    |> Stream.drop(start_step) # Drops already-seen batches
+
+  # BRANCHING WEIGHT INIT
+  {starting_params, initial_key} =
+    if load_path == :fresh do
+      IO.puts("✨ Igniting brand new Genesis weights for #{run_prefix}...")
+      DLM.PhysicsGenesis.ignite(Nx.Random.key(System.system_time()))
+    else
+      IO.puts("✨ Loading Weights from #{load_path}...")
+      %{params: loaded_p} = File.read!(load_path) |> :erlang.binary_to_term()
+      {loaded_p, Nx.Random.key(System.system_time())}
+    end
+  
+    # Move everything to the GPU
+    p = DLM.Tree.map(starting_params, &Nx.backend_copy(&1, gpu))
+    step_count = Nx.tensor(start_step) |> Nx.backend_copy(gpu)
+  
+  # ZIP FROM THE START_STEP
+  {final_p, _key, _step} =
+    Enum.reduce(Stream.zip(start_step..(total_steps - 1), data_stream), {p, initial_key, step_count}, fn {step, cpu_batch}, {cp, cur_key, c_step} ->        
+      gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+      
+      # Learning Rate
+      base_lr = 3.0e-3
+      min_lr = 3.0e-4
+      warmup_steps = 1000
+      
+      current_lr = 
+        if step < warmup_steps do
+          base_lr * (step / warmup_steps)
+        else
+          progress = min(max((step - warmup_steps) / (total_steps - warmup_steps), 0.0), 1.0)
+          min_lr + 0.5 * (base_lr - min_lr) * (1.0 + :math.cos(:math.pi() * progress))
+        end
+      
+      lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+
+      split_keys = Nx.Random.split(cur_key)
+      next_key = split_keys[1]
+      
+      # Forward Pass
+      {loss_tensor, fl1, fl2, fl3, grads} = DLM.Phase2Trainer.compute_grad(
+        cp, gpu_batch
+      )
+
+      {tot_v, tot_1, tot_2, tot_3} = {Nx.to_number(loss_tensor), Nx.to_number(fl1), Nx.to_number(fl2), Nx.to_number(fl3)}
+
+      # Optimizer Update
+      {up_p, up_step} = DLM.SvdOptimizer.update(cp, grads, c_step, lr_tensor)
+  
+      # Telemetry
+      if rem(step, 100) == 0 do
+        {em, eq, er, es, au, av, bu, bv, cu, cv, du, dv} = up_p
+        au_norm = au |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        av_norm = av |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        bu_norm = bu |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        bv_norm = bv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        cu_norm = cu |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        cv_norm = cv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        du_norm = du |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        dv_norm = dv |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        em_norm = em |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        eq_norm = eq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        er_norm = er |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        es_norm = es |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+       
+        
+        IO.puts("➡️ Step #{step} | TCE Loss: #{Float.round(tot_v, 4)} | [1,2,3] Loss: #{Float.round(tot_1, 4)} | #{Float.round(tot_2, 4)} | #{Float.round(tot_3, 4)} | LR: #{Float.round(current_lr, 6)}")
+        IO.puts("➡️ PN 1: au #{au_norm} | av #{av_norm} | bu #{bu_norm} | bv #{bv_norm} | em #{em_norm} | er #{er_norm}")
+        IO.puts("➡️ PN 2: cu #{cu_norm} | cv #{cv_norm} | du #{du_norm} | dv #{dv_norm} | eq #{eq_norm} | eq #{es_norm}")
+        :erlang.garbage_collect()
+      end
+  
+      # Checkpoint Saving
+      if rem(step, 1000) == 0 and step > 0 do
+        IO.puts("💾 Checkpoint reached! Saving Step #{step}...")
+        cpu_p = DLM.Tree.map(up_p, &Nx.backend_copy(&1, Nx.BinaryBackend))
+        filename = "#{run_prefix}_checkpoint_step_#{step}.bin"
+        File.write!(filename, :erlang.term_to_binary(%{params: cpu_p}))
+        :erlang.garbage_collect()
+      end
+  
+      {up_p, next_key, up_step}
+    end)
+
+  IO.puts("💾 Saving Final Gated Physics Engine Weights...")
+  good_params = DLM.Tree.map(final_p, &Nx.backend_transfer(&1, Nx.BinaryBackend))
+  File.write!("#{run_prefix}_final.bin", :erlang.term_to_binary(%{params: good_params}))
+  IO.puts("✅ Physics Engine Training Complete!")
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+🚀 Auto-Resuming 'v39_DLM_Phase_2m_fw3_redu_256' from Step 15000...
+🧠 Initializing Lazy Curriculum Data Stream from [./data/bbylm_512_strict]...
+✨ Loading Weights from v39_DLM_Phase_2m_fw3_redu_256_checkpoint_step_15000.bin...
+
+08:59:50.736 [info] XLA service 0x76b1f8195ac0 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+
+08:59:50.739 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+
+08:59:50.739 [info] Using BFC allocator.
+
+08:59:50.739 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+
+08:59:50.739 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+
+🔄 Epoch 1 Started | Shuffling 6 shards...
+
+🔄 Epoch 2 Started | Shuffling 6 shards...
+
+🔄 Epoch 3 Started | Shuffling 6 shards...
+
+🔄 Epoch 4 Started | Shuffling 6 shards...
+
+🔄 Epoch 5 Started | Shuffling 6 shards...
+
+🔄 Epoch 6 Started | Shuffling 6 shards...
+
+🔄 Epoch 7 Started | Shuffling 6 shards...
+
+🔄 Epoch 8 Started | Shuffling 6 shards...
+
+🔄 Epoch 9 Started | Shuffling 6 shards...
+
+🔄 Epoch 10 Started | Shuffling 6 shards...
+
+🔄 Epoch 11 Started | Shuffling 6 shards...
+
+08:59:51.335 [info] Merging Dots in computation: region_0.21
+
+08:59:51.335 [info] Merging Dots in computation: region_22.58.clone
+
+09:00:44.855 [info] Merging Dots in computation: region_2.3
+
+09:00:44.855 [info] Merging Dots in computation: region_6.7
+
+09:00:44.855 [info] Merging Dots in computation: region_10.11
+
+09:00:44.855 [info] Merging Dots in computation: region_14.15
+
+09:00:44.855 [info] Merging Dots in computation: region_18.19
+
+09:00:44.855 [info] Merging Dots in computation: region_22.23
+
+09:00:44.855 [info] Merging Dots in computation: region_26.27
+
+09:00:44.855 [info] Merging Dots in computation: region_30.31
+
+09:00:44.855 [info] Merging Dots in computation: region_34.35
+
+09:00:44.855 [info] Merging Dots in computation: region_38.39
+
+09:00:44.855 [info] Merging Dots in computation: region_42.43
+
+09:00:44.855 [info] Merging Dots in computation: region_46.47
+➡️ Step 15000 | TCE Loss: 3.896 | [1,2,3] Loss: 1.9016 | 2.5269 | 2.9242 | LR: 0.002838
+➡️ PN 1: au 11.4537 | av 22.1046 | bu 11.4836 | bv 16.1657 | em 16.1635 | er 10.4023
+➡️ PN 2: cu 10.9033 | cv 15.8455 | du 11.3881 | dv 15.9442 | eq 11.4423 | eq 9.7062
+💾 Checkpoint reached! Saving Step 15000...
+➡️ Step 15100 | TCE Loss: 3.8621 | [1,2,3] Loss: 1.8778 | 2.5198 | 2.8979 | LR: 0.002836
+➡️ PN 1: au 11.4542 | av 22.1449 | bu 11.4844 | bv 16.1664 | em 16.1643 | er 10.404
+➡️ PN 2: cu 10.9059 | cv 15.8614 | du 11.3899 | dv 15.946 | eq 11.4457 | eq 9.7061
+➡️ Step 15200 | TCE Loss: 4.003 | [1,2,3] Loss: 1.9836 | 2.5678 | 2.9422 | LR: 0.002834
+➡️ PN 1: au 11.4546 | av 22.1889 | bu 11.4852 | bv 16.1668 | em 16.1648 | er 10.4048
+➡️ PN 2: cu 10.908 | cv 15.8726 | du 11.391 | dv 15.9467 | eq 11.4482 | eq 9.7056
+➡️ Step 15300 | TCE Loss: 3.8207 | [1,2,3] Loss: 1.8723 | 2.4623 | 2.8691 | LR: 0.002832
+➡️ PN 1: au 11.4548 | av 22.2303 | bu 11.4859 | bv 16.1671 | em 16.1654 | er 10.4053
+➡️ PN 2: cu 10.9101 | cv 15.8872 | du 11.3911 | dv 15.9463 | eq 11.4518 | eq 9.7053
+➡️ Step 15400 | TCE Loss: 4.1372 | [1,2,3] Loss: 2.0682 | 2.6739 | 2.9281 | LR: 0.002829
+➡️ PN 1: au 11.4549 | av 22.2666 | bu 11.4866 | bv 16.1675 | em 16.1655 | er 10.403
+➡️ PN 2: cu 10.9115 | cv 15.8861 | du 11.3918 | dv 15.9469 | eq 11.4523 | eq 9.7022
+➡️ Step 15500 | TCE Loss: 4.5425 | [1,2,3] Loss: 2.3053 | 2.8977 | 3.1535 | LR: 0.002827
+➡️ PN 1: au 11.4563 | av 22.2972 | bu 11.4874 | bv 16.1681 | em 16.1661 | er 10.4016
+➡️ PN 2: cu 10.9131 | cv 15.8906 | du 11.393 | dv 15.948 | eq 11.4539 | eq 9.6998
+➡️ Step 15600 | TCE Loss: 3.9586 | [1,2,3] Loss: 1.9563 | 2.5742 | 2.8607 | LR: 0.002825
+➡️ PN 1: au 11.4567 | av 22.3305 | bu 11.4886 | bv 16.1688 | em 16.1665 | er 10.4008
+➡️ PN 2: cu 10.9147 | cv 15.8968 | du 11.3938 | dv 15.9487 | eq 11.4557 | eq 9.6986
+➡️ Step 15700 | TCE Loss: 3.9309 | [1,2,3] Loss: 1.948 | 2.5472 | 2.8369 | LR: 0.002822
+➡️ PN 1: au 11.4569 | av 22.3674 | bu 11.4893 | bv 16.1692 | em 16.1669 | er 10.4004
+➡️ PN 2: cu 10.9166 | cv 15.9037 | du 11.3949 | dv 15.9497 | eq 11.4575 | eq 9.6971
+➡️ Step 15800 | TCE Loss: 4.0256 | [1,2,3] Loss: 1.9873 | 2.6271 | 2.899 | LR: 0.00282
+➡️ PN 1: au 11.458 | av 22.3996 | bu 11.4902 | bv 16.1697 | em 16.1673 | er 10.4
+➡️ PN 2: cu 10.9185 | cv 15.9081 | du 11.3966 | dv 15.951 | eq 11.4595 | eq 9.6967
+➡️ Step 15900 | TCE Loss: 3.8586 | [1,2,3] Loss: 1.8914 | 2.5116 | 2.8457 | LR: 0.002818
+➡️ PN 1: au 11.459 | av 22.4302 | bu 11.4909 | bv 16.17 | em 16.1674 | er 10.4038
+➡️ PN 2: cu 10.9214 | cv 15.9305 | du 11.3992 | dv 15.9535 | eq 11.4663 | eq 9.6987
+➡️ Step 16000 | TCE Loss: 3.7542 | [1,2,3] Loss: 1.8258 | 2.4588 | 2.796 | LR: 0.002815
+➡️ PN 1: au 11.4598 | av 22.4596 | bu 11.4917 | bv 16.1707 | em 16.1678 | er 10.4074
+➡️ PN 2: cu 10.924 | cv 15.9519 | du 11.4017 | dv 15.9563 | eq 11.4732 | eq 9.7007
+💾 Checkpoint reached! Saving Step 16000...
+
+🔄 Epoch 12 Started | Shuffling 6 shards...
+➡️ Step 16100 | TCE Loss: 3.5028 | [1,2,3] Loss: 1.6804 | 2.3102 | 2.6692 | LR: 0.002813
+➡️ PN 1: au 11.4613 | av 22.4837 | bu 11.4928 | bv 16.1713 | em 16.1683 | er 10.4116
+➡️ PN 2: cu 10.9262 | cv 15.9726 | du 11.4038 | dv 15.9582 | eq 11.4796 | eq 9.7026
+➡️ Step 16200 | TCE Loss: 3.6815 | [1,2,3] Loss: 1.7894 | 2.4104 | 2.7476 | LR: 0.00281
+➡️ PN 1: au 11.4627 | av 22.5068 | bu 11.4937 | bv 16.1718 | em 16.1691 | er 10.4146
+➡️ PN 2: cu 10.9282 | cv 15.9901 | du 11.4049 | dv 15.9593 | eq 11.4851 | eq 9.7043
+➡️ Step 16300 | TCE Loss: 3.6815 | [1,2,3] Loss: 1.7667 | 2.4395 | 2.7799 | LR: 0.002808
+➡️ PN 1: au 11.4634 | av 22.5262 | bu 11.4945 | bv 16.1724 | em 16.1697 | er 10.417
+➡️ PN 2: cu 10.9302 | cv 16.0053 | du 11.4063 | dv 15.9606 | eq 11.4901 | eq 9.7054
+➡️ Step 16400 | TCE Loss: 4.2752 | [1,2,3] Loss: 2.1448 | 2.7507 | 3.02 | LR: 0.002805
+➡️ PN 1: au 11.464 | av 22.5492 | bu 11.4954 | bv 16.173 | em 16.1699 | er 10.4187
+➡️ PN 2: cu 10.932 | cv 16.0155 | du 11.4078 | dv 15.9619 | eq 11.4936 | eq 9.7057
+➡️ Step 16500 | TCE Loss: 7.7024 | [1,2,3] Loss: 4.0858 | 4.7723 | 4.9216 | LR: 0.002803
+➡️ PN 1: au 11.4647 | av 22.576 | bu 11.4963 | bv 16.1734 | em 16.1702 | er 10.4124
+➡️ PN 2: cu 10.9323 | cv 15.9936 | du 11.4076 | dv 15.9615 | eq 11.4874 | eq 9.6976
+➡️ Step 16600 | TCE Loss: 3.8695 | [1,2,3] Loss: 1.8823 | 2.5303 | 2.8879 | LR: 0.0028
+➡️ PN 1: au 11.4664 | av 22.6052 | bu 11.4971 | bv 16.1739 | em 16.1709 | er 10.4105
+➡️ PN 2: cu 10.9331 | cv 15.9909 | du 11.4087 | dv 15.9622 | eq 11.4862 | eq 9.6935
+➡️ Step 16700 | TCE Loss: 4.0191 | [1,2,3] Loss: 1.9875 | 2.5925 | 2.9414 | LR: 0.002798
+➡️ PN 1: au 11.468 | av 22.6343 | bu 11.4982 | bv 16.1746 | em 16.1712 | er 10.4109
+➡️ PN 2: cu 10.9346 | cv 15.9952 | du 11.4095 | dv 15.9625 | eq 11.4875 | eq 9.6914
+➡️ Step 16800 | TCE Loss: 4.4594 | [1,2,3] Loss: 2.2552 | 2.8452 | 3.1264 | LR: 0.002795
+➡️ PN 1: au 11.4689 | av 22.6535 | bu 11.4993 | bv 16.1751 | em 16.1716 | er 10.4019
+➡️ PN 2: cu 10.9343 | cv 15.9585 | du 11.4094 | dv 15.9614 | eq 11.4781 | eq 9.6815
+➡️ Step 16900 | TCE Loss: 4.3705 | [1,2,3] Loss: 2.2091 | 2.7806 | 3.0844 | LR: 0.002793
+➡️ PN 1: au 11.4699 | av 22.6714 | bu 11.5 | bv 16.1756 | em 16.172 | er 10.3966
+➡️ PN 2: cu 10.9346 | cv 15.9408 | du 11.4095 | dv 15.9608 | eq 11.4748 | eq 9.6749
+➡️ Step 17000 | TCE Loss: 4.1071 | [1,2,3] Loss: 2.0571 | 2.6349 | 2.9305 | LR: 0.00279
+➡️ PN 1: au 11.4707 | av 22.6937 | bu 11.5009 | bv 16.1763 | em 16.1726 | er 10.394
+➡️ PN 2: cu 10.9354 | cv 15.9362 | du 11.4099 | dv 15.9606 | eq 11.4742 | eq 9.671
+💾 Checkpoint reached! Saving Step 17000...
+➡️ Step 17100 | TCE Loss: 3.7293 | [1,2,3] Loss: 1.82 | 2.4436 | 2.7499 | LR: 0.002788
+➡️ PN 1: au 11.4723 | av 22.7193 | bu 11.5017 | bv 16.1768 | em 16.1731 | er 10.3958
+➡️ PN 2: cu 10.9368 | cv 15.9587 | du 11.4106 | dv 15.9611 | eq 11.4798 | eq 9.6725
+➡️ Step 17200 | TCE Loss: 3.8719 | [1,2,3] Loss: 1.8889 | 2.5337 | 2.8644 | LR: 0.002785
+➡️ PN 1: au 11.4738 | av 22.7465 | bu 11.5022 | bv 16.1772 | em 16.174 | er 10.3934
+➡️ PN 2: cu 10.9377 | cv 15.9601 | du 11.4111 | dv 15.9614 | eq 11.4803 | eq 9.67
+➡️ Step 17300 | TCE Loss: 4.1907 | [1,2,3] Loss: 2.1065 | 2.6902 | 2.9567 | LR: 0.002783
+➡️ PN 1: au 11.4743 | av 22.7721 | bu 11.5031 | bv 16.1779 | em 16.1746 | er 10.3934
+➡️ PN 2: cu 10.939 | cv 15.9688 | du 11.4119 | dv 15.9622 | eq 11.4824 | eq 9.6685
+➡️ Step 17400 | TCE Loss: 4.1565 | [1,2,3] Loss: 2.0946 | 2.6693 | 2.9093 | LR: 0.00278
+➡️ PN 1: au 11.4761 | av 22.7916 | bu 11.5038 | bv 16.1786 | em 16.1752 | er 10.3924
+➡️ PN 2: cu 10.9402 | cv 15.9739 | du 11.4128 | dv 15.963 | eq 11.4837 | eq 9.6674
+➡️ Step 17500 | TCE Loss: 4.0971 | [1,2,3] Loss: 2.0369 | 2.6533 | 2.9342 | LR: 0.002777
+➡️ PN 1: au 11.4776 | av 22.8154 | bu 11.5044 | bv 16.1793 | em 16.1761 | er 10.3914
+➡️ PN 2: cu 10.9414 | cv 15.9781 | du 11.4138 | dv 15.9638 | eq 11.485 | eq 9.6657
+
+🔄 Epoch 13 Started | Shuffling 6 shards...
+➡️ Step 17600 | TCE Loss: 3.777 | [1,2,3] Loss: 1.8453 | 2.4648 | 2.7973 | LR: 0.002775
+➡️ PN 1: au 11.4789 | av 22.844 | bu 11.5049 | bv 16.1798 | em 16.1768 | er 10.3915
+➡️ PN 2: cu 10.943 | cv 15.9862 | du 11.4139 | dv 15.9635 | eq 11.4876 | eq 9.6657
+➡️ Step 17700 | TCE Loss: 3.8676 | [1,2,3] Loss: 1.8906 | 2.5119 | 2.8843 | LR: 0.002772
+➡️ PN 1: au 11.4802 | av 22.8742 | bu 11.5057 | bv 16.1804 | em 16.1771 | er 10.3914
+➡️ PN 2: cu 10.9442 | cv 15.9903 | du 11.4151 | dv 15.9643 | eq 11.4889 | eq 9.6654
+➡️ Step 17800 | TCE Loss: 4.1041 | [1,2,3] Loss: 2.0321 | 2.6528 | 2.9824 | LR: 0.002769
+➡️ PN 1: au 11.4808 | av 22.9066 | bu 11.5064 | bv 16.1808 | em 16.1773 | er 10.3905
+➡️ PN 2: cu 10.9455 | cv 15.9919 | du 11.4166 | dv 15.9656 | eq 11.4884 | eq 9.6638
+➡️ Step 17900 | TCE Loss: 3.8071 | [1,2,3] Loss: 1.8457 | 2.4861 | 2.8735 | LR: 0.002767
+➡️ PN 1: au 11.4817 | av 22.9364 | bu 11.5071 | bv 16.1813 | em 16.178 | er 10.3914
+➡️ PN 2: cu 10.9469 | cv 15.9982 | du 11.4178 | dv 15.9665 | eq 11.4899 | eq 9.6637
+➡️ Step 18000 | TCE Loss: 4.0936 | [1,2,3] Loss: 2.036 | 2.6268 | 2.9767 | LR: 0.002764
+➡️ PN 1: au 11.4824 | av 22.9651 | bu 11.508 | bv 16.1821 | em 16.1785 | er 10.3912
+➡️ PN 2: cu 10.9482 | cv 16.0039 | du 11.4189 | dv 15.9671 | eq 11.4913 | eq 9.6632
+💾 Checkpoint reached! Saving Step 18000...
+➡️ Step 18100 | TCE Loss: 3.8265 | [1,2,3] Loss: 1.8755 | 2.509 | 2.7862 | LR: 0.002761
+➡️ PN 1: au 11.4834 | av 22.9851 | bu 11.5085 | bv 16.1823 | em 16.1788 | er 10.3921
+➡️ PN 2: cu 10.9494 | cv 16.0147 | du 11.4206 | dv 15.9688 | eq 11.4954 | eq 9.6643
+➡️ Step 18200 | TCE Loss: 3.9196 | [1,2,3] Loss: 1.9444 | 2.548 | 2.805 | LR: 0.002759
+➡️ PN 1: au 11.4836 | av 23.0057 | bu 11.5092 | bv 16.183 | em 16.1791 | er 10.3954
+➡️ PN 2: cu 10.9511 | cv 16.0304 | du 11.4231 | dv 15.9718 | eq 11.5005 | eq 9.6667
+➡️ Step 18300 | TCE Loss: 3.8291 | [1,2,3] Loss: 1.8887 | 2.4883 | 2.7847 | LR: 0.002756
+➡️ PN 1: au 11.4842 | av 23.0302 | bu 11.51 | bv 16.1835 | em 16.1795 | er 10.3991
+➡️ PN 2: cu 10.9531 | cv 16.0476 | du 11.4253 | dv 15.9738 | eq 11.5061 | eq 9.6689
+➡️ Step 18400 | TCE Loss: 4.5291 | [1,2,3] Loss: 2.3158 | 2.8616 | 3.1302 | LR: 0.002753
+➡️ PN 1: au 11.4838 | av 23.0524 | bu 11.5106 | bv 16.1838 | em 16.18 | er 10.3879
+➡️ PN 2: cu 10.9521 | cv 15.9937 | du 11.4239 | dv 15.9716 | eq 11.4934 | eq 9.658
+➡️ Step 18500 | TCE Loss: 4.3086 | [1,2,3] Loss: 2.1902 | 2.7308 | 3.0118 | LR: 0.002751
+➡️ PN 1: au 11.4849 | av 23.0713 | bu 11.5119 | bv 16.1846 | em 16.1804 | er 10.3828
+➡️ PN 2: cu 10.9525 | cv 15.9743 | du 11.4238 | dv 15.9705 | eq 11.4895 | eq 9.6521
+➡️ Step 18600 | TCE Loss: 4.1094 | [1,2,3] Loss: 2.0645 | 2.6452 | 2.8893 | LR: 0.002748
+➡️ PN 1: au 11.4854 | av 23.0938 | bu 11.5128 | bv 16.1853 | em 16.181 | er 10.3806
+➡️ PN 2: cu 10.9535 | cv 15.9692 | du 11.4239 | dv 15.9705 | eq 11.4882 | eq 9.6489
+➡️ Step 18700 | TCE Loss: 4.0393 | [1,2,3] Loss: 2.0086 | 2.6128 | 2.8971 | LR: 0.002745
+➡️ PN 1: au 11.4857 | av 23.126 | bu 11.5135 | bv 16.1858 | em 16.1815 | er 10.3804
+➡️ PN 2: cu 10.9552 | cv 15.9812 | du 11.4249 | dv 15.9715 | eq 11.4911 | eq 9.6489
+➡️ Step 18800 | TCE Loss: 4.1842 | [1,2,3] Loss: 2.0914 | 2.7046 | 2.9622 | LR: 0.002742
+➡️ PN 1: au 11.4861 | av 23.157 | bu 11.5142 | bv 16.1865 | em 16.1821 | er 10.3799
+➡️ PN 2: cu 10.957 | cv 15.9876 | du 11.4256 | dv 15.972 | eq 11.4926 | eq 9.6483
+➡️ Step 18900 | TCE Loss: 4.028 | [1,2,3] Loss: 1.9987 | 2.6096 | 2.8979 | LR: 0.002739
+➡️ PN 1: au 11.4861 | av 23.188 | bu 11.5154 | bv 16.1872 | em 16.1826 | er 10.3801
+➡️ PN 2: cu 10.9589 | cv 15.9967 | du 11.4271 | dv 15.9733 | eq 11.4948 | eq 9.6479
+➡️ Step 19000 | TCE Loss: 4.0787 | [1,2,3] Loss: 2.0567 | 2.623 | 2.8423 | LR: 0.002737
+➡️ PN 1: au 11.4865 | av 23.2197 | bu 11.516 | bv 16.1875 | em 16.1833 | er 10.3807
+➡️ PN 2: cu 10.9611 | cv 16.0065 | du 11.4281 | dv 15.9742 | eq 11.4971 | eq 9.6485
+💾 Checkpoint reached! Saving Step 19000...
+
+🔄 Epoch 14 Started | Shuffling 6 shards...
+➡️ Step 19100 | TCE Loss: 4.305 | [1,2,3] Loss: 2.1845 | 2.7462 | 2.9898 | LR: 0.002734
+➡️ PN 1: au 11.4867 | av 23.2478 | bu 11.5165 | bv 16.1878 | em 16.1837 | er 10.3743
+➡️ PN 2: cu 10.9615 | cv 15.976 | du 11.4284 | dv 15.974 | eq 11.49 | eq 9.6429
+➡️ Step 19200 | TCE Loss: 4.3423 | [1,2,3] Loss: 2.19 | 2.7816 | 3.046 | LR: 0.002731
+➡️ PN 1: au 11.4882 | av 23.2689 | bu 11.5175 | bv 16.1885 | em 16.1844 | er 10.3724
+➡️ PN 2: cu 10.963 | cv 15.9704 | du 11.4292 | dv 15.9748 | eq 11.4892 | eq 9.6401
+➡️ Step 19300 | TCE Loss: 4.1304 | [1,2,3] Loss: 2.0649 | 2.6478 | 2.9666 | LR: 0.002728
+➡️ PN 1: au 11.4884 | av 23.3001 | bu 11.5184 | bv 16.189 | em 16.1846 | er 10.3707
+➡️ PN 2: cu 10.9649 | cv 15.9738 | du 11.4306 | dv 15.976 | eq 11.4912 | eq 9.6386
+➡️ Step 19400 | TCE Loss: 4.0814 | [1,2,3] Loss: 2.0368 | 2.6115 | 2.9554 | LR: 0.002725
+➡️ PN 1: au 11.4889 | av 23.3321 | bu 11.519 | bv 16.189 | em 16.1849 | er 10.3725
+➡️ PN 2: cu 10.9669 | cv 15.9905 | du 11.4315 | dv 15.9769 | eq 11.495 | eq 9.6393
+➡️ Step 19500 | TCE Loss: 3.9808 | [1,2,3] Loss: 1.9766 | 2.563 | 2.8907 | LR: 0.002722
+➡️ PN 1: au 11.4892 | av 23.3657 | bu 11.5198 | bv 16.1892 | em 16.1852 | er 10.3734
+➡️ PN 2: cu 10.9688 | cv 16.0027 | du 11.4332 | dv 15.9785 | eq 11.4978 | eq 9.6395
+➡️ Step 19600 | TCE Loss: 4.0305 | [1,2,3] Loss: 2.011 | 2.5868 | 2.9048 | LR: 0.002719
+➡️ PN 1: au 11.4894 | av 23.3992 | bu 11.5207 | bv 16.1896 | em 16.1852 | er 10.3754
+➡️ PN 2: cu 10.9707 | cv 16.014 | du 11.4347 | dv 15.9799 | eq 11.5011 | eq 9.6396
+➡️ Step 19700 | TCE Loss: 4.1884 | [1,2,3] Loss: 2.1041 | 2.6972 | 2.9429 | LR: 0.002716
+➡️ PN 1: au 11.4898 | av 23.4286 | bu 11.5215 | bv 16.19 | em 16.1858 | er 10.373
+➡️ PN 2: cu 10.972 | cv 16.0149 | du 11.435 | dv 15.9801 | eq 11.5016 | eq 9.6364
+➡️ Step 19800 | TCE Loss: 4.0307 | [1,2,3] Loss: 2.0132 | 2.6006 | 2.869 | LR: 0.002713
+➡️ PN 1: au 11.4905 | av 23.465 | bu 11.5225 | bv 16.1904 | em 16.1863 | er 10.3738
+➡️ PN 2: cu 10.9737 | cv 16.025 | du 11.4356 | dv 15.9805 | eq 11.5046 | eq 9.636
+➡️ Step 19900 | TCE Loss: 3.9713 | [1,2,3] Loss: 1.9613 | 2.5886 | 2.8628 | LR: 0.002711
+➡️ PN 1: au 11.492 | av 23.4956 | bu 11.5232 | bv 16.1912 | em 16.1871 | er 10.3735
+➡️ PN 2: cu 10.975 | cv 16.0287 | du 11.4367 | dv 15.9817 | eq 11.506 | eq 9.6348
+➡️ Step 20000 | TCE Loss: 3.9187 | [1,2,3] Loss: 1.9297 | 2.5486 | 2.8587 | LR: 0.002708
+➡️ PN 1: au 11.4937 | av 23.5308 | bu 11.5243 | bv 16.1918 | em 16.1875 | er 10.3742
+➡️ PN 2: cu 10.9765 | cv 16.0384 | du 11.4376 | dv 15.9827 | eq 11.5092 | eq 9.6338
+💾 Checkpoint reached! Saving Step 20000...
+➡️ Step 20100 | TCE Loss: 4.1267 | [1,2,3] Loss: 2.0444 | 2.6697 | 2.9897 | LR: 0.002705
+➡️ PN 1: au 11.4946 | av 23.5574 | bu 11.5252 | bv 16.1925 | em 16.1879 | er 10.3749
+➡️ PN 2: cu 10.9779 | cv 16.0426 | du 11.44 | dv 15.9851 | eq 11.5114 | eq 9.6344
+➡️ Step 20200 | TCE Loss: 3.7667 | [1,2,3] Loss: 1.8341 | 2.4762 | 2.778 | LR: 0.002702
+➡️ PN 1: au 11.4948 | av 23.5817 | bu 11.5259 | bv 16.193 | em 16.1881 | er 10.3789
+➡️ PN 2: cu 10.9797 | cv 16.0599 | du 11.442 | dv 15.987 | eq 11.5176 | eq 9.6367
+➡️ Step 20300 | TCE Loss: 3.7531 | [1,2,3] Loss: 1.8273 | 2.4604 | 2.7824 | LR: 0.002699
+➡️ PN 1: au 11.4948 | av 23.6063 | bu 11.5264 | bv 16.1933 | em 16.188 | er 10.3831
+➡️ PN 2: cu 10.9816 | cv 16.0754 | du 11.4437 | dv 15.9884 | eq 11.5231 | eq 9.6381
+➡️ Step 20400 | TCE Loss: 4.009 | [1,2,3] Loss: 2.0119 | 2.5756 | 2.837 | LR: 0.002696
+➡️ PN 1: au 11.4947 | av 23.6345 | bu 11.5268 | bv 16.1936 | em 16.1878 | er 10.3822
+➡️ PN 2: cu 10.983 | cv 16.0719 | du 11.4443 | dv 15.9888 | eq 11.5229 | eq 9.6359
+
+🔄 Epoch 15 Started | Shuffling 6 shards...
+➡️ Step 20500 | TCE Loss: 4.5424 | [1,2,3] Loss: 2.3217 | 2.8805 | 3.1218 | LR: 0.002693
+➡️ PN 1: au 11.4951 | av 23.6657 | bu 11.5274 | bv 16.194 | em 16.1878 | er 10.3774
+➡️ PN 2: cu 10.9837 | cv 16.0537 | du 11.4439 | dv 15.9882 | eq 11.5184 | eq 9.6308
+➡️ Step 20600 | TCE Loss: 4.5343 | [1,2,3] Loss: 2.3171 | 2.8798 | 3.109 | LR: 0.00269
+➡️ PN 1: au 11.4957 | av 23.6866 | bu 11.5278 | bv 16.1941 | em 16.1881 | er 10.3714
+➡️ PN 2: cu 10.9843 | cv 16.0308 | du 11.444 | dv 15.9879 | eq 11.5123 | eq 9.6241
+➡️ Step 20700 | TCE Loss: 4.3125 | [1,2,3] Loss: 2.1786 | 2.7605 | 3.0145 | LR: 0.002687
+➡️ PN 1: au 11.496 | av 23.7057 | bu 11.5284 | bv 16.1944 | em 16.1884 | er 10.3689
+➡️ PN 2: cu 10.9854 | cv 16.0258 | du 11.444 | dv 15.9877 | eq 11.5113 | eq 9.6207
+➡️ Step 20800 | TCE Loss: 3.9194 | [1,2,3] Loss: 1.9298 | 2.5341 | 2.8899 | LR: 0.002683
+➡️ PN 1: au 11.4976 | av 23.7358 | bu 11.5292 | bv 16.1949 | em 16.189 | er 10.3697
+➡️ PN 2: cu 10.9867 | cv 16.0375 | du 11.4447 | dv 15.9879 | eq 11.5142 | eq 9.621
+➡️ Step 20900 | TCE Loss: 3.9203 | [1,2,3] Loss: 1.9242 | 2.5481 | 2.8883 | LR: 0.00268
+➡️ PN 1: au 11.4988 | av 23.7712 | bu 11.5302 | bv 16.1955 | em 16.1894 | er 10.371
+➡️ PN 2: cu 10.9882 | cv 16.0474 | du 11.4459 | dv 15.9888 | eq 11.5168 | eq 9.6213
+➡️ Step 21000 | TCE Loss: 3.9861 | [1,2,3] Loss: 1.9669 | 2.5765 | 2.9239 | LR: 0.002677
+➡️ PN 1: au 11.5002 | av 23.8018 | bu 11.5309 | bv 16.196 | em 16.1897 | er 10.3728
+➡️ PN 2: cu 10.99 | cv 16.0582 | du 11.447 | dv 15.9898 | eq 11.5197 | eq 9.6214
+💾 Checkpoint reached! Saving Step 21000...
+➡️ Step 21100 | TCE Loss: 3.7799 | [1,2,3] Loss: 1.8351 | 2.4705 | 2.8378 | LR: 0.002674
+➡️ PN 1: au 11.5017 | av 23.8332 | bu 11.532 | bv 16.1969 | em 16.1902 | er 10.3735
+➡️ PN 2: cu 10.9917 | cv 16.0654 | du 11.4486 | dv 15.9911 | eq 11.5206 | eq 9.6209
+➡️ Step 21200 | TCE Loss: 4.1968 | [1,2,3] Loss: 2.1121 | 2.6934 | 2.9522 | LR: 0.002671
+➡️ PN 1: au 11.5025 | av 23.8652 | bu 11.5327 | bv 16.1977 | em 16.1908 | er 10.3746
+➡️ PN 2: cu 10.9933 | cv 16.0723 | du 11.4495 | dv 15.9921 | eq 11.5223 | eq 9.6199
+➡️ Step 21300 | TCE Loss: 4.0391 | [1,2,3] Loss: 2.0158 | 2.6117 | 2.8696 | LR: 0.002668
+➡️ PN 1: au 11.5015 | av 23.8977 | bu 11.5333 | bv 16.1982 | em 16.1909 | er 10.372
+➡️ PN 2: cu 10.9946 | cv 16.0711 | du 11.45 | dv 15.9924 | eq 11.5219 | eq 9.6159
+➡️ Step 21400 | TCE Loss: 4.1519 | [1,2,3] Loss: 2.0483 | 2.7117 | 2.9908 | LR: 0.002665
+➡️ PN 1: au 11.5018 | av 23.9336 | bu 11.5342 | bv 16.199 | em 16.1914 | er 10.372
+➡️ PN 2: cu 10.9962 | cv 16.0771 | du 11.4505 | dv 15.9931 | eq 11.5241 | eq 9.6149
+➡️ Step 21500 | TCE Loss: 3.9691 | [1,2,3] Loss: 1.972 | 2.5773 | 2.834 | LR: 0.002662
+➡️ PN 1: au 11.5025 | av 23.9771 | bu 11.535 | bv 16.1996 | em 16.1918 | er 10.373
+➡️ PN 2: cu 10.9981 | cv 16.0866 | du 11.4513 | dv 15.9938 | eq 11.5267 | eq 9.6151
+➡️ Step 21600 | TCE Loss: 3.9709 | [1,2,3] Loss: 1.9644 | 2.5846 | 2.8569 | LR: 0.002659
+➡️ PN 1: au 11.5027 | av 24.0149 | bu 11.5358 | bv 16.2 | em 16.1922 | er 10.373
+➡️ PN 2: cu 10.9999 | cv 16.0924 | du 11.4522 | dv 15.9947 | eq 11.5288 | eq 9.6144
+➡️ Step 21700 | TCE Loss: 3.7603 | [1,2,3] Loss: 1.8373 | 2.4594 | 2.7731 | LR: 0.002655
+➡️ PN 1: au 11.5031 | av 24.0478 | bu 11.5364 | bv 16.2004 | em 16.1925 | er 10.3748
+➡️ PN 2: cu 11.0021 | cv 16.1026 | du 11.4542 | dv 15.997 | eq 11.5327 | eq 9.617
+➡️ Step 21800 | TCE Loss: 3.7268 | [1,2,3] Loss: 1.8095 | 2.4606 | 2.7477 | LR: 0.002652
+➡️ PN 1: au 11.5038 | av 24.0805 | bu 11.5372 | bv 16.2008 | em 16.193 | er 10.3787
+➡️ PN 2: cu 11.0043 | cv 16.121 | du 11.4564 | dv 15.999 | eq 11.5394 | eq 9.6199
+➡️ Step 21900 | TCE Loss: 3.6791 | [1,2,3] Loss: 1.774 | 2.4312 | 2.7579 | LR: 0.002649
+➡️ PN 1: au 11.5045 | av 24.1119 | bu 11.5381 | bv 16.2015 | em 16.1933 | er 10.3837
+➡️ PN 2: cu 11.0065 | cv 16.1422 | du 11.4581 | dv 16.0007 | eq 11.5469 | eq 9.6226
+
+🔄 Epoch 16 Started | Shuffling 6 shards...
+➡️ Step 22000 | TCE Loss: 4.012 | [1,2,3] Loss: 1.9752 | 2.582 | 2.9835 | LR: 0.002646
+➡️ PN 1: au 11.505 | av 24.1399 | bu 11.5389 | bv 16.2021 | em 16.1936 | er 10.381
+➡️ PN 2: cu 11.0078 | cv 16.1376 | du 11.4591 | dv 16.0018 | eq 11.5466 | eq 9.6189
+💾 Checkpoint reached! Saving Step 22000...
+➡️ Step 22100 | TCE Loss: 4.0648 | [1,2,3] Loss: 2.0086 | 2.6175 | 2.9896 | LR: 0.002643
+➡️ PN 1: au 11.5063 | av 24.1692 | bu 11.5397 | bv 16.2026 | em 16.1939 | er 10.3803
+➡️ PN 2: cu 11.0095 | cv 16.1403 | du 11.4598 | dv 16.0021 | eq 11.5465 | eq 9.6168
+➡️ Step 22200 | TCE Loss: 3.9482 | [1,2,3] Loss: 1.9557 | 2.5638 | 2.8424 | LR: 0.002639
+➡️ PN 1: au 11.5079 | av 24.1959 | bu 11.5404 | bv 16.2033 | em 16.1943 | er 10.382
+➡️ PN 2: cu 11.0112 | cv 16.1482 | du 11.4603 | dv 16.0024 | eq 11.549 | eq 9.6169
+➡️ Step 22300 | TCE Loss: 4.5845 | [1,2,3] Loss: 2.3292 | 2.9205 | 3.1799 | LR: 0.002636
+➡️ PN 1: au 11.509 | av 24.2214 | bu 11.5411 | bv 16.2036 | em 16.1947 | er 10.3777
+➡️ PN 2: cu 11.0122 | cv 16.1342 | du 11.461 | dv 16.003 | eq 11.544 | eq 9.6113
+➡️ Step 22400 | TCE Loss: 4.4298 | [1,2,3] Loss: 2.253 | 2.8139 | 3.0791 | LR: 0.002633
+➡️ PN 1: au 11.5089 | av 24.2457 | bu 11.5417 | bv 16.2041 | em 16.195 | er 10.372
+➡️ PN 2: cu 11.0132 | cv 16.1156 | du 11.461 | dv 16.0025 | eq 11.5397 | eq 9.6045
+➡️ Step 22500 | TCE Loss: 4.4186 | [1,2,3] Loss: 2.2252 | 2.8447 | 3.0839 | LR: 0.00263
+➡️ PN 1: au 11.5088 | av 24.2716 | bu 11.5426 | bv 16.2045 | em 16.195 | er 10.37
+➡️ PN 2: cu 11.0147 | cv 16.113 | du 11.4615 | dv 16.0028 | eq 11.5398 | eq 9.6013
+➡️ Step 22600 | TCE Loss: 3.9444 | [1,2,3] Loss: 1.949 | 2.5691 | 2.8435 | LR: 0.002626
+➡️ PN 1: au 11.5106 | av 24.2975 | bu 11.5432 | bv 16.2051 | em 16.1953 | er 10.3695
+➡️ PN 2: cu 11.0163 | cv 16.1224 | du 11.4615 | dv 16.0022 | eq 11.5431 | eq 9.6004
+➡️ Step 22700 | TCE Loss: 4.0944 | [1,2,3] Loss: 2.049 | 2.6388 | 2.9043 | LR: 0.002623
+➡️ PN 1: au 11.5113 | av 24.3296 | bu 11.5438 | bv 16.2056 | em 16.1957 | er 10.3706
+➡️ PN 2: cu 11.0181 | cv 16.1343 | du 11.4623 | dv 16.003 | eq 11.5472 | eq 9.6001
+➡️ Step 22800 | TCE Loss: 4.2532 | [1,2,3] Loss: 2.1257 | 2.7443 | 3.0215 | LR: 0.00262
+➡️ PN 1: au 11.5116 | av 24.361 | bu 11.5446 | bv 16.2062 | em 16.196 | er 10.3715
+➡️ PN 2: cu 11.0198 | cv 16.1444 | du 11.4636 | dv 16.0042 | eq 11.5507 | eq 9.5996
+➡️ Step 22900 | TCE Loss: 4.0189 | [1,2,3] Loss: 1.9912 | 2.6144 | 2.8823 | LR: 0.002616
+➡️ PN 1: au 11.5134 | av 24.3919 | bu 11.5453 | bv 16.2065 | em 16.1965 | er 10.3731
+➡️ PN 2: cu 11.0215 | cv 16.1542 | du 11.4643 | dv 16.0045 | eq 11.5534 | eq 9.6
+➡️ Step 23000 | TCE Loss: 4.262 | [1,2,3] Loss: 2.1904 | 2.6912 | 2.9036 | LR: 0.002613
+➡️ PN 1: au 11.5146 | av 24.4226 | bu 11.5462 | bv 16.2069 | em 16.1969 | er 10.3733
+➡️ PN 2: cu 11.0228 | cv 16.1597 | du 11.4649 | dv 16.0046 | eq 11.5553 | eq 9.5997
+💾 Checkpoint reached! Saving Step 23000...
+➡️ Step 23100 | TCE Loss: 3.8056 | [1,2,3] Loss: 1.8499 | 2.5098 | 2.8032 | LR: 0.00261
+➡️ PN 1: au 11.5151 | av 24.4545 | bu 11.5465 | bv 16.2069 | em 16.197 | er 10.3735
+➡️ PN 2: cu 11.0242 | cv 16.1658 | du 11.4665 | dv 16.0058 | eq 11.5581 | eq 9.6002
+➡️ Step 23200 | TCE Loss: 3.6617 | [1,2,3] Loss: 1.7846 | 2.3911 | 2.7261 | LR: 0.002606
+➡️ PN 1: au 11.5152 | av 24.4782 | bu 11.5475 | bv 16.2073 | em 16.1973 | er 10.3773
+➡️ PN 2: cu 11.0263 | cv 16.1836 | du 11.4683 | dv 16.0075 | eq 11.5643 | eq 9.6034
+➡️ Step 23300 | TCE Loss: 3.8016 | [1,2,3] Loss: 1.8571 | 2.4871 | 2.8037 | LR: 0.002603
+➡️ PN 1: au 11.5144 | av 24.5062 | bu 11.5479 | bv 16.2075 | em 16.1973 | er 10.381
+➡️ PN 2: cu 11.0282 | cv 16.1989 | du 11.4698 | dv 16.0091 | eq 11.5694 | eq 9.6061
+
+🔄 Epoch 17 Started | Shuffling 6 shards...
+➡️ Step 23400 | TCE Loss: 4.9432 | [1,2,3] Loss: 2.5324 | 3.1435 | 3.356 | LR: 0.0026
+➡️ PN 1: au 11.5149 | av 24.532 | bu 11.5485 | bv 16.2078 | em 16.1975 | er 10.3815
+➡️ PN 2: cu 11.0295 | cv 16.2006 | du 11.4706 | dv 16.01 | eq 11.5709 | eq 9.606
+➡️ Step 23500 | TCE Loss: 4.3945 | [1,2,3] Loss: 2.2177 | 2.8128 | 3.0819 | LR: 0.002596
+➡️ PN 1: au 11.5137 | av 24.5498 | bu 11.5493 | bv 16.2081 | em 16.1975 | er 10.3693
+➡️ PN 2: cu 11.0293 | cv 16.1558 | du 11.4704 | dv 16.0095 | eq 11.5578 | eq 9.5945
+➡️ Step 23600 | TCE Loss: 4.3652 | [1,2,3] Loss: 2.2008 | 2.7944 | 3.0688 | LR: 0.002593
+➡️ PN 1: au 11.5125 | av 24.5712 | bu 11.5502 | bv 16.2087 | em 16.1974 | er 10.3652
+➡️ PN 2: cu 11.0304 | cv 16.1451 | du 11.4708 | dv 16.0094 | eq 11.5553 | eq 9.5902
+➡️ Step 23700 | TCE Loss: 4.2567 | [1,2,3] Loss: 2.1284 | 2.7493 | 3.0147 | LR: 0.002589
+➡️ PN 1: au 11.5126 | av 24.5933 | bu 11.5514 | bv 16.2094 | em 16.1979 | er 10.3633
+➡️ PN 2: cu 11.0313 | cv 16.1483 | du 11.4709 | dv 16.0091 | eq 11.5564 | eq 9.5882
+➡️ Step 23800 | TCE Loss: 4.1713 | [1,2,3] Loss: 2.1079 | 2.671 | 2.9118 | LR: 0.002586
+➡️ PN 1: au 11.513 | av 24.6208 | bu 11.5521 | bv 16.2098 | em 16.1982 | er 10.3633
+➡️ PN 2: cu 11.0325 | cv 16.1566 | du 11.4715 | dv 16.0095 | eq 11.5593 | eq 9.5873
+➡️ Step 23900 | TCE Loss: 4.0726 | [1,2,3] Loss: 2.0491 | 2.6245 | 2.8449 | LR: 0.002582
+➡️ PN 1: au 11.5131 | av 24.6472 | bu 11.553 | bv 16.2104 | em 16.1983 | er 10.3633
+➡️ PN 2: cu 11.0338 | cv 16.1633 | du 11.4724 | dv 16.0102 | eq 11.5616 | eq 9.5865
+➡️ Step 24000 | TCE Loss: 3.8665 | [1,2,3] Loss: 1.9176 | 2.5131 | 2.7696 | LR: 0.002579
+➡️ PN 1: au 11.5139 | av 24.668 | bu 11.5538 | bv 16.211 | em 16.1987 | er 10.3628
+➡️ PN 2: cu 11.0351 | cv 16.1696 | du 11.4732 | dv 16.0109 | eq 11.5639 | eq 9.5855
+💾 Checkpoint reached! Saving Step 24000...
+➡️ Step 24100 | TCE Loss: 3.9613 | [1,2,3] Loss: 1.951 | 2.5761 | 2.8892 | LR: 0.002576
+➡️ PN 1: au 11.5133 | av 24.6971 | bu 11.5542 | bv 16.2112 | em 16.1986 | er 10.3628
+➡️ PN 2: cu 11.0363 | cv 16.1744 | du 11.474 | dv 16.0114 | eq 11.5654 | eq 9.5852
+➡️ Step 24200 | TCE Loss: 4.1873 | [1,2,3] Loss: 2.1083 | 2.6713 | 2.9738 | LR: 0.002572
+➡️ PN 1: au 11.5133 | av 24.7225 | bu 11.5547 | bv 16.2114 | em 16.1988 | er 10.3631
+➡️ PN 2: cu 11.0374 | cv 16.1764 | du 11.4748 | dv 16.0118 | eq 11.5665 | eq 9.5847
+➡️ Step 24300 | TCE Loss: 3.9149 | [1,2,3] Loss: 1.9318 | 2.5219 | 2.8884 | LR: 0.002569
+➡️ PN 1: au 11.5133 | av 24.7499 | bu 11.5552 | bv 16.2118 | em 16.1989 | er 10.3626
+➡️ PN 2: cu 11.0386 | cv 16.1756 | du 11.4764 | dv 16.013 | eq 11.5655 | eq 9.5827
+➡️ Step 24400 | TCE Loss: 4.2291 | [1,2,3] Loss: 2.1418 | 2.6785 | 2.9924 | LR: 0.002565
+➡️ PN 1: au 11.5132 | av 24.7844 | bu 11.556 | bv 16.2124 | em 16.1991 | er 10.3637
+➡️ PN 2: cu 11.0402 | cv 16.1801 | du 11.4773 | dv 16.0137 | eq 11.5667 | eq 9.5829
+➡️ Step 24500 | TCE Loss: 4.1839 | [1,2,3] Loss: 2.0802 | 2.6999 | 3.0149 | LR: 0.002562
+➡️ PN 1: au 11.513 | av 24.8124 | bu 11.5567 | bv 16.2129 | em 16.1995 | er 10.3644
+➡️ PN 2: cu 11.0417 | cv 16.1861 | du 11.478 | dv 16.0143 | eq 11.5685 | eq 9.5827
+➡️ Step 24600 | TCE Loss: 3.9048 | [1,2,3] Loss: 1.929 | 2.526 | 2.8516 | LR: 0.002558
+➡️ PN 1: au 11.5135 | av 24.8313 | bu 11.5574 | bv 16.2135 | em 16.1999 | er 10.3653
+➡️ PN 2: cu 11.0433 | cv 16.1955 | du 11.4799 | dv 16.0157 | eq 11.572 | eq 9.5844
+➡️ Step 24700 | TCE Loss: 3.8226 | [1,2,3] Loss: 1.8822 | 2.4833 | 2.7952 | LR: 0.002555
+➡️ PN 1: au 11.5147 | av 24.8468 | bu 11.5584 | bv 16.2143 | em 16.2003 | er 10.3692
+➡️ PN 2: cu 11.0451 | cv 16.2128 | du 11.4817 | dv 16.0176 | eq 11.5778 | eq 9.5875
+➡️ Step 24800 | TCE Loss: 3.856 | [1,2,3] Loss: 1.893 | 2.4947 | 2.8626 | LR: 0.002551
+➡️ PN 1: au 11.5144 | av 24.8752 | bu 11.559 | bv 16.2149 | em 16.2003 | er 10.3723
+➡️ PN 2: cu 11.0466 | cv 16.2246 | du 11.4828 | dv 16.0189 | eq 11.5819 | eq 9.59
+
+🔄 Epoch 18 Started | Shuffling 6 shards...
+➡️ Step 24900 | TCE Loss: 4.2325 | [1,2,3] Loss: 2.1239 | 2.7081 | 3.0179 | LR: 0.002547
+➡️ PN 1: au 11.5149 | av 24.9068 | bu 11.5595 | bv 16.2154 | em 16.2004 | er 10.3704
+➡️ PN 2: cu 11.0477 | cv 16.2194 | du 11.4836 | dv 16.0199 | eq 11.5813 | eq 9.5878
+➡️ Step 25000 | TCE Loss: 4.0614 | [1,2,3] Loss: 2.0357 | 2.5834 | 2.9356 | LR: 0.002544
+➡️ PN 1: au 11.5155 | av 24.9329 | bu 11.5598 | bv 16.2155 | em 16.2007 | er 10.3691
+➡️ PN 2: cu 11.0487 | cv 16.2198 | du 11.4841 | dv 16.0199 | eq 11.5812 | eq 9.585
+💾 Checkpoint reached! Saving Step 25000...
+➡️ Step 25100 | TCE Loss: 3.928 | [1,2,3] Loss: 1.944 | 2.5241 | 2.8879 | LR: 0.00254
+➡️ PN 1: au 11.5153 | av 24.9567 | bu 11.5601 | bv 16.216 | em 16.2007 | er 10.3689
+➡️ PN 2: cu 11.05 | cv 16.2209 | du 11.4842 | dv 16.0195 | eq 11.5819 | eq 9.5837
+➡️ Step 25200 | TCE Loss: 4.1944 | [1,2,3] Loss: 2.1123 | 2.6866 | 2.9552 | LR: 0.002537
+➡️ PN 1: au 11.517 | av 24.9791 | bu 11.5608 | bv 16.2165 | em 16.2011 | er 10.3672
+➡️ PN 2: cu 11.0512 | cv 16.2219 | du 11.485 | dv 16.0199 | eq 11.5809 | eq 9.5813
+➡️ Step 25300 | TCE Loss: 4.0248 | [1,2,3] Loss: 2.0108 | 2.5945 | 2.867 | LR: 0.002533
+➡️ PN 1: au 11.5186 | av 24.9995 | bu 11.5618 | bv 16.2174 | em 16.2014 | er 10.3647
+➡️ PN 2: cu 11.0524 | cv 16.2209 | du 11.4848 | dv 16.0194 | eq 11.5809 | eq 9.5774
+➡️ Step 25400 | TCE Loss: 3.9389 | [1,2,3] Loss: 1.9673 | 2.5418 | 2.8028 | LR: 0.002529
+➡️ PN 1: au 11.5196 | av 25.016 | bu 11.5627 | bv 16.2182 | em 16.202 | er 10.3634
+➡️ PN 2: cu 11.0536 | cv 16.2244 | du 11.4853 | dv 16.0196 | eq 11.5823 | eq 9.5761
+➡️ Step 25500 | TCE Loss: 4.0976 | [1,2,3] Loss: 2.0472 | 2.6631 | 2.8755 | LR: 0.002526
+➡️ PN 1: au 11.5203 | av 25.0357 | bu 11.5637 | bv 16.2189 | em 16.2025 | er 10.3629
+➡️ PN 2: cu 11.0546 | cv 16.2273 | du 11.4859 | dv 16.0201 | eq 11.5837 | eq 9.5751
+➡️ Step 25600 | TCE Loss: 3.959 | [1,2,3] Loss: 1.9914 | 2.5393 | 2.7919 | LR: 0.002522
+➡️ PN 1: au 11.52 | av 25.0556 | bu 11.5645 | bv 16.2192 | em 16.2026 | er 10.3623
+➡️ PN 2: cu 11.0556 | cv 16.231 | du 11.4867 | dv 16.0206 | eq 11.585 | eq 9.5745
+➡️ Step 25700 | TCE Loss: 4.1762 | [1,2,3] Loss: 2.108 | 2.673 | 2.9267 | LR: 0.002519
+➡️ PN 1: au 11.5211 | av 25.0737 | bu 11.5652 | bv 16.2196 | em 16.2031 | er 10.3624
+➡️ PN 2: cu 11.0567 | cv 16.2368 | du 11.4872 | dv 16.0208 | eq 11.5873 | eq 9.575
+➡️ Step 25800 | TCE Loss: 3.8282 | [1,2,3] Loss: 1.8719 | 2.4897 | 2.8459 | LR: 0.002515
+➡️ PN 1: au 11.5223 | av 25.0942 | bu 11.5658 | bv 16.2201 | em 16.2035 | er 10.3638
+➡️ PN 2: cu 11.0582 | cv 16.2448 | du 11.4891 | dv 16.0225 | eq 11.5906 | eq 9.5773
+➡️ Step 25900 | TCE Loss: 3.8852 | [1,2,3] Loss: 1.9149 | 2.5335 | 2.8142 | LR: 0.002511
+➡️ PN 1: au 11.5243 | av 25.115 | bu 11.5662 | bv 16.2203 | em 16.2041 | er 10.3687
+➡️ PN 2: cu 11.06 | cv 16.2634 | du 11.4912 | dv 16.0246 | eq 11.5972 | eq 9.5812
+➡️ Step 26000 | TCE Loss: 3.8968 | [1,2,3] Loss: 1.9182 | 2.5435 | 2.8275 | LR: 0.002508
+➡️ PN 1: au 11.5256 | av 25.1348 | bu 11.5666 | bv 16.2207 | em 16.2045 | er 10.3729
+➡️ PN 2: cu 11.0616 | cv 16.2776 | du 11.4929 | dv 16.026 | eq 11.6021 | eq 9.5836
+💾 Checkpoint reached! Saving Step 26000...
+➡️ Step 26100 | TCE Loss: 4.7382 | [1,2,3] Loss: 2.4336 | 2.9916 | 3.2351 | LR: 0.002504
+➡️ PN 1: au 11.526 | av 25.1498 | bu 11.5669 | bv 16.2211 | em 16.2049 | er 10.3672
+➡️ PN 2: cu 11.0621 | cv 16.253 | du 11.4927 | dv 16.0257 | eq 11.5955 | eq 9.578
+➡️ Step 26200 | TCE Loss: 4.4799 | [1,2,3] Loss: 2.2779 | 2.8604 | 3.0874 | LR: 0.0025
+➡️ PN 1: au 11.5262 | av 25.1575 | bu 11.5673 | bv 16.2216 | em 16.2052 | er 10.359
+➡️ PN 2: cu 11.0621 | cv 16.2255 | du 11.492 | dv 16.0247 | eq 11.588 | eq 9.5693
+➡️ Step 26300 | TCE Loss: 4.5151 | [1,2,3] Loss: 2.3135 | 2.8488 | 3.1088 | LR: 0.002496
+➡️ PN 1: au 11.5277 | av 25.1685 | bu 11.5681 | bv 16.2222 | em 16.2058 | er 10.3557
+➡️ PN 2: cu 11.0629 | cv 16.2138 | du 11.4915 | dv 16.0237 | eq 11.5846 | eq 9.565
+
+🔄 Epoch 19 Started | Shuffling 6 shards...
+➡️ Step 26400 | TCE Loss: 4.4387 | [1,2,3] Loss: 2.268 | 2.8084 | 3.0661 | LR: 0.002493
+➡️ PN 1: au 11.529 | av 25.1823 | bu 11.5691 | bv 16.223 | em 16.2061 | er 10.3544
+➡️ PN 2: cu 11.0639 | cv 16.2101 | du 11.4919 | dv 16.0239 | eq 11.5841 | eq 9.5631
+➡️ Step 26500 | TCE Loss: 4.5048 | [1,2,3] Loss: 2.3037 | 2.8498 | 3.1049 | LR: 0.002489
+➡️ PN 1: au 11.5302 | av 25.1931 | bu 11.5697 | bv 16.2234 | em 16.2069 | er 10.3524
+➡️ PN 2: cu 11.0649 | cv 16.2068 | du 11.4917 | dv 16.0235 | eq 11.5834 | eq 9.5609
+➡️ Step 26600 | TCE Loss: 4.2357 | [1,2,3] Loss: 2.152 | 2.7029 | 2.9289 | LR: 0.002485
+➡️ PN 1: au 11.5306 | av 25.2072 | bu 11.5704 | bv 16.224 | em 16.2071 | er 10.351
+➡️ PN 2: cu 11.0658 | cv 16.2065 | du 11.4928 | dv 16.0243 | eq 11.5837 | eq 9.56
+➡️ Step 26700 | TCE Loss: 3.827 | [1,2,3] Loss: 1.8709 | 2.5086 | 2.8072 | LR: 0.002482
+➡️ PN 1: au 11.5311 | av 25.2243 | bu 11.5712 | bv 16.2245 | em 16.2073 | er 10.3556
+➡️ PN 2: cu 11.0673 | cv 16.2281 | du 11.4949 | dv 16.0263 | eq 11.5913 | eq 9.5645
+➡️ Step 26800 | TCE Loss: 3.7979 | [1,2,3] Loss: 1.8566 | 2.4852 | 2.7952 | LR: 0.002478
+➡️ PN 1: au 11.5306 | av 25.2405 | bu 11.5716 | bv 16.2248 | em 16.2072 | er 10.361
+➡️ PN 2: cu 11.0688 | cv 16.2486 | du 11.4965 | dv 16.0282 | eq 11.5981 | eq 9.5689
+➡️ Step 26900 | TCE Loss: 4.4134 | [1,2,3] Loss: 2.2343 | 2.821 | 3.0742 | LR: 0.002474
+➡️ PN 1: au 11.531 | av 25.2597 | bu 11.5722 | bv 16.2252 | em 16.2077 | er 10.3646
+➡️ PN 2: cu 11.0702 | cv 16.2615 | du 11.4978 | dv 16.0296 | eq 11.6031 | eq 9.5711
+➡️ Step 27000 | TCE Loss: 4.2502 | [1,2,3] Loss: 2.1471 | 2.7054 | 3.0016 | LR: 0.00247
+➡️ PN 1: au 11.5309 | av 25.2779 | bu 11.5727 | bv 16.2256 | em 16.2079 | er 10.3617
+➡️ PN 2: cu 11.0711 | cv 16.2563 | du 11.4984 | dv 16.0299 | eq 11.602 | eq 9.5668
+💾 Checkpoint reached! Saving Step 27000...
+➡️ Step 27100 | TCE Loss: 4.0321 | [1,2,3] Loss: 2.0017 | 2.6032 | 2.915 | LR: 0.002466
+➡️ PN 1: au 11.5309 | av 25.2962 | bu 11.5732 | bv 16.226 | em 16.2083 | er 10.3619
+➡️ PN 2: cu 11.0723 | cv 16.2614 | du 11.4994 | dv 16.0302 | eq 11.6031 | eq 9.5653
+➡️ Step 27200 | TCE Loss: 3.9811 | [1,2,3] Loss: 1.9664 | 2.563 | 2.9327 | LR: 0.002463
+➡️ PN 1: au 11.5319 | av 25.3146 | bu 11.5738 | bv 16.2266 | em 16.2087 | er 10.3634
+➡️ PN 2: cu 11.0734 | cv 16.2694 | du 11.5005 | dv 16.031 | eq 11.6051 | eq 9.5645
+➡️ Step 27300 | TCE Loss: 4.2077 | [1,2,3] Loss: 2.1403 | 2.6797 | 2.9103 | LR: 0.002459
+➡️ PN 1: au 11.5329 | av 25.3292 | bu 11.5743 | bv 16.2271 | em 16.2092 | er 10.3618
+➡️ PN 2: cu 11.0744 | cv 16.27 | du 11.5004 | dv 16.0304 | eq 11.6051 | eq 9.5615
+➡️ Step 27400 | TCE Loss: 4.0656 | [1,2,3] Loss: 2.0375 | 2.6155 | 2.8814 | LR: 0.002455
+➡️ PN 1: au 11.5339 | av 25.3494 | bu 11.5748 | bv 16.2274 | em 16.2099 | er 10.3612
+➡️ PN 2: cu 11.0755 | cv 16.274 | du 11.501 | dv 16.0308 | eq 11.6061 | eq 9.5595
+➡️ Step 27500 | TCE Loss: 4.1251 | [1,2,3] Loss: 2.0701 | 2.6602 | 2.8998 | LR: 0.002451
+➡️ PN 1: au 11.5352 | av 25.3664 | bu 11.5755 | bv 16.228 | em 16.2103 | er 10.3612
+➡️ PN 2: cu 11.0766 | cv 16.2777 | du 11.5018 | dv 16.0315 | eq 11.6078 | eq 9.5583
+➡️ Step 27600 | TCE Loss: 4.0191 | [1,2,3] Loss: 1.9852 | 2.6177 | 2.9005 | LR: 0.002447
+➡️ PN 1: au 11.5363 | av 25.3853 | bu 11.5758 | bv 16.2286 | em 16.2105 | er 10.3617
+➡️ PN 2: cu 11.0777 | cv 16.2831 | du 11.5026 | dv 16.0321 | eq 11.6096 | eq 9.5581
+➡️ Step 27700 | TCE Loss: 4.0458 | [1,2,3] Loss: 2.0174 | 2.6101 | 2.8934 | LR: 0.002444
+➡️ PN 1: au 11.5361 | av 25.4061 | bu 11.5767 | bv 16.2293 | em 16.2109 | er 10.3619
+➡️ PN 2: cu 11.0789 | cv 16.2874 | du 11.5034 | dv 16.0323 | eq 11.6111 | eq 9.5577
+
+🔄 Epoch 20 Started | Shuffling 6 shards...
+➡️ Step 27800 | TCE Loss: 4.2898 | [1,2,3] Loss: 2.1712 | 2.7147 | 3.0451 | LR: 0.00244
+➡️ PN 1: au 11.5361 | av 25.4302 | bu 11.5772 | bv 16.2296 | em 16.2111 | er 10.3625
+➡️ PN 2: cu 11.08 | cv 16.2927 | du 11.5046 | dv 16.0334 | eq 11.6128 | eq 9.5581
+➡️ Step 27900 | TCE Loss: 3.999 | [1,2,3] Loss: 1.9821 | 2.5669 | 2.9339 | LR: 0.002436
+➡️ PN 1: au 11.5367 | av 25.4505 | bu 11.5779 | bv 16.2299 | em 16.2116 | er 10.3635
+➡️ PN 2: cu 11.0811 | cv 16.2965 | du 11.5062 | dv 16.035 | eq 11.6139 | eq 9.5572
+➡️ Step 28000 | TCE Loss: 4.4729 | [1,2,3] Loss: 2.2944 | 2.806 | 3.1021 | LR: 0.002432
+➡️ PN 1: au 11.5371 | av 25.4725 | bu 11.5784 | bv 16.2302 | em 16.212 | er 10.3649
+➡️ PN 2: cu 11.0824 | cv 16.3032 | du 11.507 | dv 16.0357 | eq 11.616 | eq 9.5569
+💾 Checkpoint reached! Saving Step 28000...
+```
