@@ -1,0 +1,698 @@
+# P 2 recur flow 3x3 atten - fork
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+# ⚡ 1. Disable the buggy AMD Fusion pass
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+# ⚡ 2. Disable XLA Autotuning completely
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,  # ← force total claimed under 8GB
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+System.put_env("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.33")
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("✅ AMD RX 7600 online!")
+else
+  IO.puts("❌ GPU missing — check HSA_OVERRIDE_GFX_VERSION")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+```elixir
+defmodule BabyLM.CurriculumStreamer do
+  def build_infinite_stream(directory_path, batch_size) do
+    target_shards = Path.wildcard(Path.join(directory_path, "*.bin"))
+
+    if length(target_shards) == 0 do
+      raise "CRITICAL: No .bin shards found in directory: #{directory_path}"
+    end
+
+    Stream.iterate(1, &(&1 + 1))
+    |> Stream.flat_map(fn epoch ->
+      IO.puts("\n🔄 Epoch #{epoch} Started | Shuffling #{length(target_shards)} shards...")
+      
+      # ⚡ 1. DETERMINISTIC SEED: Guarantees the same shuffle order across restarts
+      :rand.seed(:exsss, {epoch, epoch, epoch})
+      shuffled_shards = Enum.shuffle(target_shards)
+
+      Stream.flat_map(shuffled_shards, fn path ->
+        tensor = File.read!(path) |> :erlang.binary_to_term()
+          
+        total_seqs = Nx.axis_size(tensor, 0)
+        num_batches = div(total_seqs, batch_size)
+
+        # 1. Generate all the slice indices
+        0..(num_batches - 1)
+        # 2. Slice the tensor into actual batch tensors
+        |> Enum.map(fn i ->
+          Nx.slice_along_axis(tensor, i * batch_size, batch_size, axis: 0)
+        end)
+        # 3. Shuffle the list of batches!
+        |> Enum.shuffle()
+      end)
+    end)
+  end
+end
+```
+
+```elixir
+defmodule DLM.StatelessMuon do
+  import Nx.Defn
+
+  defn newton_schulz(g) do
+    frobenius_norm = Nx.LinAlg.norm(g) # defaults to frobenius if type not given
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, 5) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_step(em, grad, lr) do
+    ns_grad = newton_schulz(grad)
+    update = Nx.multiply(lr, ns_grad)
+    Nx.subtract(em, update)
+  end
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## SSM
+
+```elixir
+defmodule DLM.SvdSSM do
+  import Nx.Defn
+
+  defn l2_normalize(tensor) do
+    # Calculate Euclidean norm across the last axis natively
+    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
+    # Divide by norm with a tiny epsilon to prevent divide-by-zero
+    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+
+  defn swish(x) do
+    Nx.multiply(x, Nx.sigmoid(x))
+  end
+
+  defn apply_svd(x, u, v) do
+    gelu(x) |> Nx.dot(u) |> Nx.dot(v) |> rms_norm()
+  end
+
+  defn softplus(x) do
+    Nx.log1p(Nx.exp(x))
+  end
+
+  defn softmax(t) do
+    max_val = Nx.reduce_max(t, axes: [-1], keep_axes: true)
+    safe_t = Nx.subtract(t, max_val)
+    exps = Nx.exp(safe_t)
+    sum_exps = Nx.sum(exps, axes: [-1], keep_axes: true)
+    Nx.divide(exps, Nx.add(sum_exps, 1.0e-8))
+  end
+
+  defn forward_step(x_t, h_prev, trainable, frozen) do
+    {c1, c2, c3, d} = trainable
+    {a_frozen, b_frozen} = frozen
+    
+    # 1. Update the Reservoir (The physics engine ticks forward)
+    # The current state rotates, and the new character kicks the water.
+    h_new = Nx.dot(h_prev, a_frozen) + Nx.take(b_frozen, x_t)
+
+    # 2. Readout (The microphone listens to the water)
+    # Trainable MLP translates the 128D spectrogram into 128 ASCII probabilities
+    logits = Nx.dot(h_new, c1) |> apply_svd(c2, c3) |> Nx.dot(d)
+    
+    {logits, h_new}
+  end
+end
+```
+
+```elixir
+defmodule DLM.SvdOptimizer do
+  import Nx.Defn
+
+  defn update(params, grads, step, lr) do
+     {c1, c2, c3, d} = params   
+     {gc1, gc2, gc3, gd} = grads
+    
+    new_step = Nx.add(step, 1)
+
+    # optimizer update step
+    c1_new = DLM.StatelessMuon.muon_step(c1, gc1, lr)
+    c2_new = DLM.StatelessMuon.muon_step(c2, gc2, lr)
+    c3_new = DLM.StatelessMuon.muon_step(c3, gc3, lr)
+    d_new = DLM.StatelessMuon.muon_step(d, gd, lr)
+    
+    new_params = {c1_new, c2_new, c3_new, d_new}
+
+    {new_params, new_step}
+  end
+end
+```
+
+```elixir
+defmodule DLM.PhysicsGenesis do
+  import Nx.Defn
+
+  @vocab 128
+  @dim 256 # Must be an even number! (128 / 2 = 64 frequency oscillators)
+
+  @a_frozen_list (
+    pairs = div(@dim, 2)
+
+    for row <- 0..(@dim - 1), col <- 0..(@dim - 1) do
+      pair_row = div(row, 2)
+      pair_col = div(col, 2)
+
+      if pair_row == pair_col do
+        w = 0.01 + pair_row * (:math.pi() - 0.01) / max(1, pairs - 1)
+
+        cond do
+          rem(row, 2) == 0 and rem(col, 2) == 0 -> :math.cos(w)
+          rem(row, 2) == 0 and rem(col, 2) == 1 -> -:math.sin(w)
+          rem(row, 2) == 1 and rem(col, 2) == 0 -> :math.sin(w)
+          rem(row, 2) == 1 and rem(col, 2) == 1 -> :math.cos(w)
+        end
+      else
+        0.0
+      end
+    end
+  )
+
+  defn ignite(k1) do
+    a_frozen = Nx.tensor(@a_frozen_list, type: :f32) |> Nx.reshape({@dim, @dim})
+
+    {b_frozen, k2} = Nx.Random.normal(k1, 0.0, 1.0, shape: {@vocab, @dim})
+    
+    std_dim = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@dim, type: :f32)))
+
+    {c1, k3} = Nx.Random.normal(k2, 0.0, std_dim, shape: {@dim, @dim})
+    {c2, k4} = Nx.Random.normal(k3, 0.0, std_dim, shape: {@dim, @dim})
+    {c3, k5} = Nx.Random.normal(k4, 0.0, std_dim, shape: {@dim, @dim})
+    {d, k6} = Nx.Random.normal(k5, 0.0, std_dim, shape: {@dim, @vocab})
+
+    trainable_params = {c1, c2, c3, d}
+    frozen_params = {a_frozen, b_frozen}
+
+    {trainable_params, frozen_params, k6}
+  end
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## BLiMP
+
+```elixir
+defmodule DLM.Phase2_Eval do
+  import Nx.Defn
+
+  # ⚡ 1. Standard un-meaned CE
+  defn step_cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1]))
+  end
+
+  # ⚡ 2. Signature updated for single-char targets and split params
+  defn compute_sentence_loss(input_tokens, target_tokens, h_init, trainable, frozen) do
+    seq_len = Nx.axis_size(input_tokens, 1)
+    batch_size = Nx.axis_size(input_tokens, 0)
+      
+    # Explicitly initialize the batch-sized accumulators
+    zero_batch = Nx.broadcast(0.0, {batch_size})
+
+    result =
+      while {i = 0, 
+             total_loss = zero_batch, 
+             valid_tokens = zero_batch,
+             h = h_init,
+             inf = input_tokens,
+             tgf = target_tokens,
+             tr = trainable,
+             fr = frozen},
+            Nx.less(i, seq_len) do
+  
+        # 1. Grab the single character context and target
+        x_t = inf[[.., i]]
+        t_t = tgf[[.., i]]
+        
+        # 2. Forward pass through the reservoir
+        {logits, h_new} = DLM.SvdSSM.forward_step(x_t, h, tr, fr)
+        
+        # 3. Calculate 1-step prediction loss
+        step_loss = step_cross_entropy(logits, t_t)
+  
+        # 4. MASK: 1.0 if valid text, 0.0 if ASCII 1 (SOH / Padding)
+        mask = Nx.not_equal(t_t, 1) |> Nx.as_type(:f32)
+        masked_loss = Nx.multiply(step_loss, mask)
+
+        {i + 1, 
+         Nx.add(total_loss, masked_loss), 
+         Nx.add(valid_tokens, mask),
+         h_new, inf, tgf, tr, fr}
+      end
+  
+    {_, acc_loss, val_tokens, _, _, _, _, _} = result
+
+    # Divide ONLY by the actual number of valid tokens 
+    total_loss = Nx.divide(acc_loss, Nx.add(val_tokens, 1.0e-8))
+
+    total_loss
+  end
+end
+```
+
+```elixir
+gpu = {EXLA.Backend, client: :rocm}
+
+IO.puts("⚙️ Loading Phase 2.11 SvdSSM...")
+checkpoint_path = "v40_DLM_Fourier_Reservoir_4_checkpoint_step_1000.bin"
+ %{trainable: t_p, frozen: f_p} = File.read!(checkpoint_path) |> :erlang.binary_to_term()
+
+trainable_gpu = DLM.Tree.map(t_p, &Nx.backend_copy(&1, gpu))
+frozen_gpu = DLM.Tree.map(f_p, &Nx.backend_copy(&1, gpu))
+# ==============================================================================
+# PRE-WARM: Compile the Batched JIT kernel
+# ==============================================================================
+IO.puts("🔥 Pre-warming Batched JIT compiler (Shape: {200, 511})...")
+
+# ⚡ We pad to 512, which means the seq_len for input/target is exactly 511
+warmup_input  = Nx.broadcast(1, {200, 511}) |> Nx.as_type(:s32) |> Nx.backend_copy(gpu)
+warmup_target = Nx.broadcast(1, {200, 511}) |> Nx.as_type(:s32) |> Nx.backend_copy(gpu)
+h_init_warm   = Nx.broadcast(0.0, {200, 256}) |> Nx.backend_copy(gpu)
+
+# Assuming trainable_gpu and frozen_gpu are in memory from your checkpoint load!
+DLM.Phase2_Eval.compute_sentence_loss(warmup_input, warmup_target, h_init_warm, trainable_gpu, frozen_gpu)
+IO.puts("✅ Batched JIT warm, starting eval...\n")
+
+# ==============================================================================
+# 2. EVAL FUNCTION (Batched)
+# ==============================================================================
+run_blimp = fn path ->
+  pairs =
+    File.read!(path)
+    |> String.split("\n", trim: true)
+    |> Enum.map(&Jason.decode!/1)
+
+  total_pairs = length(pairs)
+  pairs_per_batch = 100 
+
+  {passes, total_loss_diff} =
+    pairs
+    |> Enum.chunk_every(pairs_per_batch)
+    |> Enum.reduce({0, 0.0}, fn chunk, {acc_passes, acc_diff} ->
+      
+      flat_data =
+        Enum.flat_map(chunk, fn pair ->
+          good_chars = pair["sentence_good"] |> to_charlist()
+          bad_chars  = pair["sentence_bad"]  |> to_charlist()
+
+          good_len = length(good_chars)
+          bad_len  = length(bad_chars)
+
+          good_t = Nx.tensor(good_chars, type: :s32)
+          bad_t  = Nx.tensor(bad_chars,  type: :s32)
+
+          good_pad = 512 - good_len
+          bad_pad  = 512 - bad_len
+
+          # Pad the full sentence to 512
+          good_full = Nx.slice_along_axis(good_t, 0, good_len) |> Nx.pad(1, [{0, good_pad, 0}])
+          bad_full = Nx.slice_along_axis(bad_t, 0, bad_len) |> Nx.pad(1, [{0, bad_pad, 0}])
+
+          [good_full, bad_full]
+        end)
+
+      actual_sentences = length(flat_data)
+      batch_full = flat_data |> Nx.stack() |> Nx.backend_copy(gpu)
+      
+      # ⚡ Split into input and target sequences (Length: 511)
+      seq_len = Nx.axis_size(batch_full, 1) - 1
+      batch_input  = Nx.slice_along_axis(batch_full, 0, seq_len, axis: 1)
+      batch_target = Nx.slice_along_axis(batch_full, 1, seq_len, axis: 1)
+
+      h_init = Nx.broadcast(0.0, {actual_sentences, 256}) |> Nx.backend_copy(gpu)
+      
+      # ⚡ Dispatch!
+      losses = DLM.Phase2_Eval.compute_sentence_loss(
+        batch_input, batch_target, h_init, trainable_gpu, frozen_gpu
+      )
+
+      losses_list = Nx.to_flat_list(losses)
+
+      {chunk_passes, chunk_diff} =
+        losses_list
+        |> Enum.chunk_every(2)
+        |> Enum.reduce({0, 0.0}, fn [g_loss, b_loss], {p_acc, d_acc} ->
+          new_p = if g_loss < b_loss, do: p_acc + 1, else: p_acc
+          {new_p, d_acc + (b_loss - g_loss)}
+        end)
+
+      :erlang.garbage_collect(self())
+
+      {acc_passes + chunk_passes, acc_diff + chunk_diff}
+    end)
+
+  accuracy   = (passes / total_pairs) * 100.0
+  avg_margin = total_loss_diff / total_pairs
+  name       = Path.basename(path, ".jsonl")
+
+  {name, accuracy, avg_margin, passes, total_pairs}
+end
+
+# ==============================================================================
+# 3. BATCH RUN
+# ==============================================================================
+dataset_files = Path.wildcard("./data/bblm_blimp_26_quick/*.jsonl") |> Enum.sort()
+total_files   = length(dataset_files)
+
+IO.puts("🚀 Running BLiMP batched eval across #{total_files} datasets...\n")
+
+results =
+  dataset_files
+  |> Enum.with_index(1)
+  |> Enum.map(fn {path, idx} ->
+    IO.puts("  [#{idx}/#{total_files}] #{Path.basename(path)}...")
+    result = run_blimp.(path)
+    :erlang.garbage_collect(self())
+    result
+  end)
+
+# ==============================================================================
+# 4. SORTED SUMMARY
+# ==============================================================================
+sorted = Enum.sort_by(results, fn {_, acc, _, _, _} -> acc end, :desc)
+
+IO.puts("\n")
+IO.puts(String.duplicate("=", 70))
+IO.puts("🏆 BLIMP BATCH RESULTS — sorted by accuracy")
+IO.puts(String.duplicate("=", 70))
+IO.puts(String.pad_trailing("Dataset", 48) <> "Accuracy   Margin")
+IO.puts(String.duplicate("-", 70))
+
+Enum.each(sorted, fn {name, acc, margin, passes, total} ->
+  flag = cond do
+    acc >= 60.0 -> "✅"
+    acc <= 40.0 -> "❌"
+    true        -> "〰️"
+  end
+  IO.puts("#{flag} #{String.pad_trailing(name, 46)} #{String.pad_leading("#{Float.round(acc, 1)}%", 7)} (#{passes}/#{total})   #{Float.round(margin, 4)}")
+end)
+
+IO.puts(String.duplicate("-", 70))
+
+# Overall average
+avg_acc = results |> Enum.map(fn {_, acc, _, _, _} -> acc end) |> Enum.sum() |> Kernel./(total_files)
+IO.puts("📊 Overall average accuracy: #{Float.round(avg_acc, 2)}%")
+IO.puts(String.duplicate("=", 70))
+```
+
+## Train
+
+```elixir
+defmodule DLM.Phase2Trainer do
+  import Nx.Defn
+
+  # Local un-meaned CE to prevent pre-diluting the loss
+  defn step_cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Returns a {batch_size} 1D tensor of individual sequence losses
+    Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1]))
+  end
+
+  defn compute_sequence_loss(input_tokens, target_tokens, trainable, frozen) do
+    batch_size = Nx.axis_size(input_tokens, 0)
+    seq_len = Nx.axis_size(input_tokens, 1)
+    
+    # We start with a completely still pool of water (0.0) for each new document
+    h_start = Nx.broadcast(0.0, {batch_size, 256})
+    zero_scalar = Nx.tensor(0.0, type: :f32)
+
+    result =
+      while {i = 0, 
+             total_loss = zero_scalar, 
+             valid_tokens = zero_scalar, 
+             h = h_start, 
+             inf = input_tokens, 
+             tgf = target_tokens, 
+             tr = trainable, 
+             fr = frozen},
+            Nx.less(i, seq_len) do
+        
+        # 1. Grab the current character and the target next character
+        x_t = inf[[.., i]]
+        t_t = tgf[[.., i]]
+        
+        # 2. The physics engine ticks forward 1 step
+        {logits, h_new} = DLM.SvdSSM.forward_step(x_t, h, tr, fr)
+        
+        # 3. Calculate Loss
+        l_step = step_cross_entropy(logits, t_t)
+        
+        # Assuming 1 is your padding token ID
+        mask = Nx.not_equal(t_t, 1) |> Nx.as_type(:f32) 
+        
+        step_loss = Nx.sum(Nx.multiply(l_step, mask))
+        step_valid = Nx.sum(mask)
+        
+        {i + 1, 
+         Nx.add(total_loss, step_loss), 
+         Nx.add(valid_tokens, step_valid), 
+         h_new, inf, tgf, tr, fr}
+      end
+  
+    {_, acc_loss, val_tokens, _final_h, _, _, _, _} = result
+  
+    # Divide ONLY by the actual number of valid tokens 
+    Nx.divide(acc_loss, Nx.add(val_tokens, 1.0e-8))
+  end
+
+  defn compute_grad(trainable, frozen, batch_tokens) do
+    seq_len = Nx.axis_size(batch_tokens, 1) - 1
+    
+    # Inputs: Characters 0 to 510
+    # Targets: Characters 1 to 511
+    input_tokens  = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+    target_tokens = Nx.slice_along_axis(batch_tokens, 1, seq_len, axis: 1)
+
+    # ⚡ CRITICAL: value_and_grad ONLY tracks 'trainable' parameters!
+    {loss, raw_grads} = 
+      value_and_grad(trainable, fn tr -> 
+        compute_sequence_loss(input_tokens, target_tokens, tr, frozen) 
+      end)
+      
+    {loss, raw_grads}
+  end
+end
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Scans the directory for the latest checkpoint of a specific run prefix.
+  If no checkpoints exist, it triggers a completely fresh initialization.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("✨ Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("✨ No checkpoints found for '#{run_prefix}'. Starting FRESH from Genesis.")
+        {:fresh, 0}
+      end
+    else
+      # Extract step numbers using regex and find the maximum
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("🚀 Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+end
+```
+
+```elixir
+run_prefix  = "v40_DLM_Fourier_Reservoir_4"  
+total_steps = 16000
+
+# ⚡ 1. CHECK RESUME STATE
+{load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
+
+if start_step == :completed do
+  IO.puts("✅ This run has already reached #{total_steps} steps. Exiting.") 
+  
+else
+  batch_size = 64
+  data_dir = "./data/bbylm_512_strict" 
+  
+  IO.puts("🧠 Initializing Lazy Curriculum Data Stream from [#{data_dir}]...")
+  
+  data_stream = 
+    BabyLM.CurriculumStreamer.build_infinite_stream(data_dir, batch_size)
+    |> Stream.drop(start_step) 
+
+  # BRANCHING WEIGHT INIT FOR SPLIT PARAMS
+  {starting_trainable, starting_frozen, initial_key} =
+    if load_path == :fresh do
+      IO.puts("✨ Igniting brand new Genesis weights for #{run_prefix}...")
+      DLM.PhysicsGenesis.ignite(Nx.Random.key(System.system_time()))
+    else
+      IO.puts("✨ Loading Weights from #{load_path}...")
+      %{trainable: t_p, frozen: f_p} = File.read!(load_path) |> :erlang.binary_to_term()
+      {t_p, f_p, Nx.Random.key(System.system_time())}
+    end
+  
+  # Move both blocks to the GPU
+  trainable_gpu = DLM.Tree.map(starting_trainable, &Nx.backend_copy(&1, gpu))
+  frozen_gpu = DLM.Tree.map(starting_frozen, &Nx.backend_copy(&1, gpu))
+  step_count = Nx.tensor(start_step) |> Nx.backend_copy(gpu)
+  
+  # ZIP FROM THE START_STEP
+  {final_t, _final_f, _key, _step} =
+    Enum.reduce(Stream.zip(start_step..(total_steps - 1), data_stream), 
+      {trainable_gpu, frozen_gpu, initial_key, step_count}, 
+      fn {step, cpu_batch}, {t_cp, f_cp, cur_key, c_step} ->        
+        
+      gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+     
+      # Learning Rate (Capped at 0.007)
+      base_lr = 1.0e-2
+      min_lr = 1.0e-3
+      warmup_steps = 800
+      
+      current_lr = 
+        if step < warmup_steps do
+          base_lr * (step / warmup_steps)
+        else
+          progress = min(max((step - warmup_steps) / (total_steps - warmup_steps), 0.0), 1.0) 
+            
+          min_lr + 0.5 * (base_lr - min_lr) * (1.0 + :math.cos(:math.pi() * progress))
+        end
+      
+      lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+
+      split_keys = Nx.Random.split(cur_key)
+      next_key = split_keys[1]
+      
+      # ⚡ Forward Pass (Pass Trainable and Frozen separately!)
+      {loss_tensor, grads} = DLM.Phase2Trainer.compute_grad(t_cp, f_cp, gpu_batch)
+      loss_val = Nx.to_number(loss_tensor)
+
+      # ⚡ Optimizer Update (Only touches Trainable!)
+      {up_t, up_step} = DLM.SvdOptimizer.update(t_cp, grads, c_step, lr_tensor)
+  
+      # Telemetry
+      if rem(step, 100) == 0 do
+        IO.puts("➡️ Step #{step} | LR: #{Float.round(current_lr, 6)} | Loss: #{Float.round(loss_val, 4)}")
+        :erlang.garbage_collect()
+      end
+  
+      # Checkpoint Saving (Save both structures!)
+      if rem(step, 1000) == 0 and step > 0 do
+        IO.puts("💾 Checkpoint reached! Saving Step #{step}...")
+        cpu_t = DLM.Tree.map(up_t, &Nx.backend_copy(&1, Nx.BinaryBackend))
+        cpu_f = DLM.Tree.map(f_cp, &Nx.backend_copy(&1, Nx.BinaryBackend))
+        filename = "#{run_prefix}_checkpoint_step_#{step}.bin"
+        File.write!(filename, :erlang.term_to_binary(%{trainable: cpu_t, frozen: cpu_f}))
+        :erlang.garbage_collect()
+      end
+  
+      {up_t, f_cp, next_key, up_step}
+    end)
+
+  IO.puts("💾 Saving Final Fourier Reservoir Weights...")
+  good_t = DLM.Tree.map(final_t, &Nx.backend_transfer(&1, Nx.BinaryBackend))
+  # You could save frozen here too if desired, but since they are deterministic it's optional.
+  File.write!("#{run_prefix}_final.bin", :erlang.term_to_binary(%{trainable: good_t}))
+  IO.puts("✅ Training Complete!")
+end
+```
