@@ -1,6 +1,6 @@
 <!-- livebook:{"persist_outputs":true} -->
 
-# fourier norm - rad - concat
+# fourier norm - rad - concat - fork - fork
 
 ```elixir
 System.put_env("XLA_BUILD", "true")
@@ -158,11 +158,11 @@ end
 defmodule DLM.SvdSSM do
   import Nx.Defn
 
-  defn l2_normalize(tensor) do
-    # Calculate Euclidean norm across the last axis natively
-    norm = Nx.sqrt(Nx.sum(Nx.pow(tensor, 2), axes: [-1], keep_axes: true))
-    # Divide by norm with a tiny epsilon to prevent divide-by-zero
-    Nx.divide(tensor, Nx.add(norm, 1.0e-6))
+  defn rms_norm(x, gamma, beta, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    norm = x * Nx.rsqrt(variance + epsilon)
+    scaled = gamma * norm
+    scaled + beta
   end
 
   defn rms_norm(x, epsilon \\ 1.0e-6) do
@@ -177,24 +177,12 @@ defmodule DLM.SvdSSM do
     )
     Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
   end
-
-  defn swish(x) do
-    Nx.multiply(x, Nx.sigmoid(x))
-  end
-
-  defn apply_svd(x, u, v) do
-    Nx.dot(x, u) |> gelu() |> Nx.dot(v)
-  end
-
+  
   defn feed_forward_layer(x, um, bi, dm) do
     up = Nx.dot(x, um) 
     act = gelu(up)
     biased = Nx.add(act, bi)
     Nx.dot(biased, dm) 
-  end
-
-  defn softplus(x) do
-    Nx.log1p(Nx.exp(x))
   end
 
   defn softmax(t) do
@@ -203,13 +191,6 @@ defmodule DLM.SvdSSM do
     exps = Nx.exp(safe_t)
     sum_exps = Nx.sum(exps, axes: [-1], keep_axes: true)
     Nx.divide(exps, Nx.add(sum_exps, 1.0e-8))
-  end
-
-  # For dimension-changing terms (B and C): gate the input, then project
-  defn ffn_proj_gated(x, um, dm, bi, qr) do
-    gate = Nx.multiply(x, qr) |> Nx.sigmoid()  # gate in input space, same shape as x
-    gated_x = Nx.multiply(gate, x)             # [batch, vocab] or [batch, dim]
-    feed_forward_layer(gated_x, um, bi, dm)    # projects to the new dim
   end
   
   # For same-dim terms (A and D): full residual gate, unchanged
@@ -227,29 +208,49 @@ defmodule DLM.SvdSSM do
   end
 
   defn forward_step(x_t, h_prev, hl_prev, trainable, frozen_m) do
-    {a1, a2, ab, aq, b1, b2, bb, bq, c1, c2, c3, cb, d1, d2, db, dq, hp} = trainable
+    {b1, b2, bb, bq, bg, be, c1, c2, cb, hq} = trainable
 
     is_space = Nx.equal(x_t, 32) |> Nx.as_type(:f32) |> Nx.new_axis(-1)
     reset_factor = Nx.subtract(1.0, Nx.multiply(is_space, 1.0))
 
     u_t = Nx.take(frozen_m, x_t)
 
-    a_term = ffn_residual(h_prev, a1, a2, ab, aq)
+    # 128->512->128 - add a matrix layer too - maybe have a matrix process ctx not h_prev
     b_term = ffn_residual(u_t, b1, b2, bb, bq)
 
-    hn_base = Nx.add(a_term, b_term) |> rms_norm()
+    b_norm = rms_norm(b_term, bg, be)
+
+    hn_base = Nx.add(h_prev, b_norm)
+
     hn_gated = Nx.multiply(hn_base, reset_factor)
-    hn_proj = Nx.dot(hn_gated, hp)
 
-    hl_new = Nx.add(hl_prev, Nx.multiply(hn_proj, is_space))
+    # is_space is already [batch, 1] float, just add one more axis
+    is_space_3d = Nx.new_axis(is_space, -1)  # [batch, 1, 1]
+    
+    sl_hlp_nonspace = Nx.slice_along_axis(hl_prev, 0, 63, axis: 1)
+    sl_hlp_space    = Nx.slice_along_axis(hl_prev, 1, 63, axis: 1)
+    
+    # blend: space items get sl_hlp_space, others get sl_hlp_nonspace
+    sl_hlp = Nx.multiply(sl_hlp_space, is_space_3d)
+               |> Nx.add(Nx.multiply(sl_hlp_nonspace, Nx.subtract(1.0, is_space_3d)))
+    
+    hl_new = Nx.concatenate([sl_hlp, Nx.new_axis(hn_gated, 1)], axis: 1)
+    # query
+    qh = Nx.dot(hn_base, hq) |> Nx.new_axis(1)
+    hlnt = Nx.transpose(hl_new, axes: [0, 2, 1])
+    # score
+    rshl = Nx.dot(qh, [2], [0], hlnt, [1], [0])
+    # scale (sqrt of 128 - 11.3137, 256->16.0)
+    sscr = Nx.divide(rshl, 11.3137)
+    # softmax normalization
+    sfsc = softmax(sscr)
+    ctxhl = Nx.dot(sfsc, [2], [0], hl_new, [1], [0]) |> Nx.squeeze(axes: [1])
 
-    #256+256->512
-    hc_new = Nx.concatenate([hl_new, hn_proj], axis: 1)
+    # concat like prev version, transform ctx with xsa
+    contextual_h = Nx.add(hn_base, ctxhl)
 
-    c_term = feed_forward_layer(hc_new, c1, cb, c2) |> Nx.dot(c3)
-    d_term = ffn_residual(u_t, d1, d2, db, dq)
-
-    logits = Nx.add(c_term, d_term) |> Nx.dot(frozen_m)
+    # change to 256 -> 1024 -> 128, add d matrix layer for skip connection
+    logits = feed_forward_layer(contextual_h, c1, cb, c2)
     
     {logits, hn_gated, hl_new}
   end
@@ -259,7 +260,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.SvdSSM, <<70, 79, 82, 49, 0, 0, 54, ...>>, true}
+{:module, DLM.SvdSSM, <<70, 79, 82, 49, 0, 0, 48, ...>>, true}
 ```
 
 ```elixir
@@ -267,32 +268,29 @@ defmodule DLM.SvdOptimizer do
   import Nx.Defn
 
   defn update(params, grads, step, lr) do
-    {a1, a2, ab, aq, b1, b2, bb, bq, c1, c2, c3, cb, d1, d2, db, dq, hp} = params   
-    {ga1, ga2, gab, gaq, gb1, gb2, gbb, gbq, gc1, gc2, gc3, gcb, gd1, gd2, gdb, gdq, ghp} = grads
+    {b1, b2, bb, bq, bg, be, c1, c2, cb, hq} = params   
+    {gb1, gb2, gbb, gbq, gbg, gbe, gc1, gc2, gcb, ghq} = grads
     
     new_step = Nx.add(step, 1)
 
     # optimizer update step
-    a1_new = DLM.StatelessMuon.muon_step(a1, ga1, lr)
-    a2_new = DLM.StatelessMuon.muon_step(a2, ga2, lr)
     b1_new = DLM.StatelessMuon.muon_step(b1, gb1, lr)
     b2_new = DLM.StatelessMuon.muon_step(b2, gb2, lr)
     c1_new = DLM.StatelessMuon.muon_step(c1, gc1, lr)
     c2_new = DLM.StatelessMuon.muon_step(c2, gc2, lr)
-    c3_new = DLM.StatelessMuon.muon_step(c3, gc3, lr)
-    d1_new = DLM.StatelessMuon.muon_step(d1, gd1, lr)
-    d2_new = DLM.StatelessMuon.muon_step(d2, gd2, lr)
-    ab_new = DLM.StatelessMuon.muon_step(ab, gab, lr)
+    
     bb_new = DLM.StatelessMuon.muon_step(bb, gbb, lr)
     cb_new = DLM.StatelessMuon.muon_step(cb, gcb, lr)
-    db_new = DLM.StatelessMuon.muon_step(db, gdb, lr)
-    aq_new = DLM.StatelessMuon.muon_step(aq, gaq, lr)
+
     bq_new = DLM.StatelessMuon.muon_step(bq, gbq, lr)
-    dq_new = DLM.StatelessMuon.muon_step(dq, gdq, lr)
-    hp_new = DLM.StatelessMuon.muon_step(hp, ghp, lr)
     
-    new_params = {a1_new, a2_new, ab_new, aq_new, b1_new, b2_new, bb_new, bq_new,
-                  c1_new, c2_new, c3_new, cb_new, d1_new, d2_new, db_new, dq_new, hp_new}
+    be_new = DLM.StatelessMuon.muon_step(be, gbe, lr)
+    bg_new = DLM.StatelessMuon.muon_step(bg, gbg, lr)
+    
+    hq_new = DLM.StatelessMuon.muon_step(hq, ghq, lr)
+    
+    new_params = {b1_new, b2_new, bb_new, bq_new, bg_new, be_new,
+                  c1_new, c2_new, cb_new, hq_new}
 
     {new_params, new_step}
   end
@@ -302,7 +300,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.SvdOptimizer, <<70, 79, 82, 49, 0, 0, 19, ...>>, true}
+{:module, DLM.SvdOptimizer, <<70, 79, 82, 49, 0, 0, 16, ...>>, true}
 ```
 
 ```elixir
@@ -310,40 +308,38 @@ defmodule DLM.PhysicsGenesis do
   import Nx.Defn
 
   @vocab 128
-  @rank 512
-  @dim 1024
+  # @rank 256
+  @dim 512
 
   defn init(k1) do
     std_dim = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@dim, type: :f32)))
+    # std_rnk = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@rank, type: :f32)))
     std_voc = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@vocab, type: :f32)))
-    std_rnk = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@rank, type: :f32)))
 
     # projection matrices
-    {a1, k2} = Nx.Random.normal(k1, 0.0, std_voc, shape: {@vocab, @rank})
-    {a2, k3} = Nx.Random.normal(k2, 0.0, std_rnk, shape: {@rank, @vocab})
-    {b1, k4} = Nx.Random.normal(k3, 0.0, std_voc, shape: {@vocab, @rank})
-    {b2, k5} = Nx.Random.normal(k4, 0.0, std_rnk, shape: {@rank, @vocab})
-    {c1, k6} = Nx.Random.normal(k5, 0.0, std_dim, shape: {@dim, @dim})
-    {c2, k7} = Nx.Random.normal(k6, 0.0, std_dim, shape: {@dim, @rank})
-    {d1, k8} = Nx.Random.normal(k7, 0.0, std_voc, shape: {@vocab, @rank})
-    {d2, k9} = Nx.Random.normal(k8, 0.0, std_rnk, shape: {@rank, @vocab})
-    {hp, k10} = Nx.Random.normal(k9, 0.0, std_voc, shape: {@vocab, @rank})
-    {c3, k11} = Nx.Random.normal(k10, 0.0, std_rnk, shape: {@rank, @vocab})
+    {b1, k2} = Nx.Random.normal(k1, 0.0, std_voc, shape: {@vocab, @dim})
+    {b2, k3} = Nx.Random.normal(k2, 0.0, std_dim, shape: {@dim, @vocab})
+    {c1, k4} = Nx.Random.normal(k3, 0.0, std_voc, shape: {@vocab, @dim})
+    {c2, k5} = Nx.Random.normal(k4, 0.0, std_dim, shape: {@dim, @vocab})
 
-    # feed forward layer bias'
-    ab = Nx.broadcast(0.0, {@rank}) |> Nx.as_type(:f32)
-    bb = Nx.broadcast(0.0, {@rank}) |> Nx.as_type(:f32)
+    # projection bias'
+    bb = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
     cb = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
-    db = Nx.broadcast(0.0, {@rank}) |> Nx.as_type(:f32)
 
-    # residual attention query vectors
-    aq = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32)
     bq = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32)
-    dq = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32) 
+    
+    # rms norm beta and gamma
+    be = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32)
+    bg = Nx.broadcast(1.0, {@vocab}) |> Nx.as_type(:f32)
 
-    trainable_params = {a1, a2, ab, aq, b1, b2, bb, bq, c1, c2, c3, cb, d1, d2, db, dq, hp}
+    # projection skip connection query
 
-    {trainable_params, k11}
+    # hl query
+    {hq, k6} = Nx.Random.normal(k5, 0.0, std_voc, shape: {@vocab, @vocab})    
+
+    trainable_params = {b1, b2, bb, bq, bg, be, c1, c2, cb, hq}
+
+    {trainable_params, k6}
   end
 end
 ```
@@ -351,7 +347,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 19, ...>>, true}
+{:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 15, ...>>, true}
 ```
 
 <!-- livebook:{"branch_parent_index":0} -->
@@ -561,7 +557,7 @@ end
 ```elixir
 gpu = {EXLA.Backend, client: :rocm}
 
-checkpoint_path = "v40_DLM_mkov_ffn_128x512x1024dem_checkpoint_step_3000.bin"
+checkpoint_path = "v40_DLM_mkov_ffn_128x256x1024_abcd_checkpoint_step_3000.bin"
 %{trainable: t_p, frozen_m: fm_cpu} = File.read!(checkpoint_path) |> :erlang.binary_to_term()
 
 trainable_gpu = DLM.Tree.map(t_p, &Nx.backend_copy(&1, gpu))
@@ -571,7 +567,7 @@ frozen_m_gpu = DLM.Tree.map(fm_cpu, &Nx.backend_copy(&1, gpu))
 warmup_input  = Nx.broadcast(1, {200, 255}) |> Nx.as_type(:s32) |> Nx.backend_copy(gpu)
 warmup_target = Nx.broadcast(1, {200, 255}) |> Nx.as_type(:s32) |> Nx.backend_copy(gpu)
 h_init_warm   = Nx.broadcast(0.0, {200, 128}) |> Nx.backend_copy(gpu)
-hl_init_warm   = Nx.broadcast(0.0, {200, 512}) |> Nx.backend_copy(gpu)
+hl_init_warm   = Nx.broadcast(0.0, {200, 64, 128}) |> Nx.backend_copy(gpu)
 
 DLM.Phase2_Eval.compute_sentence_loss(warmup_input, warmup_target, h_init_warm, hl_init_warm, trainable_gpu, frozen_m_gpu)
 
@@ -618,7 +614,7 @@ run_blimp = fn path ->
       batch_target = Nx.slice_along_axis(batch_full, 1, seq_len, axis: 1)
 
       h_init = Nx.broadcast(0.0, {actual_sentences, 128}) |> Nx.backend_copy(gpu)
-      hl_init = Nx.broadcast(0.0, {actual_sentences, 512}) |> Nx.backend_copy(gpu)
+      hl_init = Nx.broadcast(0.0, {actual_sentences, 64, 128}) |> Nx.backend_copy(gpu)
       
       losses = DLM.Phase2_Eval.compute_sentence_loss(
         batch_input, batch_target, h_init, hl_init, trainable_gpu, frozen_m_gpu
@@ -690,8 +686,6 @@ IO.puts(String.duplicate("=", 70))
 <!-- livebook:{"output":true} -->
 
 ```
-
-15:36:00.261 [info] Merging Dots in computation: region_0.5
 🚀 Running BLiMP batched eval across 66 datasets...
 
   [1/66] adjunct_island.jsonl...
@@ -767,74 +761,74 @@ IO.puts(String.duplicate("=", 70))
 ======================================================================
 Dataset                                         Accuracy   Margin
 ----------------------------------------------------------------------
-✅ only_npi_licensor_present                       100.0% (200/200)   0.0136
-✅ principle_A_case_1                              100.0% (200/200)   0.1119
-✅ principle_A_domain_1                            100.0% (200/200)   0.0783
-✅ wh_questions_subject_gap                        100.0% (200/200)   0.0054
-✅ wh_questions_subject_gap_long_distance          100.0% (200/200)   0.0029
-✅ wh_vs_that_no_gap                               100.0% (200/200)   0.0047
-✅ wh_vs_that_no_gap_long_distance                 100.0% (200/200)   0.0033
-✅ sentential_negation_npi_licensor_present         99.0% (198/200)   0.0863
-✅ superlative_quantifiers_2                        87.5% (175/200)   0.0166
-✅ left_branch_island_echo_question                 85.0% (170/200)   0.0399
-✅ wh_island                                        81.0% (162/200)   0.002
-✅ irregular_past_participle_verbs                  78.5% (157/200)   0.0662
-✅ existential_there_quantifiers_1                  77.0% (154/200)   0.0105
-✅ only_npi_scope                                   70.0% (140/200)   0.0113
-✅ tough_vs_raising_2                               69.0% (138/200)   0.0275
-✅ anaphor_gender_agreement                         68.0% (136/200)   0.0198
-✅ determiner_noun_agreement_irregular_2            64.0% (128/200)   0.0275
-✅ determiner_noun_agreement_with_adj_irregular_2   61.5% (123/200)   0.0229
-✅ regular_plural_subject_verb_agreement_1          61.5% (123/200)   -0.0022
-✅ determiner_noun_agreement_with_adj_irregular_1   60.5% (121/200)   0.0056
-〰️ principle_A_domain_2                             57.0% (114/200)   0.0059
-〰️ causative                                        56.5% (113/200)   0.0057
-〰️ existential_there_subject_raising                55.5% (111/200)   0.0117
-〰️ adjunct_island                                   55.0% (110/200)   0.0083
-〰️ complex_NP_island                                55.0% (110/200)   0.0049
-〰️ inchoative                                       55.0% (110/200)   0.0066
-〰️ determiner_noun_agreement_1                      54.0% (108/200)   0.0043
-〰️ expletive_it_object_raising                      53.0% (106/200)   0.0016
-〰️ determiner_noun_agreement_irregular_1            52.5% (105/200)   0.002
-〰️ distractor_agreement_relational_noun             52.5% (105/200)   0.0054
-〰️ principle_A_case_2                               52.0% (104/200)   -0.0014
-〰️ determiner_noun_agreement_2                      51.5% (103/200)   0.0068
-〰️ existential_there_object_raising                 51.0% (102/200)   0.0035
-〰️ superlative_quantifiers_1                        51.0% (102/200)   -0.0111
-〰️ anaphor_number_agreement                         50.5% (101/200)   0.0137
-〰️ distractor_agreement_relative_clause             50.5% (101/200)   0.0027
-〰️ transitive                                       50.5% (101/200)   -0.0024
-〰️ determiner_noun_agreement_with_adj_2             49.0% (98/200)   0.0016
-〰️ irregular_plural_subject_verb_agreement_2        49.0% (98/200)   -0.0199
-〰️ passive_1                                        48.5% (97/200)   -0.0036
-〰️ regular_plural_subject_verb_agreement_2          48.0% (96/200)   -0.0074
-〰️ irregular_plural_subject_verb_agreement_1        47.5% (95/200)   0.0002
-〰️ determiner_noun_agreement_with_adjective_1       47.0% (94/200)   0.0007
-〰️ principle_A_domain_3                             45.5% (91/200)   -0.0021
-〰️ intransitive                                     45.0% (90/200)   -0.0163
-〰️ animate_subject_passive                          43.0% (86/200)   -0.0164
-〰️ passive_2                                        42.0% (84/200)   -0.0159
-❌ ellipsis_n_bar_2                                 40.0% (80/200)   -0.0089
-❌ ellipsis_n_bar_1                                 38.5% (77/200)   -0.0079
-❌ left_branch_island_simple_question               36.0% (72/200)   -0.0262
-❌ coordinate_structure_constraint_complex_left_branch   34.0% (68/200)   0.0
-❌ wh_questions_object_gap                          33.0% (66/200)   -0.0138
-❌ sentential_subject_island                        31.5% (63/200)   -0.0123
-❌ sentential_negation_npi_scope                    28.0% (56/200)   0.0
-❌ principle_A_reconstruction                       27.0% (54/200)   -0.0334
-❌ irregular_past_participle_adjectives             26.5% (53/200)   -0.0844
-❌ animate_subject_trans                            25.5% (51/200)   -0.0846
-❌ coordinate_structure_constraint_object_extraction   25.5% (51/200)   -0.0395
-❌ principle_A_c_command                            24.0% (48/200)   -0.0302
-❌ tough_vs_raising_1                               24.0% (48/200)   -0.0537
-❌ matrix_question_npi_licensor_present              1.0% (2/200)   -0.1434
-❌ existential_there_quantifiers_2                   0.0% (0/200)   -0.0593
-❌ npi_present_1                                     0.0% (0/200)   -0.0919
-❌ npi_present_2                                     0.0% (0/200)   -0.0974
-❌ wh_vs_that_with_gap                               0.0% (0/200)   -0.0051
-❌ wh_vs_that_with_gap_long_distance                 0.0% (0/200)   -0.0033
+✅ wh_vs_that_no_gap_long_distance                 100.0% (200/200)   0.051
+✅ principle_A_domain_1                             99.0% (198/200)   0.0421
+✅ superlative_quantifiers_1                        99.0% (198/200)   0.0571
+✅ wh_vs_that_no_gap                                98.5% (197/200)   0.0613
+✅ wh_questions_subject_gap_long_distance           95.0% (190/200)   0.0454
+✅ wh_questions_subject_gap                         94.5% (189/200)   0.0643
+✅ wh_questions_object_gap                          93.0% (186/200)   0.054
+✅ existential_there_quantifiers_2                  80.5% (161/200)   0.0446
+✅ left_branch_island_echo_question                 74.5% (149/200)   0.0707
+✅ wh_island                                        74.5% (149/200)   0.0248
+✅ sentential_negation_npi_licensor_present         66.0% (132/200)   0.0397
+✅ sentential_negation_npi_scope                    66.0% (132/200)   0.0068
+✅ existential_there_quantifiers_1                  64.0% (128/200)   0.0193
+✅ existential_there_subject_raising                64.0% (128/200)   0.0267
+✅ tough_vs_raising_2                               62.5% (125/200)   0.0402
+✅ adjunct_island                                   62.0% (124/200)   0.024
+✅ principle_A_c_command                            62.0% (124/200)   0.012
+✅ animate_subject_passive                          61.5% (123/200)   0.0165
+〰️ expletive_it_object_raising                      58.5% (117/200)   0.0142
+〰️ existential_there_object_raising                 57.5% (115/200)   0.0069
+〰️ determiner_noun_agreement_irregular_2            54.5% (109/200)   0.0062
+〰️ principle_A_case_2                               54.5% (109/200)   0.0018
+〰️ ellipsis_n_bar_1                                 53.5% (107/200)   0.0013
+〰️ irregular_plural_subject_verb_agreement_1        53.5% (107/200)   0.0021
+〰️ determiner_noun_agreement_2                      53.0% (106/200)   0.0046
+〰️ distractor_agreement_relational_noun             52.5% (105/200)   0.0026
+〰️ npi_present_1                                    52.5% (105/200)   0.0047
+〰️ regular_plural_subject_verb_agreement_2          52.5% (105/200)   0.0054
+〰️ determiner_noun_agreement_with_adjective_1       52.0% (104/200)   0.0015
+〰️ superlative_quantifiers_2                        52.0% (104/200)   -0.012
+〰️ npi_present_2                                    51.5% (103/200)   0.0088
+〰️ coordinate_structure_constraint_object_extraction   51.0% (102/200)   0.0072
+〰️ determiner_noun_agreement_1                      51.0% (102/200)   0.0013
+〰️ irregular_past_participle_adjectives             51.0% (102/200)   -0.0079
+〰️ irregular_plural_subject_verb_agreement_2        51.0% (102/200)   0.0034
+〰️ irregular_past_participle_verbs                  50.5% (101/200)   0.0121
+〰️ principle_A_domain_3                             50.5% (101/200)   -0.0015
+〰️ principle_A_reconstruction                       50.0% (100/200)   0.0081
+〰️ causative                                        49.5% (99/200)   0.0118
+〰️ principle_A_case_1                               49.5% (99/200)   0.0165
+〰️ ellipsis_n_bar_2                                 49.0% (98/200)   -0.0051
+〰️ complex_NP_island                                48.5% (97/200)   -0.0059
+〰️ determiner_noun_agreement_irregular_1            48.0% (96/200)   0.0004
+〰️ determiner_noun_agreement_with_adj_2             48.0% (96/200)   -0.0015
+〰️ regular_plural_subject_verb_agreement_1          47.5% (95/200)   -0.0091
+〰️ transitive                                       47.5% (95/200)   -0.0065
+〰️ determiner_noun_agreement_with_adj_irregular_2   46.0% (92/200)   -0.0042
+〰️ distractor_agreement_relative_clause             45.5% (91/200)   -0.0008
+〰️ inchoative                                       45.5% (91/200)   -0.02
+〰️ sentential_subject_island                        45.5% (91/200)   -0.0081
+〰️ anaphor_gender_agreement                         45.0% (90/200)   -0.0093
+〰️ passive_2                                        44.0% (88/200)   -0.0278
+〰️ tough_vs_raising_1                               44.0% (88/200)   -0.0346
+〰️ principle_A_domain_2                             43.0% (86/200)   -0.0078
+〰️ anaphor_number_agreement                         41.0% (82/200)   -0.0176
+〰️ determiner_noun_agreement_with_adj_irregular_1   41.0% (82/200)   -0.0084
+❌ passive_1                                        40.0% (80/200)   -0.0318
+❌ left_branch_island_simple_question               39.0% (78/200)   -0.0375
+❌ animate_subject_trans                            37.0% (74/200)   -0.0269
+❌ intransitive                                     37.0% (74/200)   -0.0703
+❌ coordinate_structure_constraint_complex_left_branch   33.5% (67/200)   -0.0155
+❌ only_npi_scope                                   14.0% (28/200)   -0.0548
+❌ only_npi_licensor_present                        10.0% (20/200)   -0.0601
+❌ matrix_question_npi_licensor_present              3.5% (7/200)   -0.2649
+❌ wh_vs_that_with_gap                               2.5% (5/200)   -0.0694
+❌ wh_vs_that_with_gap_long_distance                 0.0% (0/200)   -0.0581
 ----------------------------------------------------------------------
-📊 Overall average accuracy: 51.89%
+📊 Overall average accuracy: 53.24%
 ======================================================================
 ```
 
@@ -866,7 +860,7 @@ defmodule DLM.Phase2Trainer do
     batch_size = Nx.axis_size(input_tokens, 0)
     
     h_start = Nx.broadcast(0.0, {batch_size, 128})
-    hl_start = Nx.broadcast(0.0, {batch_size, 512})
+    hl_start = Nx.broadcast(0.0, {batch_size, 64, 128}) |> Nx.as_type(:f32)
     
     zero_scalar = Nx.tensor(0.0, type: :f32)
 
@@ -919,7 +913,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.Phase2Trainer, <<70, 79, 82, 49, 0, 0, 30, ...>>, true}
+{:module, DLM.Phase2Trainer, <<70, 79, 82, 49, 0, 0, 31, ...>>, true}
 ```
 
 ```elixir
@@ -965,7 +959,7 @@ end
 ```
 
 ```elixir
-run_prefix  = "v40_DLM_mkov_ffn_128x512x1024dem"
+run_prefix  = "v40_DLM_mkov_ffn_128x256x1024_abcd"
 frozen_path = "./data/f_semantic_reservoir_128D.bin"
 total_steps = 14000
 
@@ -1035,31 +1029,22 @@ else
   
       # Telemetry
       if rem(step, 100) == 0 do
-        {a1, a2, ab, aq, b1, b2, bb, bq, c1, c2, c3, cb, d1, d2, db, dq, hp} = up_tr
-        a1_norm = a1 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        a2_norm = a2 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        {b1, b2, bb, bq, bg, be, c1, c2, cb, hq} = up_tr
+        
         b1_norm = b1 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         b2_norm = b2 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         c1_norm = c1 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         c2_norm = c2 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        c3_norm = c3 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        d1_norm = d1 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        d2_norm = d2 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        ab_norm = ab |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         bb_norm = bb |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        cb_norm = cb |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        db_norm = db |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        aq_norm = aq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         bq_norm = bq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        dq_norm = dq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
-        hp_norm = hp |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        cb_norm = cb |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        bg_norm = bg |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        be_norm = be |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        hq_norm = hq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
 
         IO.puts("➡️ Step #{step} | LR: #{Float.round(current_lr, 6)} | Loss: #{Float.round(loss_val, 4)}")
-        IO.puts("➡️ PN 1: a1 #{a1_norm} | b1 #{b1_norm} |  c1 #{c1_norm} |  d1 #{d1_norm}")
-        IO.puts("➡️ PN 2: a2 #{a2_norm} | b2 #{b2_norm} |  c2 #{c2_norm} |  c3 #{c3_norm} |  d2 #{d2_norm}")
-        IO.puts("➡️ PN 3: ab #{ab_norm} | bb #{bb_norm} |  cb #{cb_norm} |  db #{db_norm}")
-        IO.puts("➡️ PN 4: aq #{aq_norm} | bq #{bq_norm} |  dq #{dq_norm} |  hp #{hp_norm}")
-        
+        IO.puts("➡️ PN 1: b1 #{b1_norm} |  b2 #{b2_norm} |  bb #{bb_norm} |  be #{be_norm} |  bg #{bg_norm}" )
+        IO.puts("➡️ PN 2: c1 #{c1_norm} |  c2 #{c2_norm} |  cb #{cb_norm} |  hq #{hq_norm} |  bq #{bq_norm}" )
         :erlang.garbage_collect()
       end
   
@@ -1088,171 +1073,150 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-No checkpoints found for 'v40_DLM_mkov_ffn_128x512x1024dem'. Starting FRESH from Genesis.
+No checkpoints found for 'v40_DLM_mkov_ffn_128x256x1024_abcd'. Starting FRESH from Genesis.
 Initializing Lazy Curriculum Data Stream from [./data/bbylm_512_strict]...
-Igniting brand new Trainable weights for v40_DLM_mkov_ffn_128x512x1024dem...
+Igniting brand new Trainable weights for v40_DLM_mkov_ffn_128x256x1024_abcd...
 
 🔄 Epoch 1 Started | Shuffling 6 shards...
-➡️ Step 0 | LR: 0.0 | Loss: 48.4528
-➡️ PN 1: a1 22.5346 | b1 22.6194 |  c1 32.0065 |  d1 22.6446
-➡️ PN 2: a2 11.3147 | b2 11.341 |  c2 22.6192 |  c3 11.3025 |  d2 11.3335
-➡️ PN 3: ab 0.0 | bb 0.0 |  cb 0.0 |  db 0.0
-➡️ PN 4: aq 0.0 | bq 0.0 |  dq 0.0 |  hp 22.6573
-➡️ Step 100 | LR: 8.33e-4 | Loss: 23.4201
-➡️ PN 1: a1 22.5348 | b1 22.6195 |  c1 32.0059 |  d1 22.6428
-➡️ PN 2: a2 11.3146 | b2 11.3412 |  c2 22.6185 |  c3 11.3006 |  d2 11.332
-➡️ PN 3: ab 0.0379 | bb 0.0385 |  cb 0.0377 |  db 0.0378
-➡️ PN 4: aq 0.0348 | bq 0.034 |  dq 0.0405 |  hp 22.6551
-➡️ Step 200 | LR: 0.001667 | Loss: 8.5462
-➡️ PN 1: a1 22.5347 | b1 22.6333 |  c1 32.0065 |  d1 22.6426
-➡️ PN 2: a2 11.3145 | b2 11.3452 |  c2 22.6195 |  c3 11.3026 |  d2 11.3319
-➡️ PN 3: ab 0.1362 | bb 0.1396 |  cb 0.1507 |  db 0.1495
-➡️ PN 4: aq 0.126 | bq 0.1245 |  dq 0.1567 |  hp 22.6573
-➡️ Step 300 | LR: 0.0025 | Loss: 4.2631
-➡️ PN 1: a1 22.5383 | b1 22.6538 |  c1 32.0097 |  d1 22.6456
-➡️ PN 2: a2 11.3195 | b2 11.3522 |  c2 22.6243 |  c3 11.3119 |  d2 11.3346
-➡️ PN 3: ab 0.2569 | bb 0.2632 |  cb 0.2832 |  db 0.2703
-➡️ PN 4: aq 0.2305 | bq 0.2512 |  dq 0.3397 |  hp 22.6703
-➡️ Step 400 | LR: 0.003333 | Loss: 3.7213
-➡️ PN 1: a1 22.5436 | b1 22.6715 |  c1 32.0112 |  d1 22.6496
-➡️ PN 2: a2 11.3257 | b2 11.3623 |  c2 22.6249 |  c3 11.313 |  d2 11.3375
-➡️ PN 3: ab 0.3026 | bb 0.3131 |  cb 0.3226 |  db 0.3042
-➡️ PN 4: aq 0.302 | bq 0.2793 |  dq 0.4381 |  hp 22.6765
-➡️ Step 500 | LR: 0.004167 | Loss: 3.7343
-➡️ PN 1: a1 22.551 | b1 22.6919 |  c1 32.0123 |  d1 22.656
-➡️ PN 2: a2 11.3333 | b2 11.3771 |  c2 22.6252 |  c3 11.3134 |  d2 11.3418
-➡️ PN 3: ab 0.3379 | bb 0.347 |  cb 0.3355 |  db 0.3158
-➡️ PN 4: aq 0.3639 | bq 0.3118 |  dq 0.4548 |  hp 22.6812
-➡️ Step 600 | LR: 0.005 | Loss: 3.6636
-➡️ PN 1: a1 22.5617 | b1 22.7178 |  c1 32.0134 |  d1 22.6624
-➡️ PN 2: a2 11.3437 | b2 11.3996 |  c2 22.6254 |  c3 11.3138 |  d2 11.3458
-➡️ PN 3: ab 0.3737 | bb 0.375 |  cb 0.3454 |  db 0.3256
-➡️ PN 4: aq 0.4232 | bq 0.3504 |  dq 0.4632 |  hp 22.6856
-➡️ Step 700 | LR: 0.004999 | Loss: 3.6002
-➡️ PN 1: a1 22.5755 | b1 22.7531 |  c1 32.0142 |  d1 22.6679
-➡️ PN 2: a2 11.3574 | b2 11.4338 |  c2 22.6255 |  c3 11.3139 |  d2 11.3495
-➡️ PN 3: ab 0.41 | bb 0.3968 |  cb 0.3538 |  db 0.3345
-➡️ PN 4: aq 0.4789 | bq 0.4595 |  dq 0.4738 |  hp 22.6891
-➡️ Step 800 | LR: 0.004998 | Loss: 3.5158
-➡️ PN 1: a1 22.5942 | b1 22.808 |  c1 32.0147 |  d1 22.6732
-➡️ PN 2: a2 11.3775 | b2 11.4889 |  c2 22.6254 |  c3 11.3134 |  d2 11.3528
-➡️ PN 3: ab 0.4522 | bb 0.4159 |  cb 0.3611 |  db 0.3424
-➡️ PN 4: aq 0.5399 | bq 0.5904 |  dq 0.4825 |  hp 22.6909
-➡️ Step 900 | LR: 0.004994 | Loss: 3.4507
-➡️ PN 1: a1 22.6183 | b1 22.8681 |  c1 32.0154 |  d1 22.6782
-➡️ PN 2: a2 11.4017 | b2 11.5454 |  c2 22.6253 |  c3 11.3131 |  d2 11.3561
-➡️ PN 3: ab 0.4832 | bb 0.4252 |  cb 0.3709 |  db 0.3516
-➡️ PN 4: aq 0.6055 | bq 0.7082 |  dq 0.488 |  hp 22.6935
-➡️ Step 1000 | LR: 0.00499 | Loss: 3.5022
-➡️ PN 1: a1 22.6489 | b1 22.927 |  c1 32.0161 |  d1 22.6832
-➡️ PN 2: a2 11.4317 | b2 11.5973 |  c2 22.6252 |  c3 11.3127 |  d2 11.3594
-➡️ PN 3: ab 0.509 | bb 0.4315 |  cb 0.3812 |  db 0.3608
-➡️ PN 4: aq 0.6833 | bq 0.8042 |  dq 0.4917 |  hp 22.6965
+
+22:38:10.393 [info] Merging Dots in computation: region_2.3
+
+22:38:10.393 [info] Merging Dots in computation: region_6.7
+
+22:38:10.393 [info] Merging Dots in computation: region_26.27
+
+22:38:10.393 [info] Merging Dots in computation: region_30.31
+
+22:38:10.393 [info] Merging Dots in computation: region_38.39
+➡️ Step 0 | LR: 0.0 | Loss: 7.6108
+➡️ PN 1: b1 22.5938 |  b2 11.3471 |  bb 0.0 |  be 0.0 |  bg 11.3137
+➡️ PN 2: c1 22.5293 |  c2 11.3553 |  cb 0.0 |  hq 11.2427 |  bq 0.0
+➡️ Step 100 | LR: 8.33e-4 | Loss: 5.6181
+➡️ PN 1: b1 22.5934 |  b2 11.3474 |  bb 0.0414 |  be 0.0415 |  bg 11.3091
+➡️ PN 2: c1 22.5269 |  c2 11.3529 |  cb 0.0415 |  hq 11.2411 |  bq 0.0415
+➡️ Step 200 | LR: 0.001667 | Loss: 3.9749
+➡️ PN 1: b1 22.6008 |  b2 11.3526 |  bb 0.1421 |  be 0.1422 |  bg 11.3082
+➡️ PN 2: c1 22.5152 |  c2 11.3418 |  cb 0.1577 |  hq 11.2335 |  bq 0.1539
+➡️ Step 300 | LR: 0.0025 | Loss: 3.1069
+➡️ PN 1: b1 22.6399 |  b2 11.3839 |  bb 0.2831 |  be 0.2832 |  bg 11.3429
+➡️ PN 2: c1 22.5007 |  c2 11.3281 |  cb 0.3275 |  hq 11.2219 |  bq 0.3052
+➡️ Step 400 | LR: 0.003333 | Loss: 2.7643
+➡️ PN 1: b1 22.7399 |  b2 11.4745 |  bb 0.4536 |  be 0.4449 |  bg 11.3935
+➡️ PN 2: c1 22.4954 |  c2 11.322 |  cb 0.5032 |  hq 11.2155 |  bq 0.5348
+➡️ Step 500 | LR: 0.004167 | Loss: 3.025
+➡️ PN 1: b1 22.9189 |  b2 11.634 |  bb 0.6265 |  be 0.6103 |  bg 11.48
+➡️ PN 2: c1 22.4894 |  c2 11.3152 |  cb 0.6877 |  hq 11.2124 |  bq 0.8563
+➡️ Step 600 | LR: 0.005 | Loss: 3.0128
+➡️ PN 1: b1 23.1529 |  b2 11.822 |  bb 0.7735 |  be 0.7649 |  bg 11.6507
+➡️ PN 2: c1 22.4799 |  c2 11.3052 |  cb 0.8915 |  hq 11.2099 |  bq 1.2261
+➡️ Step 700 | LR: 0.004999 | Loss: 3.1705
+➡️ PN 1: b1 23.3715 |  b2 11.9723 |  bb 0.8793 |  be 0.8882 |  bg 11.8361
+➡️ PN 2: c1 22.4677 |  c2 11.293 |  cb 1.1223 |  hq 11.2058 |  bq 1.4652
+➡️ Step 800 | LR: 0.004998 | Loss: 3.0171
+➡️ PN 1: b1 23.5462 |  b2 12.0823 |  bb 0.921 |  be 0.9629 |  bg 12.039
+➡️ PN 2: c1 22.4557 |  c2 11.2816 |  cb 1.3434 |  hq 11.199 |  bq 1.4323
+➡️ Step 900 | LR: 0.004994 | Loss: 2.9628
+➡️ PN 1: b1 23.6954 |  b2 12.1761 |  bb 0.9369 |  be 1.0154 |  bg 12.2655
+➡️ PN 2: c1 22.4441 |  c2 11.2718 |  cb 1.5651 |  hq 11.1948 |  bq 1.307
+➡️ Step 1000 | LR: 0.00499 | Loss: 3.0709
+➡️ PN 1: b1 23.8243 |  b2 12.2588 |  bb 0.9377 |  be 1.0478 |  bg 12.5111
+➡️ PN 2: c1 22.4333 |  c2 11.2633 |  cb 1.7806 |  hq 11.1913 |  bq 1.178
 Checkpoint reached! Saving Step 1000...
-➡️ Step 1100 | LR: 0.004985 | Loss: 3.3298
-➡️ PN 1: a1 22.6851 | b1 22.9758 |  c1 32.0169 |  d1 22.6877
-➡️ PN 2: a2 11.4689 | b2 11.6396 |  c2 22.6251 |  c3 11.3125 |  d2 11.3625
-➡️ PN 3: ab 0.5264 | bb 0.4371 |  cb 0.3912 |  db 0.3694
-➡️ PN 4: aq 0.7535 | bq 0.8782 |  dq 0.4907 |  hp 22.6994
-➡️ Step 1200 | LR: 0.004978 | Loss: 3.396
-➡️ PN 1: a1 22.7316 | b1 23.0176 |  c1 32.0176 |  d1 22.6924
-➡️ PN 2: a2 11.5153 | b2 11.6745 |  c2 22.6251 |  c3 11.3123 |  d2 11.3659
-➡️ PN 3: ab 0.5381 | bb 0.4426 |  cb 0.3999 |  db 0.377
-➡️ PN 4: aq 0.8006 | bq 0.909 |  dq 0.4897 |  hp 22.7019
-➡️ Step 1300 | LR: 0.00497 | Loss: 3.3061
-➡️ PN 1: a1 22.7863 | b1 23.0568 |  c1 32.0182 |  d1 22.6978
-➡️ PN 2: a2 11.5695 | b2 11.7067 |  c2 22.625 |  c3 11.3121 |  d2 11.3696
-➡️ PN 3: ab 0.5475 | bb 0.4464 |  cb 0.4105 |  db 0.3857
-➡️ PN 4: aq 0.8422 | bq 0.9208 |  dq 0.4915 |  hp 22.704
-➡️ Step 1400 | LR: 0.004961 | Loss: 3.4868
-➡️ PN 1: a1 22.8433 | b1 23.0941 |  c1 32.0183 |  d1 22.7024
-➡️ PN 2: a2 11.6278 | b2 11.7368 |  c2 22.6246 |  c3 11.3111 |  d2 11.3723
-➡️ PN 3: ab 0.5582 | bb 0.4482 |  cb 0.4208 |  db 0.3938
-➡️ PN 4: aq 0.8879 | bq 0.9282 |  dq 0.4947 |  hp 22.7037
+➡️ Step 1100 | LR: 0.004985 | Loss: 2.7965
+➡️ PN 1: b1 23.936 |  b2 12.3309 |  bb 0.949 |  be 1.1027 |  bg 12.7767
+➡️ PN 2: c1 22.4216 |  c2 11.2547 |  cb 1.9971 |  hq 11.1869 |  bq 1.0886
+➡️ Step 1200 | LR: 0.004978 | Loss: 2.8831
+➡️ PN 1: b1 24.0337 |  b2 12.395 |  bb 0.9496 |  be 1.1547 |  bg 13.0598
+➡️ PN 2: c1 22.412 |  c2 11.2479 |  cb 2.1856 |  hq 11.1871 |  bq 1.0585
+➡️ Step 1300 | LR: 0.00497 | Loss: 2.7308
+➡️ PN 1: b1 24.1188 |  b2 12.447 |  bb 0.9432 |  be 1.2047 |  bg 13.3318
+➡️ PN 2: c1 22.4028 |  c2 11.2419 |  cb 2.3641 |  hq 11.1951 |  bq 1.0535
+➡️ Step 1400 | LR: 0.004961 | Loss: 2.8977
+➡️ PN 1: b1 24.1921 |  b2 12.4876 |  bb 0.9354 |  be 1.2594 |  bg 13.5969
+➡️ PN 2: c1 22.3924 |  c2 11.2355 |  cb 2.5366 |  hq 11.2054 |  bq 1.0414
 
 🔄 Epoch 2 Started | Shuffling 6 shards...
-➡️ Step 1500 | LR: 0.00495 | Loss: 3.6419
-➡️ PN 1: a1 22.9066 | b1 23.1331 |  c1 32.0185 |  d1 22.7039
-➡️ PN 2: a2 11.6927 | b2 11.7681 |  c2 22.624 |  c3 11.3096 |  d2 11.3719
-➡️ PN 3: ab 0.5786 | bb 0.4581 |  cb 0.4284 |  db 0.4005
-➡️ PN 4: aq 0.9368 | bq 0.9381 |  dq 0.4918 |  hp 22.7041
-➡️ Step 1600 | LR: 0.004938 | Loss: 3.5457
-➡️ PN 1: a1 22.9742 | b1 23.1763 |  c1 32.0188 |  d1 22.705
-➡️ PN 2: a2 11.7603 | b2 11.8024 |  c2 22.6234 |  c3 11.3083 |  d2 11.3714
-➡️ PN 3: ab 0.5965 | bb 0.4626 |  cb 0.4346 |  db 0.4061
-➡️ PN 4: aq 0.9893 | bq 0.947 |  dq 0.4945 |  hp 22.7048
-➡️ Step 1700 | LR: 0.004926 | Loss: 3.5165
-➡️ PN 1: a1 23.0523 | b1 23.2185 |  c1 32.0192 |  d1 22.7071
-➡️ PN 2: a2 11.8342 | b2 11.8358 |  c2 22.6228 |  c3 11.3071 |  d2 11.3716
-➡️ PN 3: ab 0.6059 | bb 0.4622 |  cb 0.4414 |  db 0.4118
-➡️ PN 4: aq 1.0422 | bq 0.9606 |  dq 0.4972 |  hp 22.7056
-➡️ Step 1800 | LR: 0.004912 | Loss: 3.2722
-➡️ PN 1: a1 23.1383 | b1 23.2462 |  c1 32.0196 |  d1 22.7102
-➡️ PN 2: a2 11.9137 | b2 11.8584 |  c2 22.6226 |  c3 11.3065 |  d2 11.3736
-➡️ PN 3: ab 0.6064 | bb 0.4565 |  cb 0.4524 |  db 0.4198
-➡️ PN 4: aq 1.0891 | bq 1.0039 |  dq 0.4993 |  hp 22.7065
-➡️ Step 1900 | LR: 0.004896 | Loss: 3.3402
-➡️ PN 1: a1 23.2343 | b1 23.2749 |  c1 32.0205 |  d1 22.7154
-➡️ PN 2: a2 12.002 | b2 11.88 |  c2 22.6224 |  c3 11.3061 |  d2 11.3771
-➡️ PN 3: ab 0.6053 | bb 0.4562 |  cb 0.4638 |  db 0.4287
-➡️ PN 4: aq 1.1312 | bq 1.0328 |  dq 0.5004 |  hp 22.7098
-➡️ Step 2000 | LR: 0.00488 | Loss: 3.2225
-➡️ PN 1: a1 23.3325 | b1 23.3058 |  c1 32.0216 |  d1 22.7203
-➡️ PN 2: a2 12.0929 | b2 11.9016 |  c2 22.6223 |  c3 11.3058 |  d2 11.3802
-➡️ PN 3: ab 0.605 | bb 0.4568 |  cb 0.4743 |  db 0.4368
-➡️ PN 4: aq 1.164 | bq 1.0469 |  dq 0.5016 |  hp 22.7137
+➡️ Step 1500 | LR: 0.00495 | Loss: 3.2458
+➡️ PN 1: b1 24.2601 |  b2 12.5234 |  bb 0.9404 |  be 1.3259 |  bg 13.866
+➡️ PN 2: c1 22.3729 |  c2 11.2223 |  cb 2.7179 |  hq 11.2059 |  bq 1.06
+➡️ Step 1600 | LR: 0.004938 | Loss: 3.1073
+➡️ PN 1: b1 24.3187 |  b2 12.5556 |  bb 0.9403 |  be 1.3803 |  bg 14.1239
+➡️ PN 2: c1 22.3501 |  c2 11.2074 |  cb 2.9067 |  hq 11.2045 |  bq 1.0979
+➡️ Step 1700 | LR: 0.004926 | Loss: 3.0789
+➡️ PN 1: b1 24.3685 |  b2 12.585 |  bb 0.9439 |  be 1.4499 |  bg 14.3935
+➡️ PN 2: c1 22.3323 |  c2 11.1963 |  cb 3.0907 |  hq 11.2054 |  bq 1.1327
+➡️ Step 1800 | LR: 0.004912 | Loss: 2.7418
+➡️ PN 1: b1 24.4185 |  b2 12.6176 |  bb 0.9449 |  be 1.5293 |  bg 14.6837
+➡️ PN 2: c1 22.3214 |  c2 11.1889 |  cb 3.2837 |  hq 11.2022 |  bq 1.1507
+➡️ Step 1900 | LR: 0.004896 | Loss: 2.7776
+➡️ PN 1: b1 24.4713 |  b2 12.6492 |  bb 0.9372 |  be 1.6093 |  bg 14.9972
+➡️ PN 2: c1 22.3143 |  c2 11.1845 |  cb 3.4625 |  hq 11.2021 |  bq 1.16
+➡️ Step 2000 | LR: 0.00488 | Loss: 2.5869
+➡️ PN 1: b1 24.527 |  b2 12.6836 |  bb 0.9261 |  be 1.6838 |  bg 15.3036
+➡️ PN 2: c1 22.3088 |  c2 11.1833 |  cb 3.6182 |  hq 11.2031 |  bq 1.1805
 Checkpoint reached! Saving Step 2000...
-➡️ Step 2100 | LR: 0.004862 | Loss: 3.3691
-➡️ PN 1: a1 23.4325 | b1 23.3292 |  c1 32.0216 |  d1 22.7244
-➡️ PN 2: a2 12.1835 | b2 11.916 |  c2 22.6218 |  c3 11.3049 |  d2 11.3825
-➡️ PN 3: ab 0.6089 | bb 0.4622 |  cb 0.4824 |  db 0.4429
-➡️ PN 4: aq 1.192 | bq 1.0438 |  dq 0.5054 |  hp 22.7128
-➡️ Step 2200 | LR: 0.004844 | Loss: 3.3551
-➡️ PN 1: a1 23.5342 | b1 23.3505 |  c1 32.0219 |  d1 22.7268
-➡️ PN 2: a2 12.2747 | b2 11.9301 |  c2 22.6213 |  c3 11.3039 |  d2 11.3838
-➡️ PN 3: ab 0.6184 | bb 0.4669 |  cb 0.4891 |  db 0.4482
-➡️ PN 4: aq 1.2195 | bq 1.0418 |  dq 0.505 |  hp 22.7132
-➡️ Step 2300 | LR: 0.004824 | Loss: 3.3178
-➡️ PN 1: a1 23.6382 | b1 23.3835 |  c1 32.0221 |  d1 22.7282
-➡️ PN 2: a2 12.3636 | b2 11.9552 |  c2 22.6207 |  c3 11.3028 |  d2 11.3843
-➡️ PN 3: ab 0.6262 | bb 0.472 |  cb 0.493 |  db 0.4516
-➡️ PN 4: aq 1.2408 | bq 1.0416 |  dq 0.5062 |  hp 22.7133
-➡️ Step 2400 | LR: 0.004803 | Loss: 3.333
-➡️ PN 1: a1 23.7438 | b1 23.4169 |  c1 32.0223 |  d1 22.7302
-➡️ PN 2: a2 12.4509 | b2 11.9819 |  c2 22.6201 |  c3 11.3016 |  d2 11.3853
-➡️ PN 3: ab 0.6421 | bb 0.4835 |  cb 0.4969 |  db 0.454
-➡️ PN 4: aq 1.2641 | bq 1.0408 |  dq 0.5044 |  hp 22.7133
-➡️ Step 2500 | LR: 0.00478 | Loss: 3.4659
-➡️ PN 1: a1 23.8478 | b1 23.447 |  c1 32.0228 |  d1 22.7322
-➡️ PN 2: a2 12.536 | b2 12.0058 |  c2 22.6197 |  c3 11.3009 |  d2 11.3864
-➡️ PN 3: ab 0.6483 | bb 0.4823 |  cb 0.5014 |  db 0.4569
-➡️ PN 4: aq 1.288 | bq 1.0369 |  dq 0.5045 |  hp 22.7146
-➡️ Step 2600 | LR: 0.004757 | Loss: 3.3619
-➡️ PN 1: a1 23.9419 | b1 23.4705 |  c1 32.0231 |  d1 22.7351
-➡️ PN 2: a2 12.6182 | b2 12.0237 |  c2 22.6193 |  c3 11.3001 |  d2 11.388
-➡️ PN 3: ab 0.645 | bb 0.4772 |  cb 0.5086 |  db 0.4619
-➡️ PN 4: aq 1.3101 | bq 1.0389 |  dq 0.4974 |  hp 22.715
-➡️ Step 2700 | LR: 0.004733 | Loss: 3.3906
-➡️ PN 1: a1 24.0383 | b1 23.4936 |  c1 32.0233 |  d1 22.7378
-➡️ PN 2: a2 12.6987 | b2 12.0406 |  c2 22.6189 |  c3 11.2994 |  d2 11.3897
-➡️ PN 3: ab 0.6423 | bb 0.4733 |  cb 0.5148 |  db 0.4664
-➡️ PN 4: aq 1.3277 | bq 1.0409 |  dq 0.4989 |  hp 22.7152
-➡️ Step 2800 | LR: 0.004707 | Loss: 3.3376
-➡️ PN 1: a1 24.1334 | b1 23.516 |  c1 32.0238 |  d1 22.7408
-➡️ PN 2: a2 12.7777 | b2 12.0575 |  c2 22.6185 |  c3 11.2987 |  d2 11.3915
-➡️ PN 3: ab 0.647 | bb 0.4746 |  cb 0.5214 |  db 0.4715
-➡️ PN 4: aq 1.3375 | bq 1.0392 |  dq 0.4983 |  hp 22.7164
-➡️ Step 2900 | LR: 0.004681 | Loss: 3.3681
-➡️ PN 1: a1 24.2247 | b1 23.5395 |  c1 32.0243 |  d1 22.7438
-➡️ PN 2: a2 12.8525 | b2 12.0769 |  c2 22.6181 |  c3 11.298 |  d2 11.3933
-➡️ PN 3: ab 0.6503 | bb 0.4783 |  cb 0.5277 |  db 0.4763
-➡️ PN 4: aq 1.3439 | bq 1.0361 |  dq 0.4999 |  hp 22.7176
+➡️ Step 2100 | LR: 0.004862 | Loss: 2.85
+➡️ PN 1: b1 24.5822 |  b2 12.7199 |  bb 0.9034 |  be 1.74 |  bg 15.5804
+➡️ PN 2: c1 22.2993 |  c2 11.1791 |  cb 3.7493 |  hq 11.2069 |  bq 1.2063
+➡️ Step 2200 | LR: 0.004844 | Loss: 2.88
+➡️ PN 1: b1 24.643 |  b2 12.7604 |  bb 0.8965 |  be 1.8035 |  bg 15.8685
+➡️ PN 2: c1 22.2865 |  c2 11.1724 |  cb 3.8702 |  hq 11.211 |  bq 1.2414
+➡️ Step 2300 | LR: 0.004824 | Loss: 2.8361
+➡️ PN 1: b1 24.6996 |  b2 12.7933 |  bb 0.8974 |  be 1.8539 |  bg 16.17
+➡️ PN 2: c1 22.2735 |  c2 11.1649 |  cb 4.0021 |  hq 11.2193 |  bq 1.2578
+➡️ Step 2400 | LR: 0.004803 | Loss: 2.7834
+➡️ PN 1: b1 24.7501 |  b2 12.8207 |  bb 0.9204 |  be 1.8974 |  bg 16.4593
+➡️ PN 2: c1 22.2615 |  c2 11.1575 |  cb 4.1362 |  hq 11.2278 |  bq 1.2566
+➡️ Step 2500 | LR: 0.00478 | Loss: 2.817
+➡️ PN 1: b1 24.7994 |  b2 12.8457 |  bb 0.9512 |  be 1.9307 |  bg 16.754
+➡️ PN 2: c1 22.2488 |  c2 11.149 |  cb 4.2699 |  hq 11.233 |  bq 1.249
+➡️ Step 2600 | LR: 0.004757 | Loss: 2.7833
+➡️ PN 1: b1 24.8411 |  b2 12.8655 |  bb 0.9789 |  be 1.9898 |  bg 17.0373
+➡️ PN 2: c1 22.2369 |  c2 11.1409 |  cb 4.3928 |  hq 11.2369 |  bq 1.2434
+➡️ Step 2700 | LR: 0.004733 | Loss: 2.8648
+➡️ PN 1: b1 24.8677 |  b2 12.8781 |  bb 0.9884 |  be 2.0502 |  bg 17.331
+➡️ PN 2: c1 22.2252 |  c2 11.1333 |  cb 4.5168 |  hq 11.2461 |  bq 1.2417
+➡️ Step 2800 | LR: 0.004707 | Loss: 2.8221
+➡️ PN 1: b1 24.8842 |  b2 12.8828 |  bb 0.9908 |  be 2.1079 |  bg 17.6374
+➡️ PN 2: c1 22.2116 |  c2 11.1256 |  cb 4.6377 |  hq 11.2618 |  bq 1.2105
+➡️ Step 2900 | LR: 0.004681 | Loss: 2.8155
+➡️ PN 1: b1 24.9129 |  b2 12.8985 |  bb 1.0083 |  be 2.148 |  bg 17.9351
+➡️ PN 2: c1 22.1985 |  c2 11.117 |  cb 4.7487 |  hq 11.2751 |  bq 1.1887
 
 🔄 Epoch 3 Started | Shuffling 6 shards...
-➡️ Step 3000 | LR: 0.004653 | Loss: 3.3586
-➡️ PN 1: a1 24.3121 | b1 23.5628 |  c1 32.025 |  d1 22.7466
-➡️ PN 2: a2 12.9246 | b2 12.0965 |  c2 22.6178 |  c3 11.2973 |  d2 11.3948
-➡️ PN 3: ab 0.6526 | bb 0.4825 |  cb 0.5344 |  db 0.4812
-➡️ PN 4: aq 1.3491 | bq 1.0325 |  dq 0.5016 |  hp 22.7198
+➡️ Step 3000 | LR: 0.004653 | Loss: 2.8452
+➡️ PN 1: b1 24.9426 |  b2 12.9188 |  bb 1.0231 |  be 2.176 |  bg 18.2245
+➡️ PN 2: c1 22.1869 |  c2 11.1097 |  cb 4.8475 |  hq 11.2867 |  bq 1.2049
 Checkpoint reached! Saving Step 3000...
+➡️ Step 3100 | LR: 0.004624 | Loss: 2.869
+➡️ PN 1: b1 24.966 |  b2 12.9323 |  bb 1.0288 |  be 2.2003 |  bg 18.5182
+➡️ PN 2: c1 22.1748 |  c2 11.102 |  cb 4.9346 |  hq 11.2983 |  bq 1.2066
+➡️ Step 3200 | LR: 0.004595 | Loss: 2.8379
+➡️ PN 1: b1 24.9863 |  b2 12.941 |  bb 1.0311 |  be 2.225 |  bg 18.8062
+➡️ PN 2: c1 22.1623 |  c2 11.0943 |  cb 5.0042 |  hq 11.3077 |  bq 1.2182
+➡️ Step 3300 | LR: 0.004564 | Loss: 2.8006
+➡️ PN 1: b1 25.0001 |  b2 12.9483 |  bb 1.0371 |  be 2.2486 |  bg 19.1038
+➡️ PN 2: c1 22.15 |  c2 11.0854 |  cb 5.0605 |  hq 11.3231 |  bq 1.2329
+➡️ Step 3400 | LR: 0.004532 | Loss: 2.8642
+➡️ PN 1: b1 25.0164 |  b2 12.956 |  bb 1.0381 |  be 2.2646 |  bg 19.3697
+➡️ PN 2: c1 22.1387 |  c2 11.0765 |  cb 5.1413 |  hq 11.3308 |  bq 1.2433
+➡️ Step 3500 | LR: 0.0045 | Loss: 3.0524
+➡️ PN 1: b1 25.0404 |  b2 12.965 |  bb 1.032 |  be 2.2871 |  bg 19.6638
+➡️ PN 2: c1 22.1227 |  c2 11.0659 |  cb 5.2002 |  hq 11.3396 |  bq 1.2464
+➡️ Step 3600 | LR: 0.004466 | Loss: 3.0578
+➡️ PN 1: b1 25.074 |  b2 12.9793 |  bb 1.0217 |  be 2.3419 |  bg 19.9771
+➡️ PN 2: c1 22.0942 |  c2 11.0469 |  cb 5.2434 |  hq 11.3526 |  bq 1.2744
+➡️ Step 3700 | LR: 0.004431 | Loss: 3.1557
+➡️ PN 1: b1 25.1026 |  b2 12.9939 |  bb 1.0285 |  be 2.3978 |  bg 20.2838
+➡️ PN 2: c1 22.0692 |  c2 11.0285 |  cb 5.3038 |  hq 11.3646 |  bq 1.2827
+➡️ Step 3800 | LR: 0.004396 | Loss: 2.6878
+➡️ PN 1: b1 25.1143 |  b2 13.0 |  bb 1.0427 |  be 2.4531 |  bg 20.5602
+➡️ PN 2: c1 22.0527 |  c2 11.0161 |  cb 5.3793 |  hq 11.3705 |  bq 1.2685
+➡️ Step 3900 | LR: 0.00436 | Loss: 2.5765
+➡️ PN 1: b1 25.141 |  b2 13.0146 |  bb 1.0342 |  be 2.5128 |  bg 20.8536
+➡️ PN 2: c1 22.0418 |  c2 11.0086 |  cb 5.437 |  hq 11.3797 |  bq 1.2667
+➡️ Step 4000 | LR: 0.004322 | Loss: 2.6801
+➡️ PN 1: b1 25.1661 |  b2 13.0293 |  bb 1.0388 |  be 2.5771 |  bg 21.1499
+➡️ PN 2: c1 22.0312 |  c2 11.0008 |  cb 5.4764 |  hq 11.3925 |  bq 1.2924
+Checkpoint reached! Saving Step 4000...
 ```
