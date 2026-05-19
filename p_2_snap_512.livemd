@@ -1,6 +1,6 @@
 <!-- livebook:{"persist_outputs":true} -->
 
-# fourier norm - word atten wno - snf
+# fourier norm - word atten sliding window with snapshots -512
 
 ```elixir
 System.put_env("XLA_BUILD", "true")
@@ -83,9 +83,9 @@ defmodule BabyLM.CurriculumStreamer do
     Stream.iterate(1, &(&1 + 1))
     |> Stream.flat_map(fn epoch ->
       :rand.seed(:exsss, {epoch, epoch, epoch})
-      # shuffled_shards = Enum.shuffle(target_shards)
+      shuffled_shards = Enum.shuffle(target_shards)
       IO.puts("\n🔄 Epoch #{epoch} Started | Shuffling #{length(target_shards)} shards...")
-      Stream.flat_map(target_shards, fn path ->
+      Stream.flat_map(shuffled_shards, fn path ->
         tensor = File.read!(path) |> :erlang.binary_to_term()
           
         total_seqs = Nx.axis_size(tensor, 0)
@@ -98,8 +98,8 @@ defmodule BabyLM.CurriculumStreamer do
           Nx.slice_along_axis(tensor, i * batch_size, batch_size, axis: 0)
         end)
         # 3. Shuffle the list of batches
-        # |> Enum.shuffle()
-        end) |> Enum.shuffle()
+        |> Enum.shuffle()
+        end)
     end)
   end
 end
@@ -178,7 +178,7 @@ defmodule DLM.SvdSSM do
   
   defn feed_forward_layer(x, um, ga, bi, dm) do
     up = Nx.dot(x, um) 
-    act = Nx.tanh(up)
+    act = gelu(up) #was tanh
     scaled = Nx.multiply(ga, act)
     biased = Nx.add(scaled, bi)
     Nx.dot(biased, dm) 
@@ -193,49 +193,89 @@ defmodule DLM.SvdSSM do
   end
 
   defn forward_step(x_t, h_prev, hl_prev, p) do
-    {b1, b2, bb, bq, bg, be, c1, c2, cb, cq, hq, em} = p
-    # turn is_space into a learned scalar that triggers when it's greater than a certain value
-    is_space = Nx.equal(x_t, 32) |> Nx.as_type(:f32) |> Nx.new_axis(-1)
-    reset_factor = Nx.subtract(1.0, Nx.multiply(is_space, 1.0))
+    {b1, b2, bb, bq, bg, be, c1, c2, cb, cq, cg, ce, hq, em, ed, uq, wq} = p
 
     u_t = Nx.take(em, x_t) # -> {batch, 512}
-
-    # add learned gamma and beta for the tanh activation?
-    # 512->1024->512 or just 512?
-    b_term = feed_forward_layer(u_t, b1, bq, bb, b2)
-    b_norm = rms_norm(b_term, bg, be)
-
-    hn_base = Nx.add(h_prev, b_norm)
-    hn_gated = Nx.multiply(hn_base, reset_factor)
-
-    # blend: space items get sl_hlp_space, others get sl_hlp_nonspace
-    sl_hlp = Nx.slice_along_axis(hl_prev, is_space, 127, axis: 1)
-    
-    hl_new = Nx.concatenate([sl_hlp, Nx.new_axis(hn_base, 1)], axis: 1)
+    #update "spelling" memory 64x512
+    hnb_sl = Nx.slice_along_axis(h_prev, 1, 15, axis: 1)
+    hnew_base = Nx.concatenate([hnb_sl, Nx.new_axis(u_t, 1)], axis: 1)
     # query
-    qh = Nx.dot(hn_base, hq) |> Nx.new_axis(1)
-    hlnt = Nx.transpose(hl_new, axes: [0, 2, 1])
+    qu = Nx.dot(u_t, uq) |> Nx.new_axis(1)
+    hnt = Nx.transpose(hnew_base, axes: [0, 2, 1])
     # score
-    rshl = Nx.dot(qh, [2], [0], hlnt, [1], [0])
-    # scale (sqrt of 128 - 11.3137, 256->16.0)
-    sscr = Nx.divide(rshl, 11.3137)
+    rsh = Nx.dot(qu, [2], [0], hnt, [1], [0])
+    # scale (sqrt of 128 - 11.3137, 256 -> 16.0, 512 -> 22.6274)
+    # sscrh = Nx.divide(rsh, 11.3137)
     # softmax normalization
-    sfsc = softmax(sscr)
-    ctxhl = Nx.dot(sfsc, [2], [0], hl_new, [1], [0]) |> Nx.squeeze(axes: [1])
+    sfsch = softmax(rsh)
+    ctxh = Nx.dot(sfsch, [2], [0], hnew_base, [1], [0]) |> Nx.squeeze(axes: [1])
 
     # 2. XSA Geometric Adaptation
-    u_norm_sq = Nx.add(Nx.sum(Nx.pow(u_t, 2), axes: [-1], keep_axes: true), 1.0e-6)
-    u_unit = Nx.divide(u_t, Nx.sqrt(u_norm_sq))
+    ut_norm_sq = Nx.add(Nx.sum(Nx.pow(u_t, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    ut_unit = Nx.divide(u_t, Nx.sqrt(ut_norm_sq))
     
-    u_ov = Nx.sum(Nx.multiply(ctxhl, u_unit), axes: [-1], keep_axes: true)
-    ctx_exclusive = Nx.subtract(ctxhl, Nx.multiply(u_ov, u_unit))
+    ut_ov = Nx.sum(Nx.multiply(ctxh, ut_unit), axes: [-1], keep_axes: true)
+    ctxh_exc = Nx.subtract(ctxh, Nx.multiply(ut_ov, ut_unit))
 
-    h_com = Nx.concatenate([hn_base, ctx_exclusive], axis: 1)
+    #process incomming character 512->1024->512
+    b_term = feed_forward_layer(ctxh_exc, b1, bq, bb, b2)
+    b_norm = rms_norm(b_term, bg, be)
 
-    # 1024 -> 128
-    logits = feed_forward_layer(h_com, c1, cq, cb, c2)
+    # update current "word" memory entry
+    slmu = Nx.slice_along_axis(hl_prev, 0, 19, axis: 1)
+    up_mem = Nx.concatenate([slmu, Nx.new_axis(b_norm, 1)], axis: 1)
+
+    # query
+    qh = Nx.dot(b_norm, hq) |> Nx.new_axis(1)
+    hlnt = Nx.transpose(up_mem, axes: [0, 2, 1])
+    # score
+    rshl = Nx.dot(qh, [2], [0], hlnt, [1], [0])
+    # scale (sqrt of 128 - 11.3137, 256 -> 16.0, 512 -> 22.6274)
+    # sscr = Nx.divide(rshl, 11.3137)
+    # softmax normalization
+    sfsc = softmax(rshl)
+    ctxhl = Nx.dot(sfsc, [2], [0], up_mem, [1], [0]) |> Nx.squeeze(axes: [1])
+
+    # 2. XSA Geometric Adaptation
+    hn_norm_sq = Nx.add(Nx.sum(Nx.pow(b_norm, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    hn_unit = Nx.divide(b_norm, Nx.sqrt(hn_norm_sq))
     
-    {logits, hn_gated, hl_new}
+    hn_ov = Nx.sum(Nx.multiply(ctxhl, hn_unit), axes: [-1], keep_axes: true)
+    ctxhl_exc = Nx.subtract(ctxhl, Nx.multiply(hn_ov, hn_unit))
+
+    hn_com = Nx.add(b_norm, ctxhl_exc)
+
+    # 512 -> 512 -> 512
+    c_term = feed_forward_layer(hn_com, c1, cq, cb, c2)
+    c_norm = rms_norm(c_term, cg, ce)
+
+    # determine "word" boundry
+    sig_val = Nx.dot(c_norm, wq) |> Nx.sigmoid()
+    is_eow_hard = Nx.greater(sig_val, 0.5)
+    # Forward uses hard values, backward uses sigmoid gradient
+    is_eow = Nx.add(sig_val, stop_grad(Nx.subtract(Nx.as_type(is_eow_hard, :f32), sig_val)))
+    # is_space = Nx.equal(x_t, 32) |> Nx.as_type(:f32) |> Nx.new_axis(-1)
+    reset_factor = Nx.subtract(1.0, is_eow)
+
+    hnp_gated = Nx.multiply(b_norm, reset_factor)
+
+    # is_space is already [batch, 512] float, just add one more axis
+    is_eow_3d = Nx.new_axis(is_eow, 1)  # [batch, 1, 512]
+    
+    
+    sl_hlp_nonspace = Nx.slice_along_axis(up_mem, 0, 19, axis: 1)
+    sl_hlp_space    = Nx.slice_along_axis(up_mem, 1, 19, axis: 1)
+
+    # blend: space items get sl_hlp_space, others get sl_hlp_nonspace
+    sl_hlp = Nx.multiply(sl_hlp_space, is_eow_3d)
+               |> Nx.add(Nx.multiply(sl_hlp_nonspace, Nx.subtract(1.0, is_eow_3d)))
+    
+    hl_new = Nx.concatenate([sl_hlp, Nx.new_axis(hnp_gated, 1)], axis: 1)
+
+    # 512 -> 128
+    logits = Nx.dot(c_norm, ed)
+    
+    {logits, hnew_base, hl_new}
   end
 end
 ```
@@ -243,7 +283,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.SvdSSM, <<70, 79, 82, 49, 0, 0, 41, ...>>, true}
+{:module, DLM.SvdSSM, <<70, 79, 82, 49, 0, 0, 46, ...>>, true}
 ```
 
 ```elixir
@@ -251,8 +291,8 @@ defmodule DLM.SvdOptimizer do
   import Nx.Defn
 
   defn update(params, grads, step, lr) do
-    {b1, b2, bb, bq, bg, be, c1, c2, cb, cq, hq, em} = params   
-    {gb1, gb2, gbb, gbq, gbg, gbe, gc1, gc2, gcb, gcq, ghq, gem} = grads
+    {b1, b2, bb, bq, bg, be, c1, c2, cb, cq, cg, ce, hq, em, ed, uq, wq} = params   
+    {gb1, gb2, gbb, gbq, gbg, gbe, gc1, gc2, gcb, gcq, gcg, gce, ghq, gem, ged, guq, gwq} = grads
     
     new_step = Nx.add(step, 1)
 
@@ -270,12 +310,18 @@ defmodule DLM.SvdOptimizer do
 
     be_new = DLM.StatelessMuon.muon_step(be, gbe, lr)
     bg_new = DLM.StatelessMuon.muon_step(bg, gbg, lr)
+    ce_new = DLM.StatelessMuon.muon_step(ce, gce, lr)
+    cg_new = DLM.StatelessMuon.muon_step(cg, gcg, lr)
     
     hq_new = DLM.StatelessMuon.muon_step(hq, ghq, lr)
     em_new = DLM.StatelessMuon.muon_step(em, gem, lr)
+    ed_new = DLM.StatelessMuon.muon_step(ed, ged, lr)
+    uq_new = DLM.StatelessMuon.muon_step(uq, guq, lr)
+    wq_new = DLM.StatelessMuon.muon_step(wq, gwq, lr)
     
     new_params = {b1_new, b2_new, bb_new, bq_new, bg_new, be_new,
-                  c1_new, c2_new, cb_new, cq_new, hq_new, em_new}
+                  c1_new, c2_new, cb_new, cq_new, cg_new, ce_new,
+                  hq_new, em_new, ed_new, uq_new, wq_new}
 
     {new_params, new_step}
   end
@@ -285,7 +331,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.SvdOptimizer, <<70, 79, 82, 49, 0, 0, 17, ...>>, true}
+{:module, DLM.SvdOptimizer, <<70, 79, 82, 49, 0, 0, 19, ...>>, true}
 ```
 
 ```elixir
@@ -293,39 +339,44 @@ defmodule DLM.PhysicsGenesis do
   import Nx.Defn
 
   @vocab 128
-  @rank 512
+  @rank 256
   @dim 1024
 
   defn init(k1) do
     std_dim = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@dim, type: :f32)))
-    std_rnk = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@rank, type: :f32)))
     std_voc = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@vocab, type: :f32)))
+    std_rnk = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@rank, type: :f32)))
 
     # projection matrices
-    {b1, k2} = Nx.Random.normal(k1, 0.0, std_rnk, shape: {@rank, @rank})
-    {b2, k3} = Nx.Random.normal(k2, 0.0, std_rnk, shape: {@rank, @rank})
-    {c1, k4} = Nx.Random.normal(k3, 0.0, std_dim, shape: {@dim, @dim})
-    {c2, k5} = Nx.Random.normal(k4, 0.0, std_dim, shape: {@dim, @vocab})
+    {b1, k2} = Nx.Random.normal(k1, 0.0, std_rnk, shape: {@rank, @dim})
+    {b2, k3} = Nx.Random.normal(k2, 0.0, std_dim, shape: {@dim, @rank})
+    {c1, k4} = Nx.Random.normal(k3, 0.0, std_rnk, shape: {@rank, @dim})
+    {c2, k5} = Nx.Random.normal(k4, 0.0, std_dim, shape: {@dim, @rank})
 
     # projection bias'
-    bb = Nx.broadcast(0.0, {@rank}) |> Nx.as_type(:f32)
+    bb = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
     cb = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
 
-    bq = Nx.broadcast(1.0, {@rank}) |> Nx.as_type(:f32)
+    bq = Nx.broadcast(1.0, {@dim}) |> Nx.as_type(:f32)
     cq = Nx.broadcast(1.0, {@dim}) |> Nx.as_type(:f32)
     
     # rms norm beta and gamma
     be = Nx.broadcast(0.0, {@rank}) |> Nx.as_type(:f32)
     bg = Nx.broadcast(1.0, {@rank}) |> Nx.as_type(:f32)
+    ce = Nx.broadcast(0.0, {@rank}) |> Nx.as_type(:f32)
+    cg = Nx.broadcast(1.0, {@rank}) |> Nx.as_type(:f32)
 
-    # hl query
-    {hq, k6} = Nx.Random.normal(k5, 0.0, std_rnk, shape: {@rank, @rank})
+    {em, k6} = Nx.Random.normal(k5, 0.0, std_voc, shape: {@vocab, @rank})
+    {ed, k7} = Nx.Random.normal(k6, 0.0, std_rnk, shape: {@rank, @vocab})
+    {hq, k8} = Nx.Random.normal(k7, 0.0, std_rnk, shape: {@rank, @rank})
+    {uq, k9} = Nx.Random.normal(k8, 0.0, std_rnk, shape: {@rank, @rank})
+    {wq, k10} = Nx.Random.normal(k9, 0.0, 0.0, shape: {@rank, @rank})
 
-    {em, k7} = Nx.Random.normal(k6, 0.0, std_voc, shape: {@vocab, @rank}) 
+    trainable_params = {b1, b2, bb, bq, bg, be, 
+                        c1, c2, cb, cq, cg, ce, 
+                        hq, em, ed, uq, wq}
 
-    trainable_params = {b1, b2, bb, bq, bg, be, c1, c2, cb, cq, hq, em}
-
-    {trainable_params, k7}
+    {trainable_params, k10}
   end
 end
 ```
@@ -333,138 +384,7 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 16, ...>>, true}
-```
-
-<!-- livebook:{"branch_parent_index":0} -->
-
-## Fourier build
-
-```elixir
-defmodule DLM.SemanticReservoirForge do
-  import Nx.Defn
-
-  @vocab 128
-  @dim 128 
-
-  def build_fourier_matrix do
-    pairs = div(@dim, 2)
-
-    flat_list =
-      for row <- 0..(@dim - 1), col <- 0..(@dim - 1) do
-        pair_row = div(row, 2)
-        pair_col = div(col, 2)
-
-        if pair_row == pair_col do
-          w = 0.01 + pair_row * (:math.pi() - 0.01) / max(1, pairs - 1)
-          cond do
-            rem(row, 2) == 0 and rem(col, 2) == 0 -> :math.cos(w)
-            rem(row, 2) == 0 and rem(col, 2) == 1 -> -:math.sin(w)
-            rem(row, 2) == 1 and rem(col, 2) == 0 -> :math.sin(w)
-            rem(row, 2) == 1 and rem(col, 2) == 1 -> :math.cos(w)
-          end
-        else
-          0.0
-        end
-      end
-
-    Nx.tensor(flat_list, type: :f32) |> Nx.reshape({@dim, @dim})
-  end
-
-  defn count_transitions(tensor, acc_matrix) do
-    flat = Nx.flatten(tensor)
-    seq_len = Nx.axis_size(flat, 0)
-
-    current_chars = Nx.slice_along_axis(flat, 0, seq_len - 1)
-    next_chars = Nx.slice_along_axis(flat, 1, seq_len - 1)
-
-    indices = Nx.stack([current_chars, next_chars], axis: 1)
-    updates = Nx.broadcast(1.0, {seq_len - 1})
-
-    Nx.indexed_add(acc_matrix, indices, updates)
-  end
-
-  defn compute_b_matrix(transition_counts) do
-    row_sums = Nx.sum(transition_counts, axes: [1], keep_axes: true)
-    markov_matrix = Nx.divide(transition_counts, Nx.add(row_sums, 1.0e-8))
-
-    {u, s, _v} = Nx.LinAlg.svd(markov_matrix)
-
-    semantic_b = Nx.dot(u, Nx.make_diagonal(Nx.sqrt(s)))
-
-    sem_variance = Nx.mean(Nx.pow(semantic_b, 2))
-    semantic_bf = Nx.divide(semantic_b, Nx.sqrt(sem_variance + 1.0e-8))
-
-    # missing_dims = @dim - @vocab
-    # {random_b, _} = Nx.Random.normal(key, 0.0, 1.0, shape: {@vocab, missing_dims})
-
-    # Nx.concatenate([semantic_b, random_b], axis: 1)
-    semantic_bf
-  end
-
-  def forge_and_save(data_dir, output_path) do
-    shards = Path.wildcard(Path.join(data_dir, "*.bin"))
-
-    initial_matrix = Nx.broadcast(0.0, {@vocab, @vocab}) |> Nx.backend_copy()
-
-    final_counts = Enum.reduce(shards, initial_matrix, fn path, acc ->
-      tensor = File.read!(path) |> :erlang.binary_to_term()
-      gpu_tensor = Nx.backend_copy(tensor)
-      count_transitions(gpu_tensor, acc)
-    end)
-
-    b_frozen = compute_b_matrix(final_counts)
-
-    a_frozen = build_fourier_matrix()
-
-    IO.puts("Saving tuned reservoir to #{output_path}...")
-    
-    cpu_a = DLM.Tree.map(a_frozen, &Nx.backend_transfer(&1, Nx.BinaryBackend))
-    cpu_b = DLM.Tree.map(b_frozen, &Nx.backend_transfer(&1, Nx.BinaryBackend))
-    
-    File.write!(output_path, :erlang.term_to_binary(%{frozen: {cpu_a, cpu_b}}))
-    IO.puts("file write complete")
-  end
-end
-```
-
-<!-- livebook:{"output":true} -->
-
-```
-{:module, DLM.SemanticReservoirForge, <<70, 79, 82, 49, 0, 0, 33, ...>>, {:forge_and_save, 2}}
-```
-
-```elixir
-DLM.SemanticReservoirForge.forge_and_save("./data/bbylm_512_strict", "./data/f_semantic_reservoir_128D.bin")
-```
-
-<!-- livebook:{"output":true} -->
-
-```
-
-12:48:40.966 [info] XLA service 0x7fda662c53a0 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
-
-12:48:40.967 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
-
-12:48:40.967 [info] Using BFC allocator.
-
-12:48:40.967 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
-
-12:48:40.967 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
-
-12:48:41.287 [info] Merging Dots in computation: region_15.12
-
-12:48:41.287 [info] Merging Dots in computation: region_53.56
-
-12:48:41.287 [info] Merging Dots in computation: region_7.59.clone
-Saving tuned reservoir to ./data/f_semantic_reservoir_128D.bin...
-file write complete
-```
-
-<!-- livebook:{"output":true} -->
-
-```
-:ok
+{:module, DLM.PhysicsGenesis, <<70, 79, 82, 49, 0, 0, 18, ...>>, true}
 ```
 
 <!-- livebook:{"branch_parent_index":0} -->
@@ -536,13 +456,13 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-{:module, DLM.Phase2_Eval, <<70, 79, 82, 49, 0, 0, 26, ...>>, true}
+{:module, DLM.Phase2_Eval, <<70, 79, 82, 49, 0, 0, 25, ...>>, true}
 ```
 
 ```elixir
 gpu = {EXLA.Backend, client: :rocm}
 
-checkpoint_path = "v44_DLM_mkov_ffn_128x512x1024_nu2u_checkpoint_step_3000.bin"
+checkpoint_path = "v44_DLM_mkov_ffn_256x1024_256sq_256x16x20sm_checkpoint_step_4000.bin"
 %{trainable: t_p} = File.read!(checkpoint_path) |> :erlang.binary_to_term()
 
 trainable_gpu = DLM.Tree.map(t_p, &Nx.backend_copy(&1, gpu))
@@ -550,8 +470,8 @@ trainable_gpu = DLM.Tree.map(t_p, &Nx.backend_copy(&1, gpu))
 
 warmup_input  = Nx.broadcast(1, {200, 255}) |> Nx.as_type(:s32) |> Nx.backend_copy(gpu)
 warmup_target = Nx.broadcast(1, {200, 255}) |> Nx.as_type(:s32) |> Nx.backend_copy(gpu)
-h_init_warm   = Nx.broadcast(0.0, {200, 512}) |> Nx.backend_copy(gpu)
-hl_init_warm   = Nx.broadcast(0.0, {200, 128, 512}) |> Nx.backend_copy(gpu)
+h_init_warm   = Nx.broadcast(0.0, {200, 16, 256}) |> Nx.backend_copy(gpu)
+hl_init_warm   = Nx.broadcast(0.0, {200, 20, 256}) |> Nx.backend_copy(gpu)
 
 DLM.Phase2_Eval.compute_sentence_loss(warmup_input, warmup_target, h_init_warm, hl_init_warm, trainable_gpu)
 
@@ -562,6 +482,7 @@ run_blimp = fn path ->
     |> Enum.map(&Jason.decode!/1)
 
   total_pairs = length(pairs)
+  # 50 for supplimental
   pairs_per_batch = 100 
 
   {passes, total_loss_diff} =
@@ -597,8 +518,8 @@ run_blimp = fn path ->
       batch_input  = Nx.slice_along_axis(batch_full, 0, seq_len, axis: 1)
       batch_target = Nx.slice_along_axis(batch_full, 1, seq_len, axis: 1)
 
-      h_init = Nx.broadcast(0.0, {actual_sentences, 512}) |> Nx.backend_copy(gpu)
-      hl_init = Nx.broadcast(0.0, {actual_sentences, 128, 512}) |> Nx.backend_copy(gpu)
+      h_init = Nx.broadcast(0.0, {actual_sentences, 16, 256}) |> Nx.backend_copy(gpu)
+      hl_init = Nx.broadcast(0.0, {actual_sentences, 20, 256}) |> Nx.backend_copy(gpu)
       
       losses = DLM.Phase2_Eval.compute_sentence_loss(
         batch_input, batch_target, h_init, hl_init, trainable_gpu
@@ -626,6 +547,7 @@ run_blimp = fn path ->
   {name, accuracy, avg_margin, passes, total_pairs}
 end
 
+# ./data/bbylm_non_blimp_evals/*.jsonl -> ./data/bblm_blimp_26_quick/*.jsonl
 dataset_files = Path.wildcard("./data/bblm_blimp_26_quick/*.jsonl") |> Enum.sort()
 total_files   = length(dataset_files)
 
@@ -670,6 +592,8 @@ IO.puts(String.duplicate("=", 70))
 <!-- livebook:{"output":true} -->
 
 ```
+
+01:08:55.046 [info] Merging Dots in computation: region_0.14
 🚀 Running BLiMP batched eval across 66 datasets...
 
   [1/66] adjunct_island.jsonl...
@@ -745,74 +669,74 @@ IO.puts(String.duplicate("=", 70))
 ======================================================================
 Dataset                                         Accuracy   Margin
 ----------------------------------------------------------------------
-✅ wh_questions_subject_gap                        100.0% (200/200)   0.0617
-✅ wh_vs_that_no_gap                                99.5% (199/200)   0.0626
-✅ wh_questions_subject_gap_long_distance           99.0% (198/200)   0.04
-✅ principle_A_domain_1                             98.0% (196/200)   0.045
-✅ wh_vs_that_no_gap_long_distance                  97.5% (195/200)   0.0401
-✅ wh_island                                        92.5% (185/200)   0.0361
-✅ wh_questions_object_gap                          91.5% (183/200)   0.0547
-✅ principle_A_case_1                               89.5% (179/200)   0.0517
-✅ sentential_negation_npi_scope                    77.5% (155/200)   0.0036
-✅ left_branch_island_echo_question                 75.0% (150/200)   0.0668
-✅ superlative_quantifiers_1                        73.5% (147/200)   0.0195
-✅ sentential_negation_npi_licensor_present         73.0% (146/200)   0.053
-✅ only_npi_licensor_present                        69.5% (139/200)   0.0101
-✅ irregular_past_participle_adjectives             67.0% (134/200)   0.0163
-✅ principle_A_c_command                            66.0% (132/200)   0.015
-✅ coordinate_structure_constraint_complex_left_branch   62.5% (125/200)   0.0257
-✅ left_branch_island_simple_question               62.0% (124/200)   0.0333
-✅ anaphor_gender_agreement                         60.5% (121/200)   0.0108
-✅ ellipsis_n_bar_2                                 60.0% (120/200)   0.0069
-〰️ existential_there_subject_raising                58.0% (116/200)   0.0207
-〰️ existential_there_object_raising                 57.5% (115/200)   0.0047
-〰️ superlative_quantifiers_2                        57.0% (114/200)   0.0126
-〰️ transitive                                       56.5% (113/200)   0.0134
-〰️ expletive_it_object_raising                      56.0% (112/200)   0.0092
-〰️ tough_vs_raising_2                               56.0% (112/200)   0.0061
-〰️ tough_vs_raising_1                               55.0% (110/200)   0.0166
-〰️ determiner_noun_agreement_irregular_1            54.5% (109/200)   0.006
-〰️ distractor_agreement_relational_noun             54.5% (109/200)   0.0015
-〰️ determiner_noun_agreement_2                      54.0% (108/200)   0.0001
-〰️ existential_there_quantifiers_1                  54.0% (108/200)   -0.0012
-〰️ complex_NP_island                                52.5% (105/200)   0.0007
-〰️ irregular_plural_subject_verb_agreement_1        52.5% (105/200)   0.0028
-〰️ passive_2                                        51.0% (102/200)   0.0039
-〰️ animate_subject_passive                          50.5% (101/200)   0.0054
-〰️ determiner_noun_agreement_with_adj_2             50.5% (101/200)   -0.0081
-〰️ passive_1                                        50.5% (101/200)   0.0033
-〰️ regular_plural_subject_verb_agreement_2          50.5% (101/200)   0.0025
-〰️ determiner_noun_agreement_irregular_2            50.0% (100/200)   -0.0086
-〰️ regular_plural_subject_verb_agreement_1          50.0% (100/200)   -0.0
-〰️ determiner_noun_agreement_1                      48.5% (97/200)   -0.0011
-〰️ principle_A_domain_3                             48.5% (97/200)   -0.0017
-〰️ determiner_noun_agreement_with_adj_irregular_1   48.0% (96/200)   0.0014
-〰️ determiner_noun_agreement_with_adjective_1       47.5% (95/200)   -0.0022
-〰️ anaphor_number_agreement                         47.0% (94/200)   -0.0072
-〰️ causative                                        47.0% (94/200)   -0.0157
-〰️ irregular_plural_subject_verb_agreement_2        47.0% (94/200)   -0.0071
-〰️ ellipsis_n_bar_1                                 46.5% (93/200)   0.0007
-〰️ adjunct_island                                   44.5% (89/200)   -0.007
-〰️ irregular_past_participle_verbs                  44.5% (89/200)   -0.0001
-〰️ inchoative                                       44.0% (88/200)   -0.045
-〰️ coordinate_structure_constraint_object_extraction   43.5% (87/200)   -0.0138
-〰️ distractor_agreement_relative_clause             43.5% (87/200)   -0.0013
-〰️ determiner_noun_agreement_with_adj_irregular_2   43.0% (86/200)   -0.0178
-〰️ animate_subject_trans                            42.0% (84/200)   -0.0364
-〰️ principle_A_case_2                               41.0% (82/200)   -0.0042
-❌ intransitive                                     39.5% (79/200)   -0.0294
-❌ npi_present_2                                    39.5% (79/200)   -0.0202
-❌ sentential_subject_island                        39.0% (78/200)   -0.01
-❌ principle_A_domain_2                             37.5% (75/200)   -0.0158
-❌ npi_present_1                                    37.0% (74/200)   -0.0184
-❌ only_npi_scope                                   37.0% (74/200)   -0.0163
-❌ existential_there_quantifiers_2                  36.5% (73/200)   -0.0411
-❌ principle_A_reconstruction                       28.0% (56/200)   -0.0192
-❌ matrix_question_npi_licensor_present             25.5% (51/200)   -0.0663
-❌ wh_vs_that_with_gap_long_distance                 1.5% (3/200)   -0.0479
-❌ wh_vs_that_with_gap                               0.0% (0/200)   -0.0716
+✅ principle_A_domain_1                             99.5% (199/200)   0.087
+✅ wh_vs_that_no_gap                                98.5% (197/200)   0.0569
+✅ wh_vs_that_no_gap_long_distance                  98.0% (196/200)   0.0406
+✅ existential_there_quantifiers_2                  97.0% (194/200)   0.122
+✅ principle_A_case_1                               96.0% (192/200)   0.0783
+✅ wh_questions_subject_gap                         93.0% (186/200)   0.0772
+✅ sentential_negation_npi_licensor_present         89.5% (179/200)   0.0766
+✅ wh_questions_subject_gap_long_distance           89.5% (179/200)   0.0404
+✅ principle_A_case_2                               86.5% (173/200)   0.0344
+✅ wh_questions_object_gap                          86.0% (172/200)   0.0587
+✅ superlative_quantifiers_1                        83.5% (167/200)   0.0567
+✅ left_branch_island_echo_question                 80.5% (161/200)   0.1015
+✅ wh_island                                        76.0% (152/200)   0.0257
+✅ principle_A_c_command                            70.5% (141/200)   0.0201
+✅ irregular_past_participle_verbs                  67.0% (134/200)   0.0493
+✅ anaphor_gender_agreement                         65.5% (131/200)   0.0323
+✅ existential_there_quantifiers_1                  64.0% (128/200)   0.0383
+✅ determiner_noun_agreement_with_adj_irregular_1   60.0% (120/200)   0.0067
+〰️ causative                                        59.0% (118/200)   0.0217
+〰️ animate_subject_passive                          56.5% (113/200)   0.0192
+〰️ determiner_noun_agreement_irregular_2            56.0% (112/200)   0.0158
+〰️ determiner_noun_agreement_2                      55.5% (111/200)   0.0099
+〰️ regular_plural_subject_verb_agreement_1          55.5% (111/200)   0.015
+〰️ distractor_agreement_relative_clause             55.0% (110/200)   0.0052
+〰️ ellipsis_n_bar_1                                 55.0% (110/200)   0.0031
+〰️ existential_there_subject_raising                55.0% (110/200)   0.0113
+〰️ principle_A_domain_3                             54.5% (109/200)   0.006
+〰️ determiner_noun_agreement_1                      54.0% (108/200)   0.0029
+〰️ superlative_quantifiers_2                        53.5% (107/200)   0.0053
+〰️ complex_NP_island                                53.0% (106/200)   0.0043
+〰️ tough_vs_raising_2                               53.0% (106/200)   0.0202
+〰️ determiner_noun_agreement_with_adj_irregular_2   52.5% (105/200)   0.0043
+〰️ transitive                                       52.5% (105/200)   0.0092
+〰️ determiner_noun_agreement_with_adjective_1       51.5% (103/200)   0.0016
+〰️ adjunct_island                                   49.0% (98/200)   -0.0017
+〰️ determiner_noun_agreement_irregular_1            48.5% (97/200)   -0.0017
+〰️ distractor_agreement_relational_noun             48.5% (97/200)   0.0048
+〰️ ellipsis_n_bar_2                                 48.5% (97/200)   -0.0048
+〰️ anaphor_number_agreement                         48.0% (96/200)   -0.0075
+〰️ expletive_it_object_raising                      47.5% (95/200)   -0.0006
+〰️ tough_vs_raising_1                               47.5% (95/200)   -0.0132
+〰️ irregular_plural_subject_verb_agreement_1        46.5% (93/200)   -0.0054
+〰️ determiner_noun_agreement_with_adj_2             45.5% (91/200)   -0.0041
+〰️ existential_there_object_raising                 45.5% (91/200)   -0.0028
+〰️ sentential_subject_island                        45.0% (90/200)   -0.004
+〰️ passive_2                                        44.5% (89/200)   -0.0062
+〰️ regular_plural_subject_verb_agreement_2          44.5% (89/200)   -0.0029
+〰️ coordinate_structure_constraint_complex_left_branch   44.0% (88/200)   -0.0068
+〰️ irregular_plural_subject_verb_agreement_2        43.5% (87/200)   -0.0091
+〰️ left_branch_island_simple_question               42.5% (85/200)   -0.0121
+〰️ inchoative                                       41.0% (82/200)   -0.0291
+❌ sentential_negation_npi_scope                    38.5% (77/200)   -0.0077
+❌ principle_A_reconstruction                       38.0% (76/200)   -0.0162
+❌ passive_1                                        37.0% (74/200)   -0.0184
+❌ principle_A_domain_2                             36.0% (72/200)   -0.0176
+❌ animate_subject_trans                            33.5% (67/200)   -0.046
+❌ only_npi_scope                                   33.0% (66/200)   -0.028
+❌ irregular_past_participle_adjectives             32.0% (64/200)   -0.0389
+❌ coordinate_structure_constraint_object_extraction   31.0% (62/200)   -0.0295
+❌ intransitive                                     30.0% (60/200)   -0.0621
+❌ npi_present_2                                    27.5% (55/200)   -0.0369
+❌ npi_present_1                                    19.5% (39/200)   -0.0374
+❌ matrix_question_npi_licensor_present             13.0% (26/200)   -0.1329
+❌ only_npi_licensor_present                         2.5% (5/200)   -0.0853
+❌ wh_vs_that_with_gap                               0.5% (1/200)   -0.0659
+❌ wh_vs_that_with_gap_long_distance                 0.5% (1/200)   -0.0426
 ----------------------------------------------------------------------
-📊 Overall average accuracy: 55.03%
+📊 Overall average accuracy: 53.41%
 ======================================================================
 ```
 
@@ -842,9 +766,11 @@ defmodule DLM.Phase2Trainer do
 
   defn compute_sequence_loss(input_tokens, params) do
     batch_size = Nx.axis_size(input_tokens, 0)
-    
-    h_start = Nx.broadcast(0.0, {batch_size, 512})
-    hl_start = Nx.broadcast(0.0, {batch_size, 128, 512}) |> Nx.as_type(:f32)
+
+    # add learned initialization weights, not direct but a 'starting bias'
+    h_start = Nx.broadcast(0.0, {batch_size, 16, 256})
+    # 64 b/c sequence length(256) / 4 characters 
+    hl_start = Nx.broadcast(0.0, {batch_size, 20, 256}) |> Nx.as_type(:f32)
     
     zero_scalar = Nx.tensor(0.0, type: :f32)
 
@@ -943,8 +869,8 @@ end
 ```
 
 ```elixir
-run_prefix  = "v44_DLM_mkov_ffn_128x512x1024_nu2u"
-total_steps = 16000
+run_prefix  = "v44_DLM_mkov_ffn_256x1024_256sq_256x16x20sm"
+total_steps = 32000
 
 {load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
 
@@ -953,8 +879,8 @@ if start_step == :completed do
   
 else
   batch_size = 64
-  # ./data/bbylm_512_fullmix (256 too)
-  data_dir = "./data/bbylm_512_strict" #/babylm_high_sanitize(sq 256, /bbylm_512_strict
+  # ./data/bbylm_512_fullmix (256 too) bbylm_lg_wiki_512
+  data_dir = "./data/babylm_high_sanitize" #/babylm_high_sanitize(sq 256, /bbylm_512_strict
   
   IO.puts("Initializing Lazy Curriculum Data Stream from [#{data_dir}]...")
   
@@ -985,9 +911,9 @@ else
       gpu_batch = Nx.backend_copy(cpu_batch, gpu)
      
       # Learning Rate (Capped at 0.007)
-      base_lr = 3.0e-4
-      min_lr = 3.0e-5
-      warmup_steps = 800
+      base_lr = 5.0e-4
+      min_lr = 5.0e-5
+      warmup_steps = 1600
       
       current_lr = 
         if step < warmup_steps do
@@ -1010,7 +936,7 @@ else
   
       # Telemetry
       if rem(step, 100) == 0 do
-        {b1, b2, bb, bq, bg, be, c1, c2, cb, cq, hq, em} = up_tr
+        {b1, b2, bb, bq, bg, be, c1, c2, cb, cq, cg, ce, hq, em, ed, uq, wq} = up_tr
         
         b1_norm = b1 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         b2_norm = b2 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
@@ -1021,13 +947,19 @@ else
         cb_norm = cb |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         bg_norm = bg |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         be_norm = be |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        cg_norm = cg |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        ce_norm = ce |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         hq_norm = hq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         cq_norm = cq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
         em_norm = em |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        ed_norm = ed |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        uq_norm = uq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        wq_norm = wq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
 
         IO.puts("➡️ Step #{step} | LR: #{Float.round(current_lr, 6)} | Loss: #{Float.round(loss_val, 4)}")
-        IO.puts("➡️ PN 1: b1 #{b1_norm} |  b2 #{b2_norm} |  bb #{bb_norm} |  be #{be_norm} |  bg #{bg_norm} |  em #{em_norm}" )
-        IO.puts("➡️ PN 2: c1 #{c1_norm} |  c2 #{c2_norm} |  cb #{cb_norm} |  hq #{hq_norm} |  bq #{bq_norm} |  cq #{cq_norm}" )
+        IO.puts("➡️ PN 1: b1 #{b1_norm} |  b2 #{b2_norm} |  bb #{bb_norm} |  bq #{bq_norm} |  be #{be_norm} |  bg #{bg_norm}")
+        IO.puts("➡️ PN 2: c1 #{c1_norm} |  c2 #{c2_norm} |  cb #{cb_norm} |  cq #{cq_norm} |  ce #{ce_norm} |  cg #{cg_norm}")
+        IO.puts("➡️ PN 3: wq #{wq_norm} |  uq #{uq_norm} |  hq #{hq_norm} |  em #{em_norm} |  ed #{ed_norm}")
         :erlang.garbage_collect()
       end
   
@@ -1054,72 +986,93 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-Auto-Resuming 'v44_DLM_mkov_ffn_128x512x1024_nu2u' from Step 2000...
-Initializing Lazy Curriculum Data Stream from [./data/bbylm_512_strict]...
-Loading Trainable Weights from v44_DLM_mkov_ffn_128x512x1024_nu2u_checkpoint_step_2000.bin...
+Auto-Resuming 'v44_DLM_mkov_ffn_256x1024_256sq_256x16x20sm' from Step 3000...
+Initializing Lazy Curriculum Data Stream from [./data/babylm_high_sanitize]...
+Loading Trainable Weights from v44_DLM_mkov_ffn_256x1024_256sq_256x16x20sm_checkpoint_step_3000.bin...
 
-21:15:11.431 [info] XLA service 0x792ff227ad00 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
+00:55:30.308 [info] XLA service 0x7f5e3033bf00 initialized for platform ROCM (this does not guarantee that XLA will be used). Devices:
 
-21:15:11.433 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
+00:55:30.309 [info]   StreamExecutor [0]: AMD Radeon RX 7600, AMDGPU ISA version: gfx1100 (Driver: 6.4.43482; Runtime: 6.4.43482; Toolkit: 6.4.43482; DNN: 0.0.0)
 
-21:15:11.433 [info] Using BFC allocator.
+00:55:30.309 [info] Using BFC allocator.
 
-21:15:11.433 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
+00:55:30.309 [info] XLA backend will use up to 6429868032 bytes on device 0 for BFCAllocator.
 
-21:15:11.433 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
+00:55:30.309 [info] XLA backend will use up to 2143289344 bytes on device 0 for CollectiveBFCAllocator.
 
 🔄 Epoch 1 Started | Shuffling 6 shards...
 
 🔄 Epoch 2 Started | Shuffling 6 shards...
 
-21:15:11.898 [info] Merging Dots in computation: region_12.39.clone
+00:55:30.770 [info] Merging Dots in computation: region_0.16
 
-21:16:08.892 [info] Merging Dots in computation: region_2.3
+00:55:30.770 [info] Merging Dots in computation: region_17.59.clone
 
-21:16:08.892 [info] Merging Dots in computation: region_6.7
+00:56:46.218 [info] Merging Dots in computation: region_2.3
 
-21:16:08.892 [info] Merging Dots in computation: region_26.27
+00:56:46.218 [info] Merging Dots in computation: region_6.7
 
-21:16:08.892 [info] Merging Dots in computation: region_30.31
+00:56:46.218 [info] Merging Dots in computation: region_26.27
 
-21:16:08.893 [info] Merging Dots in computation: region_42.43
+00:56:46.218 [info] Merging Dots in computation: region_30.31
 
-21:16:08.893 [info] Merging Dots in computation: region_46.47
-➡️ Step 2000 | LR: 2.96e-4 | Loss: 3.0733
-➡️ PN 1: b1 22.5998 |  b2 22.6194 |  bb 0.3075 |  be 0.3525 |  bg 22.8957 |  em 22.5219
-➡️ PN 2: c1 32.0144 |  c2 11.2847 |  cb 0.3919 |  hq 22.6304 |  bq 22.5721 |  cq 32.0645
-Checkpoint reached! Saving Step 2000...
-➡️ Step 2100 | LR: 2.95e-4 | Loss: 2.9396
-➡️ PN 1: b1 22.5989 |  b2 22.6188 |  bb 0.3183 |  be 0.371 |  bg 22.917 |  em 22.52
-➡️ PN 2: c1 32.0136 |  c2 11.2832 |  cb 0.4143 |  hq 22.6303 |  bq 22.5683 |  cq 32.0688
-➡️ Step 2200 | LR: 2.94e-4 | Loss: 3.0418
-➡️ PN 1: b1 22.5981 |  b2 22.6183 |  bb 0.3275 |  be 0.3882 |  bg 22.9382 |  em 22.5184
-➡️ PN 2: c1 32.0127 |  c2 11.2816 |  cb 0.4354 |  hq 22.6301 |  bq 22.5649 |  cq 32.0728
-➡️ Step 2300 | LR: 2.94e-4 | Loss: 3.0487
-➡️ PN 1: b1 22.5973 |  b2 22.6177 |  bb 0.3362 |  be 0.4053 |  bg 22.9598 |  em 22.5168
-➡️ PN 2: c1 32.0119 |  c2 11.2801 |  cb 0.4571 |  hq 22.6299 |  bq 22.5615 |  cq 32.0772
-➡️ Step 2400 | LR: 2.93e-4 | Loss: 2.9732
-➡️ PN 1: b1 22.5966 |  b2 22.6173 |  bb 0.3443 |  be 0.4223 |  bg 22.982 |  em 22.5154
-➡️ PN 2: c1 32.011 |  c2 11.2787 |  cb 0.4794 |  hq 22.6298 |  bq 22.5583 |  cq 32.0819
-➡️ Step 2500 | LR: 2.92e-4 | Loss: 3.0057
-➡️ PN 1: b1 22.5959 |  b2 22.6168 |  bb 0.3514 |  be 0.4385 |  bg 23.0042 |  em 22.514
-➡️ PN 2: c1 32.0102 |  c2 11.2772 |  cb 0.5003 |  hq 22.6296 |  bq 22.5554 |  cq 32.0862
-➡️ Step 2600 | LR: 2.91e-4 | Loss: 2.9636
-➡️ PN 1: b1 22.5954 |  b2 22.6164 |  bb 0.3575 |  be 0.4541 |  bg 23.0265 |  em 22.5128
-➡️ PN 2: c1 32.0094 |  c2 11.2756 |  cb 0.5216 |  hq 22.6294 |  bq 22.553 |  cq 32.0903
-➡️ Step 2700 | LR: 2.9e-4 | Loss: 2.8774
-➡️ PN 1: b1 22.5948 |  b2 22.6161 |  bb 0.3626 |  be 0.4691 |  bg 23.0489 |  em 22.5118
-➡️ PN 2: c1 32.0085 |  c2 11.2741 |  cb 0.5432 |  hq 22.6292 |  bq 22.5508 |  cq 32.0947
-➡️ Step 2800 | LR: 2.89e-4 | Loss: 3.2428
-➡️ PN 1: b1 22.5943 |  b2 22.6157 |  bb 0.3672 |  be 0.4835 |  bg 23.0712 |  em 22.5108
-➡️ PN 2: c1 32.0077 |  c2 11.2727 |  cb 0.5643 |  hq 22.629 |  bq 22.5489 |  cq 32.0993
-➡️ Step 2900 | LR: 2.87e-4 | Loss: 2.9466
-➡️ PN 1: b1 22.5939 |  b2 22.6154 |  bb 0.3709 |  be 0.4971 |  bg 23.0935 |  em 22.5098
-➡️ PN 2: c1 32.0068 |  c2 11.2711 |  cb 0.585 |  hq 22.6288 |  bq 22.5473 |  cq 32.1033
+00:56:46.218 [info] Merging Dots in computation: region_50.51
 
-🔄 Epoch 3 Started | Shuffling 6 shards...
-➡️ Step 3000 | LR: 2.86e-4 | Loss: 3.0296
-➡️ PN 1: b1 22.5935 |  b2 22.6151 |  bb 0.3741 |  be 0.5106 |  bg 23.1161 |  em 22.509
-➡️ PN 2: c1 32.0059 |  c2 11.2696 |  cb 0.6059 |  hq 22.6286 |  bq 22.546 |  cq 32.1076
+00:56:46.218 [info] Merging Dots in computation: region_54.55
+
+00:56:46.218 [info] Merging Dots in computation: region_58.59
+
+00:56:46.218 [info] Merging Dots in computation: region_62.63
+
+00:56:46.218 [info] Merging Dots in computation: region_66.67
+➡️ Step 3000 | LR: 4.98e-4 | Loss: 3.1193
+➡️ PN 1: b1 32.0018 |  b2 15.9939 |  bb 0.1095 |  bq 31.986 |  be 0.2785 |  bg 16.3062
+➡️ PN 2: c1 31.8576 |  c2 15.9819 |  cb 0.3284 |  cq 31.9978 |  ce 0.5469 |  cg 16.3392
+➡️ PN 3: wq 0.3506 |  uq 16.0822 |  hq 16.0837 |  em 16.187 |  ed 11.358
 Checkpoint reached! Saving Step 3000...
+➡️ Step 3100 | LR: 4.97e-4 | Loss: 2.9178
+➡️ PN 1: b1 32.0009 |  b2 15.993 |  bb 0.1098 |  bq 31.986 |  be 0.2812 |  bg 16.3141
+➡️ PN 2: c1 31.8567 |  c2 15.9814 |  cb 0.3277 |  cq 31.9978 |  ce 0.546 |  cg 16.3401
+➡️ PN 3: wq 0.3661 |  uq 16.0891 |  hq 16.0833 |  em 16.2008 |  ed 11.357
+➡️ Step 3200 | LR: 4.97e-4 | Loss: 2.8215
+➡️ PN 1: b1 32.0002 |  b2 15.9923 |  bb 0.1103 |  bq 31.9859 |  be 0.2847 |  bg 16.3222
+➡️ PN 2: c1 31.856 |  c2 15.981 |  cb 0.3288 |  cq 31.9978 |  ce 0.552 |  cg 16.3491
+➡️ PN 3: wq 0.3827 |  uq 16.0966 |  hq 16.0829 |  em 16.2146 |  ed 11.3579
+➡️ Step 3300 | LR: 4.97e-4 | Loss: 2.8102
+➡️ PN 1: b1 31.9997 |  b2 15.9918 |  bb 0.1103 |  bq 31.9859 |  be 0.2885 |  bg 16.3289
+➡️ PN 2: c1 31.8553 |  c2 15.9806 |  cb 0.3314 |  cq 31.9977 |  ce 0.5628 |  cg 16.3627
+➡️ PN 3: wq 0.3978 |  uq 16.1046 |  hq 16.0824 |  em 16.2285 |  ed 11.36
+➡️ Step 3400 | LR: 4.96e-4 | Loss: 2.8573
+➡️ PN 1: b1 31.9994 |  b2 15.9915 |  bb 0.1107 |  bq 31.9859 |  be 0.2912 |  bg 16.3347
+➡️ PN 2: c1 31.8548 |  c2 15.9804 |  cb 0.3337 |  cq 31.9977 |  ce 0.574 |  cg 16.3774
+➡️ PN 3: wq 0.413 |  uq 16.113 |  hq 16.082 |  em 16.2425 |  ed 11.3625
+➡️ Step 3500 | LR: 4.96e-4 | Loss: 2.763
+➡️ PN 1: b1 31.9992 |  b2 15.9913 |  bb 0.1122 |  bq 31.9855 |  be 0.2991 |  bg 16.338
+➡️ PN 2: c1 31.8545 |  c2 15.9801 |  cb 0.3387 |  cq 31.9976 |  ce 0.5869 |  cg 16.3888
+➡️ PN 3: wq 0.4239 |  uq 16.1198 |  hq 16.0818 |  em 16.254 |  ed 11.3644
+➡️ Step 3600 | LR: 4.95e-4 | Loss: 2.5956
+➡️ PN 1: b1 31.9994 |  b2 15.9916 |  bb 0.1128 |  bq 31.9854 |  be 0.302 |  bg 16.3407
+➡️ PN 2: c1 31.8547 |  c2 15.9803 |  cb 0.341 |  cq 31.9976 |  ce 0.6007 |  cg 16.4031
+➡️ PN 3: wq 0.4322 |  uq 16.1265 |  hq 16.0816 |  em 16.2653 |  ed 11.3677
+➡️ Step 3700 | LR: 4.95e-4 | Loss: 2.607
+➡️ PN 1: b1 31.9998 |  b2 15.992 |  bb 0.1123 |  bq 31.9856 |  be 0.3014 |  bg 16.3442
+➡️ PN 2: c1 31.8548 |  c2 15.9804 |  cb 0.341 |  cq 31.9976 |  ce 0.6136 |  cg 16.4188
+➡️ PN 3: wq 0.4444 |  uq 16.1341 |  hq 16.0814 |  em 16.2776 |  ed 11.3715
+➡️ Step 3800 | LR: 4.94e-4 | Loss: 2.5951
+➡️ PN 1: b1 32.0 |  b2 15.9923 |  bb 0.1117 |  bq 31.9857 |  be 0.3013 |  bg 16.3485
+➡️ PN 2: c1 31.8549 |  c2 15.9805 |  cb 0.3415 |  cq 31.9976 |  ce 0.6277 |  cg 16.4355
+➡️ PN 3: wq 0.4566 |  uq 16.1421 |  hq 16.0812 |  em 16.2902 |  ed 11.3754
+➡️ Step 3900 | LR: 4.94e-4 | Loss: 2.4838
+➡️ PN 1: b1 32.0002 |  b2 15.9925 |  bb 0.1114 |  bq 31.9858 |  be 0.3017 |  bg 16.3531
+➡️ PN 2: c1 31.855 |  c2 15.9806 |  cb 0.3419 |  cq 31.9976 |  ce 0.6407 |  cg 16.4512
+➡️ PN 3: wq 0.4703 |  uq 16.1502 |  hq 16.0809 |  em 16.3029 |  ed 11.3789
+➡️ Step 4000 | LR: 4.93e-4 | Loss: 2.5863
+➡️ PN 1: b1 32.0004 |  b2 15.9927 |  bb 0.1109 |  bq 31.9859 |  be 0.3026 |  bg 16.3577
+➡️ PN 2: c1 31.855 |  c2 15.9807 |  cb 0.3427 |  cq 31.9976 |  ce 0.6541 |  cg 16.4669
+➡️ PN 3: wq 0.4872 |  uq 16.1583 |  hq 16.0807 |  em 16.3154 |  ed 11.3824
+Checkpoint reached! Saving Step 4000...
+➡️ Step 4100 | LR: 4.93e-4 | Loss: 2.6484
+➡️ PN 1: b1 32.0007 |  b2 15.9929 |  bb 0.1108 |  bq 31.986 |  be 0.3034 |  bg 16.3621
+➡️ PN 2: c1 31.8551 |  c2 15.9807 |  cb 0.3434 |  cq 31.9975 |  ce 0.6664 |  cg 16.4813
+➡️ PN 3: wq 0.5052 |  uq 16.1664 |  hq 16.0804 |  em 16.3277 |  ed 11.3856
 ```
