@@ -1,0 +1,681 @@
+# fourier for real
+
+```elixir
+System.put_env("XLA_BUILD", "true")
+
+Mix.install([
+  {:nx, "~> 0.11.0"},
+  {:exla, "~> 0.11.0"},
+  {:jason, "~> 1.4"}
+])
+
+System.put_env("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+System.put_env("XLA_TARGET", "rocm")
+
+System.put_env("TF_ROCM_FUSION_ENABLE", "0")
+
+System.put_env("XLA_FLAGS", "--xla_gpu_autotune_level=0 --xla_gpu_enable_reassociation_for_converted_ar=false --xla_gpu_graph_enable_concurrent_region=false")
+
+System.put_env("ROCM_DISABLE_CU_MEMSET", "1")
+
+Application.put_env(:exla, :clients,
+  rocm: [
+    platform: :rocm,
+    memory_fraction: 0.75,
+    preallocate: false,
+    num_replicas: 1
+  ]
+)
+
+Application.put_env(:exla, :default_client, :rocm)
+
+gpu = {EXLA.Backend, client: :rocm}
+Nx.global_default_backend(gpu)
+Nx.Defn.default_options(compiler: EXLA, client: :rocm)
+
+platforms = EXLA.Client.get_supported_platforms()
+if platforms[:rocm] do
+  IO.puts("gpu found")
+else
+  IO.puts("gpu missing")
+end
+```
+
+## Helpers
+
+```elixir
+defmodule DLM.Tree do
+  @moduledoc """
+  Recursively maps a function over nested tuples of tensors.
+  """
+  
+  def map(tuple, func) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&map(&1, func))
+    |> List.to_tuple()
+  end
+
+  # The base case: When it hits a tensor (or a compile-time Expr), apply the function
+  def map(tensor, func) do
+    func.(tensor)
+  end
+end
+```
+
+```elixir
+defmodule BabyLM.CurriculumStreamer do
+  def build_infinite_stream(directory_path, batch_size) do
+    target_shards = Path.wildcard(Path.join(directory_path, "*.bin"))
+
+    if length(target_shards) == 0 do
+      raise "CRITICAL: No .bin shards found in directory: #{directory_path}"
+    end
+
+    Stream.iterate(1, &(&1 + 1))
+    |> Stream.flat_map(fn epoch ->
+      :rand.seed(:exsss, {epoch, epoch, epoch})
+      shuffled_shards = Enum.shuffle(target_shards)
+      IO.puts("\n🔄 Epoch #{epoch} Started | Shuffling #{length(target_shards)} shards...")
+      Stream.flat_map(shuffled_shards, fn path ->
+        tensor = File.read!(path) |> :erlang.binary_to_term()
+          
+        total_seqs = Nx.axis_size(tensor, 0)
+        num_batches = div(total_seqs, batch_size)
+
+        # 1. Generate all the slice indices
+        0..(num_batches - 1)
+        # 2. Slice the tensor into actual batch tensors
+        |> Enum.map(fn i ->
+          Nx.slice_along_axis(tensor, i * batch_size, batch_size, axis: 0)
+        end)
+        # 3. Shuffle the list of batches
+        |> Enum.shuffle()
+        end) |> Enum.shuffle() # shuffle it all together now
+    end)
+  end
+end
+```
+
+```elixir
+defmodule DLM.StatelessMuon do
+  import Nx.Defn
+
+  defn newton_schulz(g) do
+    frobenius_norm = Nx.LinAlg.norm(g) # defaults to frobenius if type not given
+    x = g / frobenius_norm
+    
+    {final_x, _} = while {curr_x = x, i = 0}, Nx.less(i, 5) do
+      x_t_x = Nx.dot(Nx.transpose(curr_x), curr_x)
+      next_x = 1.5 * curr_x - 0.5 * Nx.dot(curr_x, x_t_x)
+      {next_x, i + 1}
+    end
+    final_x
+  end
+
+  defn muon_step(em, grad, lr) do
+    ns_grad = newton_schulz(grad)
+    update = Nx.multiply(lr, ns_grad)
+    Nx.subtract(em, update)
+  end
+
+  defn muon_step_decay(em, grad, lr, wd \\ 1.0e-4) do
+    ns_grad = newton_schulz(grad)
+    update = Nx.multiply(lr, ns_grad)
+    em_decayed = Nx.multiply(em, Nx.subtract(1.0, Nx.multiply(lr, wd)))
+    Nx.subtract(em_decayed, update)
+  end
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## SSM
+
+```elixir
+defmodule DLM.SvdSSM do
+  import Nx.Defn
+
+  defn rms_norm(x, gamma, beta, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    norm = x * Nx.rsqrt(variance + epsilon)
+    scaled = norm * gamma
+    scaled + beta
+  end
+
+  defn rms_norm(x, epsilon \\ 1.0e-6) do
+    variance = Nx.mean(Nx.pow(x, 2), axes: [-1], keep_axes: true)
+    x * Nx.rsqrt(variance + epsilon)
+  end
+
+  defn gelu(x) do
+    cdf = Nx.multiply(
+      Nx.tensor(0.7978845608, type: :f32),
+      Nx.add(x, Nx.multiply(Nx.tensor(0.044715, type: :f32), Nx.pow(x, 3)))
+    )
+    Nx.multiply(Nx.multiply(Nx.tensor(0.5, type: :f32), x), Nx.add(Nx.tensor(1.0, type: :f32), Nx.tanh(cdf)))
+  end
+  
+  defn feed_forward_layer(x, um, ga, bi, dm) do
+    up = Nx.dot(x, um) 
+    act = Nx.tanh(up) #was tanh
+    scaled = Nx.multiply(act, ga)
+    biased = Nx.add(scaled, bi)
+    Nx.dot(biased, dm) 
+  end
+
+  defn softmax(t) do
+    max_val = Nx.reduce_max(t, axes: [-1], keep_axes: true)
+    safe_t = Nx.subtract(t, max_val)
+    exps = Nx.exp(safe_t)
+    sum_exps = Nx.sum(exps, axes: [-1], keep_axes: true)
+    Nx.divide(exps, Nx.add(sum_exps, 1.0e-8))
+  end
+
+  defn apply_xsa(x, y) do
+    y_norm_sq = Nx.add(Nx.sum(Nx.pow(y, 2), axes: [-1], keep_axes: true), 1.0e-6)
+    y_unit = Nx.divide(y, Nx.sqrt(y_norm_sq))
+    y_ov = Nx.sum(Nx.multiply(x, y_unit), axes: [-1], keep_axes: true)
+    Nx.subtract(x, Nx.multiply(y_ov, y_unit))
+  end
+
+  defn apply_attention(q, v) do
+    k = Nx.transpose(v, axes: [0, 2, 1])
+    r = Nx.axis_size(v, 1)
+    qu = Nx.new_axis(q, 1)
+    score = Nx.dot(qu, [2], [0], k, [1], [0])
+    scaled_score = Nx.divide(score, Nx.sqrt(r))
+    soft_score = softmax(scaled_score)
+    Nx.dot(soft_score, [2], [0], v, [1], [0]) |> Nx.squeeze(axes: [1])
+  end
+
+  defn forward_step(x_t, spell_mem, word_mem, solver, frzn, p) do
+    {b1, b2, bb, bq, bg, be, 
+     c1, c2, cb, cq, cg, ce,
+     w1, w2, wb, wq, wg, we, wd} = p
+    # apply time scale
+    time_scale = Nx.rsqrt(Nx.Constants.pi())
+    wm_scaled = Nx.multiply(word_mem, time_scale)
+    sm_scaled = Nx.multiply(spell_mem, time_scale)
+    # determine word boundry, apply resest, check for "-"(ascii 45) too?
+    is_space = Nx.equal(x_t, 32) |> Nx.as_type(:f32) |> Nx.new_axis(1)
+    is_space_3d = Nx.new_axis(is_space, 1)
+    reset_factor_3d = Nx.subtract(1.0, is_space) |> Nx.new_axis(1)
+    sm_set = Nx.multiply(sm_scaled, reset_factor_3d)
+    # process current character
+    u_t = Nx.take(frzn, x_t)
+    # update spelling
+    sl_sm = Nx.slice_along_axis(sm_set, 1, 31, axis: 1)
+    sm_new = Nx.concatenate([sl_sm, Nx.new_axis(u_t, 1)], axis: 1)
+    # reshape and down project for word update 4096 -> 128
+    wrd = Nx.reshape(sm_new, {:auto, 4096}) |> Nx.dot(wd)
+    # update word memory
+    sl_wm_nonspace = Nx.slice_along_axis(wm_scaled, 0, 255, axis: 1)
+    sl_wm_space    = Nx.slice_along_axis(wm_scaled, 1, 255, axis: 1)
+    # blended slice
+    sl_wm = Nx.multiply(sl_wm_space, is_space_3d)
+               |> Nx.add(Nx.multiply(sl_wm_nonspace, Nx.subtract(1.0, is_space_3d)))
+    # actual update - is space batches will get new entry, non is space will update in place
+    wm_new = Nx.concatenate([sl_wm, Nx.new_axis(wrd, 1)], axis: 1)
+    # get spelling attention
+    sp_ctx = apply_attention(u_t, sm_new)
+    spxa = apply_xsa(sp_ctx, u_t)
+    # 128 -> 512 -> 128
+    b_in = Nx.add(u_t, spxa)
+    b_term = feed_forward_layer(b_in, b1, bq, bb, b2)
+    b_norm = rms_norm(b_term, bg, be)
+    # get word attention
+    wm_ctx = apply_attention(u_t, wm_new)
+    wmxa = apply_xsa(wm_ctx, u_t)
+    # 128 -> 512 -> 128
+    w_in = Nx.add(u_t, wmxa)
+    w_term = feed_forward_layer(w_in, w1, wq, wb, w2)
+    w_norm = rms_norm(w_term, wg, we)
+    # create thinking space
+    solv_sl = Nx.slice_along_axis(solver, 1, 126, axis: 1)
+    solv_cur = Nx.concatenate([Nx.new_axis(b_norm, 1), solv_sl, Nx.new_axis(w_norm, 1)], axis: 1)
+    # solve for 'x'
+    solv_ctx = apply_attention(u_t, solv_cur)
+    # 128 -> 512 -> 128
+    c_term = feed_forward_layer(solv_ctx, c1, cq, cb, c2)
+    logits = rms_norm(c_term, cg, ce)
+    
+    {logits, sm_new, wm_new}
+  end
+end
+```
+
+```elixir
+defmodule DLM.SvdOptimizer do
+  import Nx.Defn
+
+  defn update(params, grads, step, lr) do
+    {b1, b2, bb, bq, bg, be, 
+     c1, c2, cb, cq, cg, ce,
+     w1, w2, wb, wq, wg, we, wd}  = params   
+    {gb1, gb2, gbb, gbq, gbg, gbe, 
+     gc1, gc2, gcb, gcq, gcg, gce,
+     gw1, gw2, gwb, gwq, gwg, gwe, gwd}  = grads
+    
+    new_step = Nx.add(step, 1)
+
+    # optimizer update step    
+    b1_new = DLM.StatelessMuon.muon_step(b1, gb1, lr)
+    b2_new = DLM.StatelessMuon.muon_step(b2, gb2, lr)
+    bb_new = DLM.StatelessMuon.muon_step(bb, gbb, lr)
+    bq_new = DLM.StatelessMuon.muon_step(bq, gbq, lr)
+    be_new = DLM.StatelessMuon.muon_step(be, gbe, lr)
+    bg_new = DLM.StatelessMuon.muon_step(bg, gbg, lr)
+
+    c1_new = DLM.StatelessMuon.muon_step(c1, gc1, lr)
+    c2_new = DLM.StatelessMuon.muon_step(c2, gc2, lr)
+    cb_new = DLM.StatelessMuon.muon_step(cb, gcb, lr)
+    cq_new = DLM.StatelessMuon.muon_step(cq, gcq, lr)
+    ce_new = DLM.StatelessMuon.muon_step(ce, gce, lr)
+    cg_new = DLM.StatelessMuon.muon_step(cg, gcg, lr)
+
+    w1_new = DLM.StatelessMuon.muon_step(w1, gw1, lr)
+    w2_new = DLM.StatelessMuon.muon_step(w2, gw2, lr)
+    wb_new = DLM.StatelessMuon.muon_step(wb, gwb, lr)
+    wq_new = DLM.StatelessMuon.muon_step(wq, gwq, lr)
+    we_new = DLM.StatelessMuon.muon_step(we, gwe, lr)
+    wg_new = DLM.StatelessMuon.muon_step(wg, gwg, lr)
+    wd_new = DLM.StatelessMuon.muon_step(wd, gwd, lr)
+    
+    new_params = {b1_new, b2_new, bb_new, bq_new, bg_new, be_new,
+                  c1_new, c2_new, cb_new, cq_new, cg_new, ce_new,
+                  w1_new, w2_new, wb_new, wq_new, wg_new, we_new,
+                  wd_new}
+
+    {new_params, new_step}
+  end
+end
+```
+
+```elixir
+defmodule DLM.PhysicsGenesis do
+  import Nx.Defn
+
+  @vocab 128
+  @dim 512
+
+  defn init(k1) do
+    std_dim = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@dim, type: :f32)))
+    std_voc = Nx.divide(1.0, Nx.sqrt(Nx.tensor(@vocab, type: :f32)))
+    std_496 = Nx.divide(1.0, Nx.sqrt(Nx.tensor(4096, type: :f32)))
+
+    # projection matrices
+    {b1r, k2} = Nx.Random.normal(k1, 0.0, std_voc, shape: {@vocab, @dim})
+    {b1i, k3} = Nx.Random.normal(k2, 0.0, std_voc, shape: {@vocab, @dim})
+     b1 = Nx.complex(b1r, b1i)
+    {b2r, k4} = Nx.Random.normal(k3, 0.0, std_dim, shape: {@dim, @vocab})
+    {b2i, k5} = Nx.Random.normal(k4, 0.0, std_dim, shape: {@dim, @vocab})
+     b2 = Nx.complex(b2r, b2i)
+    {c1r, k6} = Nx.Random.normal(k5, 0.0, std_voc, shape: {@vocab, @dim})
+    {c1i, k7} = Nx.Random.normal(k6, 0.0, std_voc, shape: {@vocab, @dim})
+     c1 = Nx.complex(c1r, c1i)
+    {c2r, k8} = Nx.Random.normal(k7, 0.0, std_dim, shape: {@dim, @vocab})
+    {c2i, k9} = Nx.Random.normal(k8, 0.0, std_dim, shape: {@dim, @vocab})
+     c2 = Nx.complex(c2r, c2i)
+    {w1r, k10} = Nx.Random.normal(k9, 0.0, std_voc, shape: {@vocab, @dim})
+    {w1i, k11} = Nx.Random.normal(k10, 0.0, std_voc, shape: {@vocab, @dim})
+     w1 = Nx.complex(w1r, w1i)
+    {w2r, k12} = Nx.Random.normal(k11, 0.0, std_dim, shape: {@dim, @vocab})
+    {w2i, k13} = Nx.Random.normal(k12, 0.0, std_dim, shape: {@dim, @vocab})
+     w2 = Nx.complex(w2r, w2i)
+    {wdr, k14} = Nx.Random.normal(k13, 0.0, std_496, shape: {4096, @vocab})
+    {wdi, k15} = Nx.Random.normal(k14, 0.0, std_496, shape: {4096, @vocab})
+     wd = Nx.complex(wdr, wdi)
+
+    # projection bias vectors
+    bbr = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
+    bbi = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
+    bb = Nx.complex(bbr, bbi)
+    cbr = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
+    cbi = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
+    cb = Nx.complex(cbr, cbi)
+    wbr = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
+    wbi = Nx.broadcast(0.0, {@dim}) |> Nx.as_type(:f32)
+    wb = Nx.complex(wbr, wbi)
+    # projection scaling vectors
+    bqr = Nx.broadcast(1.0, {@dim}) |> Nx.as_type(:f32)
+    bqi = Nx.broadcast(1.0, {@dim}) |> Nx.as_type(:f32)
+    bq = Nx.complex(bqr, bqi)
+    cqr = Nx.broadcast(1.0, {@dim}) |> Nx.as_type(:f32)
+    cqi = Nx.broadcast(1.0, {@dim}) |> Nx.as_type(:f32)
+    cq = Nx.complex(cqr, cqi)
+    wqr = Nx.broadcast(1.0, {@dim}) |> Nx.as_type(:f32)
+    wqi = Nx.broadcast(1.0, {@dim}) |> Nx.as_type(:f32)
+    wq = Nx.complex(wqr, wqi)
+    # rms norm beta and gamma vectors
+    ber = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32)
+    bei = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32)
+    be = Nx.complex(ber, bei)
+    bgr = Nx.broadcast(1.0, {@vocab}) |> Nx.as_type(:f32)
+    bgi = Nx.broadcast(1.0, {@vocab}) |> Nx.as_type(:f32)
+    bg = Nx.complex(bgr, bgi)
+    cer = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32)
+    cei = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32)
+    ce = Nx.complex(cer, cei)
+    cgr = Nx.broadcast(1.0, {@vocab}) |> Nx.as_type(:f32)
+    cgi = Nx.broadcast(1.0, {@vocab}) |> Nx.as_type(:f32)
+    cg = Nx.complex(cgr, cgi)
+    wer = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32)
+    wei = Nx.broadcast(0.0, {@vocab}) |> Nx.as_type(:f32)
+    we = Nx.complex(wer, wei)
+    wgr = Nx.broadcast(1.0, {@vocab}) |> Nx.as_type(:f32)
+    wgi = Nx.broadcast(1.0, {@vocab}) |> Nx.as_type(:f32)
+    wg = Nx.complex(wgr, wgi)
+    
+    trainable_params = {b1, b2, bb, bq, bg, be, 
+                        c1, c2, cb, cq, cg, ce,
+                        w1, w2, wb, wq, wg, we, wd} 
+    
+    {trainable_params, k15}
+  end
+end
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Frozen Fourier Build
+
+```elixir
+defmodule DLM.FourierReservoirBuild do
+  import Nx.Defn
+
+  @dim 128 
+
+  def build_fourier_matrix do
+    pairs = div(@dim, 2)
+    
+    # Generate real and imaginary flattened lists
+    {flat_real, flat_imag} = 
+      for row <- 0..(@dim - 1), col <- 0..(@dim - 1), reduce: ([], []) do
+        {real_acc, imag_acc} ->
+          pair_row = div(row, 2)
+          pair_col = div(col, 2)
+  
+          if pair_row == pair_col do
+            w = 0.01 + pair_row * (:math.pi() - 0.01) / max(1, pairs - 1)
+            
+            # Compute Real & Imaginary components for the current element
+            {real_val, imag_val} = cond do
+              rem(row, 2) == 0 and rem(col, 2) == 0 -> {:math.cos(w), 0.0}
+              rem(row, 2) == 0 and rem(col, 2) == 1 -> (-:math.sin(w), 0.0)
+              rem(row, 2) == 1 and rem(col, 2) == 0 -> (0.0, :math.sin(w))
+              rem(row, 2) == 1 and rem(col, 2) == 1 -> (0.0, :math.cos(w))
+            end
+            
+            {[real_val | real_acc], [imag_val | imag_acc]}
+          else
+            {[0.0 | real_acc], [0.0 | imag_acc]}
+          end
+      end
+      
+    # Reverse accumulations since list comprehensions push to the head
+    flat_real = Enum.reverse(flat_real)
+    flat_imag = Enum.reverse(flat_imag)
+  
+    # Create complex tensor using Nx
+    real_tensor = Nx.tensor(flat_real, type: :f32) |> Nx.reshape({@dim, @dim})
+    imag_tensor = Nx.tensor(flat_imag, type: :f32) |> Nx.reshape({@dim, @dim})
+  
+    Nx.complex(real_tensor, imag_tensor)
+  end
+
+
+  def build_and_save(output_path) do
+    fr = build_fourier_matrix()
+
+    IO.puts("Saving tuned reservoir to #{output_path}...")
+    
+    cpu_f = DLM.Tree.map(fr, &Nx.backend_transfer(&1, Nx.BinaryBackend))
+    
+    File.write!(output_path, :erlang.term_to_binary(%{frozen: cpu_f}))
+    IO.puts("file write complete")
+  end
+end
+```
+
+```elixir
+DLM.FourierReservoirBuild.build_and_save( "./data/fc_semantic_reservoir_128D.bin")
+```
+
+<!-- livebook:{"branch_parent_index":0} -->
+
+## Inference
+
+## Train
+
+```elixir
+defmodule DLM.Phase2Trainer do
+  import Nx.Defn
+
+  defn step_cross_entropy(logits, targets) do
+    vocab_size = Nx.axis_size(logits, -1)
+    one_hot = Nx.equal(Nx.iota({vocab_size}), Nx.new_axis(targets, -1))
+    
+    max_logits = Nx.reduce_max(logits, axes: [-1], keep_axes: true)
+    safe_logits = Nx.subtract(logits, max_logits)
+    log_probs = Nx.subtract(safe_logits, Nx.log(Nx.sum(Nx.exp(safe_logits), axes: [-1], keep_axes: true)))
+    
+    # Returns a {batch_size} 1D tensor of individual sequence losses
+    Nx.negate(Nx.sum(Nx.multiply(one_hot, log_probs), axes: [-1]))
+  end
+
+  defn compute_sequence_loss(input_tokens, frzn, params) do
+    batch_size = Nx.axis_size(input_tokens, 0)
+
+    sm_start = Nx.broadcast(0.0, {batch_size, 32, 128}) |> Nx.as_type(:f32)
+    wm_start = Nx.broadcast(0.0, {batch_size, 256, 128}) |> Nx.as_type(:f32)
+    solver = Nx.broadcast(0.0, {batch_size, 128, 128}) |> Nx.as_type(:f32)
+    
+    zero_scalar = Nx.tensor(0.0, type: :f32)
+
+    result =
+      while {i = 0, 
+             total_loss = zero_scalar, 
+             valid_tokens = zero_scalar,
+             sm = sm_start,
+             wm = wm_start,
+             sl = solver,
+             fr = frzn,
+             inf = input_tokens,
+             tp = params},
+            Nx.less(i, Nx.axis_size(inf, 1)-1) do
+
+        x_t = inf[[.., i]]
+        t_t = inf[[.., i+1]]
+        
+        {logits, sm_new, wm_new} = DLM.SvdSSM.forward_step(x_t, sm, wm, sl, fr, tp)
+        
+        step_loss = step_cross_entropy(logits, t_t)
+        mask = Nx.not_equal(t_t, 1) |> Nx.as_type(:f32)
+        
+        masked_loss_scalar = Nx.sum(Nx.multiply(step_loss, mask))
+        valid_tokens_scalar = Nx.sum(mask)
+
+        {i + 1, 
+         Nx.add(total_loss, masked_loss_scalar), 
+         Nx.add(valid_tokens, valid_tokens_scalar),
+         sm_new, wm_new, sl, fr, inf, tp}
+      end
+  
+    {_, acc_loss, val_tokens, _, _, _, _, _, _} = result
+    # compress and save final hlong for a long term memory context?
+
+    total_loss = Nx.divide(acc_loss, Nx.add(val_tokens, 1.0e-8))
+    total_loss
+  end
+
+  defn compute_grad(params, frzn, batch_tokens) do
+    seq_len = Nx.axis_size(batch_tokens, 1) - 1
+    input_tokens  = Nx.slice_along_axis(batch_tokens, 0, seq_len, axis: 1)
+
+    {loss, raw_grads} = 
+      value_and_grad(params, fn p -> compute_sequence_loss(input_tokens, frzn, p) end)
+      
+    {loss, raw_grads}
+  end
+end
+```
+
+```elixir
+defmodule DLM.CheckpointManager do
+  @moduledoc """
+  Scans the directory for the latest checkpoint of a specific run prefix.
+  If no checkpoints exist, it triggers a completely fresh initialization.
+  """
+  def get_resume_state(run_prefix) do
+    checkpoints = Path.wildcard("#{run_prefix}_checkpoint_step_*.bin")
+
+    if Enum.empty?(checkpoints) do
+      if File.exists?("#{run_prefix}_final.bin") do
+        IO.puts("Found completed run: #{run_prefix}_final.bin")
+        {"#{run_prefix}_final.bin", :completed}
+      else
+        IO.puts("No checkpoints found for '#{run_prefix}'. Starting FRESH from Genesis.")
+        {:fresh, 0}
+      end
+    else
+      # Extract step numbers using regex and find the maximum
+      latest_file = Enum.max_by(checkpoints, fn file ->
+        case Regex.run(~r/_step_(\d+)\.bin$/, file) do
+          [_, step_str] -> String.to_integer(step_str)
+          _ -> -1
+        end
+      end)
+
+      [_, step_str] = Regex.run(~r/_step_(\d+)\.bin$/, latest_file)
+      step = String.to_integer(step_str)
+      
+      IO.puts("Auto-Resuming '#{run_prefix}' from Step #{step}...")
+      {latest_file, step}
+    end
+  end
+end
+```
+
+```elixir
+run_prefix  = "v44_DLM_256sq_slowlowlr2x_frznf_v4096dsm"
+frozen_path = "./data/f_semantic_reservoir_128D.bin"
+total_steps = 82000
+
+{load_path, start_step} = DLM.CheckpointManager.get_resume_state(run_prefix)
+
+if start_step == :completed do
+  IO.puts("This run has already reached #{total_steps} steps. Exiting.") 
+  
+else
+  batch_size = 64
+  # ./data/bbylm_512_fullmix (256 too) bbylm_lg_wiki_512
+  data_dir = "./data/bbylm_512_strict_lg_ltd" #/babylm_high_sanitize(sq 256), /bbylm_512_strict(sq 512)
+  
+  IO.puts("Initializing Lazy Curriculum Data Stream from [#{data_dir}]...")
+  
+  data_stream = 
+    BabyLM.CurriculumStreamer.build_infinite_stream(data_dir, batch_size)
+    |> Stream.drop(start_step) 
+
+   {starting_trainable, starting_frozen, initial_key} =
+    if load_path == :fresh do
+      IO.puts("Igniting brand new Trainable weights for #{run_prefix}...")
+      {ip, ik} = DLM.PhysicsGenesis.init(Nx.Random.key(System.system_time()))
+      %{frozen: {r, _m}} = File.read!(frozen_path) |> :erlang.binary_to_term()
+      {ip, r, ik}
+    else
+      IO.puts("Loading Trainable Weights from #{load_path}...")
+      %{trainable: t_p, frozen: f_p} = File.read!(load_path) |> :erlang.binary_to_term()
+      {t_p, f_p, Nx.Random.key(System.system_time())}
+    end
+
+  trainable_gpu = DLM.Tree.map(starting_trainable, &Nx.backend_copy(&1, gpu))
+  frozen_gpu = DLM.Tree.map(starting_frozen, &Nx.backend_copy(&1, gpu))
+  step_count = Nx.tensor(start_step) |> Nx.backend_copy(gpu)
+  
+  # ZIP FROM THE START_STEP
+  {final_p, final_f, _key, _step} =
+    Enum.reduce(Stream.zip(start_step..(total_steps - 1), data_stream), 
+      {trainable_gpu, frozen_gpu, initial_key, step_count}, 
+      fn {step, cpu_batch}, {cur_tr, frzn, cur_key, c_step} ->        
+        
+      gpu_batch = Nx.backend_copy(cpu_batch, gpu)
+     
+      base_lr = 7.0e-5
+      min_lr = 7.0e-6
+      warmup_steps = 4000
+      cooldown_start = 40000
+      
+      current_lr = 
+        if step < warmup_steps do
+          base_lr * (step / warmup_steps)
+        else
+          if step < cooldown_start do
+            base_lr
+          else
+            progress = min(max((step - cooldown_start) / (total_steps - cooldown_start), 0.0), 1.0) 
+            min_lr + 0.5 * (base_lr - min_lr) * (1.0 + :math.cos(:math.pi() * progress))
+          end
+        end
+      
+      lr_tensor = Nx.tensor(current_lr, type: :f32) |> Nx.backend_copy(gpu)
+
+      split_keys = Nx.Random.split(cur_key)
+      next_key = split_keys[1]
+      
+      {loss_tensor, grads} = DLM.Phase2Trainer.compute_grad(cur_tr, frzn, gpu_batch)
+      loss_val = Nx.to_number(loss_tensor)
+
+      {up_tr, up_step} = DLM.SvdOptimizer.update(cur_tr, grads, c_step, lr_tensor)
+  
+      # Telemetry
+      if rem(step, 100) == 0 do
+        {b1, b2, bb, bq, bg, be, c1, c2, cb, cq, cg, ce, w1, w2, wb, wq, wg, we, wd}  = up_tr
+
+        b1_norm = b1 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        b2_norm = b2 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        bb_norm = bb |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        bq_norm = bq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        bg_norm = bg |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        be_norm = be |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        c1_norm = c1 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        c2_norm = c2 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        cb_norm = cb |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        cq_norm = cq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        cg_norm = cg |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        ce_norm = ce |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        w1_norm = w1 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        w2_norm = w2 |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        wb_norm = wb |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        wq_norm = wq |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        wg_norm = wg |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        we_norm = we |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+        wd_norm = wd |> Nx.pow(2) |> Nx.sum() |> Nx.sqrt() |> Nx.to_number() |> Float.round(4)
+
+        IO.puts("➡️ Step #{step} | LR: #{Float.round(current_lr, 6)} | Loss: #{Float.round(loss_val, 4)} |  wd #{wd_norm}")
+        IO.puts("➡️ PN 1: b1 #{b1_norm} |  b2 #{b2_norm} |  bb #{bb_norm} |  bq #{bq_norm} |  be #{be_norm} |  bg #{bg_norm}")
+        IO.puts("➡️ PN 2: c1 #{c1_norm} |  c2 #{c2_norm} |  cb #{cb_norm} |  cq #{cq_norm} |  ce #{ce_norm} |  cg #{cg_norm}")
+        IO.puts("➡️ PN 3: w1 #{w1_norm} |  w2 #{w2_norm} |  wb #{wb_norm} |  wq #{wq_norm} |  we #{we_norm} |  wg #{wg_norm}")
+        :erlang.garbage_collect()
+      end
+  
+      if rem(step, 1000) == 0 and step > 0 do
+        IO.puts("Checkpoint reached! Saving Step #{step}...")
+        cpu_tr = DLM.Tree.map(up_tr, &Nx.backend_copy(&1, Nx.BinaryBackend))
+        cpu_fr = DLM.Tree.map(frzn, &Nx.backend_copy(&1, Nx.BinaryBackend))
+        filename = "#{run_prefix}_checkpoint_step_#{step}.bin"
+        File.write!(filename, :erlang.term_to_binary(%{trainable: cpu_tr, frozen: cpu_fr}))
+        :erlang.garbage_collect()
+      end
+  
+      {up_tr, frzn, next_key, up_step}
+    end)
+
+  IO.puts("Saving Final Fourier Reservoir Weights...")
+  fin_t = DLM.Tree.map(final_p, &Nx.backend_copy(&1, Nx.BinaryBackend))
+  fin_f = DLM.Tree.map(final_f, &Nx.backend_copy(&1, Nx.BinaryBackend))
+  File.write!("#{run_prefix}_final.bin", :erlang.term_to_binary(%{trainable: fin_t, frozen: fin_f}))
+  IO.puts("Training Complete!")
+end
+```
